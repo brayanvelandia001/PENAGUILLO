@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 5.0
+# VERSIÓN 5.1
 #
 # FUNCIONES:
 # - Chat con Penaguillo
@@ -22,11 +22,6 @@
 #
 # GOOGLE_DRIVE_FOLDER_ID sigue siendo el ID de la carpeta
 # raíz de Penaguillo dentro del Shared Drive.
-#
-# NO se debe colocar aquí el ID del Shared Drive.
-# El backend lo detecta automáticamente.
-#
-# REGLA PRINCIPAL:
 #
 # Google Drive conserva el penaguillo.json completo.
 #
@@ -119,10 +114,6 @@ else:
 
 if os.getenv("RENDER") == "true":
 
-    # Render Free no tiene Persistent Disk.
-    #
-    # Google Drive es el almacenamiento permanente.
-
     CONOCIMIENTO_DIR = (
         BASE_DIR
         / "storage"
@@ -130,8 +121,6 @@ if os.getenv("RENDER") == "true":
     )
 
 else:
-
-    # Local / Electron.
 
     CONOCIMIENTO_DIR = (
         BASE_DIR
@@ -287,10 +276,8 @@ DRIVE_SCOPES = [
 drive_service = None
 
 
-# ID de la carpeta raíz
 DRIVE_ROOT_FOLDER = None
 
-# ID real del Shared Drive
 DRIVE_SHARED_ID = None
 
 DRIVE_KNOWLEDGE_FOLDER = None
@@ -490,7 +477,9 @@ def inicializar_google_drive():
             drive_service
             .files()
             .get(
+
                 fileId=DRIVE_ROOT_FOLDER,
+
                 fields=(
                     "id,"
                     "name,"
@@ -498,7 +487,9 @@ def inicializar_google_drive():
                     "driveId,"
                     "parents"
                 ),
+
                 supportsAllDrives=True,
+
             )
             .execute()
         )
@@ -579,13 +570,6 @@ def inicializar_google_drive():
         )
 
 
-        # ----------------------------------------------------
-        # Backups:
-        #
-        # Se conserva la carpeta por compatibilidad,
-        # pero NO participa en el arranque.
-        # ----------------------------------------------------
-
         DRIVE_BACKUPS_FOLDER = (
             obtener_o_crear_carpeta(
                 "backups",
@@ -599,10 +583,14 @@ def inicializar_google_drive():
         )
 
 
+        print(
+            "📂 Carpeta conocimiento ID: "
+            f"{DRIVE_KNOWLEDGE_FOLDER}"
+        )
+
+
         # ----------------------------------------------------
         # SINCRONIZAR CONOCIMIENTO
-        #
-        # penaguillo.json en Drive es la fuente maestra.
         # ----------------------------------------------------
 
         sincronizar_conocimiento_desde_drive()
@@ -670,11 +658,16 @@ def buscar_archivo_drive(
                 "name,"
                 "mimeType,"
                 "size,"
-                "modifiedTime"
+                "modifiedTime,"
+                "parents"
                 ")"
             ),
 
             "pageSize": 100,
+
+            "orderBy": (
+                "modifiedTime desc"
+            ),
 
         }
 
@@ -704,9 +697,97 @@ def buscar_archivo_drive(
         )
 
 
+        # ====================================================
+        # DIAGNÓSTICO
+        # ====================================================
+
+        print(
+            "🔎 Búsqueda Drive:"
+        )
+
+        print(
+            f"   Nombre: {nombre}"
+        )
+
+        print(
+            f"   Carpeta: {folder_id}"
+        )
+
+        print(
+            "   Resultados encontrados: "
+            f"{len(archivos)}"
+        )
+
+
+        for indice, archivo in enumerate(
+
+            archivos,
+
+            start=1,
+
+        ):
+
+            print(
+                f"   ───────── Archivo {indice}"
+            )
+
+            print(
+                f"   🆔 ID: "
+                f"{archivo.get('id')}"
+            )
+
+            print(
+                f"   📄 Nombre: "
+                f"{archivo.get('name')}"
+            )
+
+            print(
+                f"   📦 MIME: "
+                f"{archivo.get('mimeType')}"
+            )
+
+            print(
+                f"   📏 Tamaño Drive: "
+                f"{archivo.get('size', 'N/D')} bytes"
+            )
+
+            print(
+                f"   📅 Modificado: "
+                f"{archivo.get('modifiedTime', 'N/D')}"
+            )
+
+            print(
+                f"   📁 Padres: "
+                f"{archivo.get('parents', [])}"
+            )
+
+
         if archivos:
 
-            return archivos[0]
+            archivo = archivos[0]
+
+
+            print(
+                "🎯 Archivo seleccionado:"
+            )
+
+            print(
+                f"   ID = "
+                f"{archivo.get('id')}"
+            )
+
+            print(
+                f"   Tamaño = "
+                f"{archivo.get('size', 'N/D')} bytes"
+            )
+
+
+            return archivo
+
+
+        print(
+            "ℹ️ No se encontró el archivo."
+        )
 
 
         return None
@@ -764,7 +845,8 @@ def listar_archivos_drive(
                 "name,"
                 "mimeType,"
                 "size,"
-                "modifiedTime"
+                "modifiedTime,"
+                "parents"
                 ")"
             ),
 
@@ -853,9 +935,13 @@ def obtener_o_crear_carpeta(
         drive_service
         .files()
         .create(
+
             body=metadata,
+
             fields="id",
+
             supportsAllDrives=True,
+
         )
         .execute()
     )
@@ -966,7 +1052,7 @@ def subir_archivo_drive(
 
                     media_body=media,
 
-                    fields="id,name",
+                    fields="id,name,size,modifiedTime",
 
                     supportsAllDrives=True,
 
@@ -978,6 +1064,22 @@ def subir_archivo_drive(
             print(
                 "☁️ Archivo actualizado en Drive: "
                 f"{nombre_drive}"
+            )
+
+
+            print(
+                f"   🆔 ID: "
+                f"{archivo.get('id')}"
+            )
+
+            print(
+                f"   📏 Tamaño: "
+                f"{archivo.get('size', 'N/D')} bytes"
+            )
+
+            print(
+                f"   📅 Modificado: "
+                f"{archivo.get('modifiedTime', 'N/D')}"
             )
 
 
@@ -1008,7 +1110,7 @@ def subir_archivo_drive(
 
                 media_body=media,
 
-                fields="id,name",
+                fields="id,name,size,modifiedTime",
 
                 supportsAllDrives=True,
 
@@ -1053,6 +1155,79 @@ def descargar_archivo_drive(
 
     try:
 
+        # ----------------------------------------------------
+        # OBTENER METADATOS ANTES DE DESCARGAR
+        # ----------------------------------------------------
+
+        metadata = (
+            drive_service
+            .files()
+            .get(
+
+                fileId=file_id,
+
+                fields=(
+                    "id,"
+                    "name,"
+                    "mimeType,"
+                    "size,"
+                    "modifiedTime,"
+                    "parents"
+                ),
+
+                supportsAllDrives=True,
+
+            )
+            .execute()
+        )
+
+
+        print(
+            "📋 Metadatos del archivo "
+            "que se va a descargar:"
+        )
+
+
+        print(
+            f"   🆔 ID: "
+            f"{metadata.get('id')}"
+        )
+
+
+        print(
+            f"   📄 Nombre: "
+            f"{metadata.get('name')}"
+        )
+
+
+        print(
+            f"   📦 MIME: "
+            f"{metadata.get('mimeType')}"
+        )
+
+
+        print(
+            f"   📏 Tamaño reportado por Drive: "
+            f"{metadata.get('size', 'N/D')} bytes"
+        )
+
+
+        print(
+            f"   📅 Modificado: "
+            f"{metadata.get('modifiedTime', 'N/D')}"
+        )
+
+
+        print(
+            f"   📁 Padres: "
+            f"{metadata.get('parents', [])}"
+        )
+
+
+        # ----------------------------------------------------
+        # DESCARGAR CONTENIDO
+        # ----------------------------------------------------
+
         request = (
             drive_service
             .files()
@@ -1085,12 +1260,40 @@ def descargar_archivo_drive(
 
         while not terminado:
 
-            _, terminado = (
+            estado, terminado = (
                 downloader.next_chunk()
             )
 
 
+            if estado:
+
+                print(
+                    "⬇️ Progreso descarga: "
+                    f"{int(estado.progress() * 100)}%"
+                )
+
+
         datos = buffer.getvalue()
+
+
+        print(
+            "📦 Bytes realmente descargados: "
+            f"{len(datos)}"
+        )
+
+
+        # ----------------------------------------------------
+        # SEGURIDAD
+        # ----------------------------------------------------
+
+        if len(datos) == 0:
+
+            print(
+                "🛑 Drive devolvió "
+                "un archivo vacío."
+            )
+
+            return False
 
 
         destino.parent.mkdir(
@@ -1273,26 +1476,6 @@ def validar_json_conocimiento(
 # ============================================================
 # GOOGLE DRIVE — SINCRONIZAR CONOCIMIENTO DESDE DRIVE
 # ============================================================
-#
-# IMPORTANTE:
-#
-# Google Drive es la fuente permanente.
-#
-# Si Render arranca sin archivo local:
-#     descarga el JSON desde Drive.
-#
-# Si Drive tiene JSON válido:
-#     lo descarga.
-#
-# Si Drive tiene JSON vacío o corrupto:
-#     NO lo sobrescribe.
-#
-# Si no existe en Drive:
-#     solo sube un archivo local si ese archivo es válido
-#     y contiene información.
-#
-# NUNCA crea [] automáticamente.
-# ============================================================
 
 def sincronizar_conocimiento_desde_drive():
 
@@ -1343,9 +1526,36 @@ def sincronizar_conocimiento_desde_drive():
 
             print(
 
+                "🆔 ID maestro Drive: "
+
+                f"{archivo_drive.get('id')}"
+
+            )
+
+
+            print(
+
+                "📏 Tamaño reportado Drive: "
+
+                f"{archivo_drive.get('size', 'N/D')} bytes"
+
+            )
+
+
+            print(
+
                 "📅 Última modificación Drive: "
 
                 f"{archivo_drive.get('modifiedTime', 'N/D')}"
+
+            )
+
+
+            print(
+
+                "📁 Carpeta padre: "
+
+                f"{archivo_drive.get('parents', [])}"
 
             )
 
@@ -1645,14 +1855,6 @@ def sincronizar_conocimiento_a_drive():
         return
 
 
-    # --------------------------------------------------------
-    # VALIDACIÓN DE SEGURIDAD
-    #
-    # JAMÁS subir un JSON vacío.
-    #
-    # Esto protege contra la pérdida de conocimiento.
-    # --------------------------------------------------------
-
     valido, data = (
         validar_json_conocimiento(
             ARCHIVO_CONOCIMIENTO
@@ -1796,7 +1998,7 @@ app = FastAPI(
 
     title="Penaguillo IA",
 
-    version="5.0.0",
+    version="5.1.0",
 
     description=(
         "Backend del asistente inteligente Penaguillo"
@@ -2010,13 +2212,6 @@ def cargar_system_prompt() -> str:
 # ============================================================
 # CARGAR CONOCIMIENTO
 # ============================================================
-#
-# SOLO LEE.
-#
-# NO crea []
-# NO guarda []
-# NO modifica Drive
-# ============================================================
 
 def cargar_conocimiento() -> list[dict[str, Any]]:
 
@@ -2096,17 +2291,6 @@ def cargar_conocimiento() -> list[dict[str, Any]]:
 
 # ============================================================
 # BACKUP
-# ============================================================
-#
-# Los backups siguen existiendo como seguridad adicional.
-#
-# IMPORTANTE:
-#
-# Los backups NO se utilizan automáticamente durante el startup.
-#
-# El archivo maestro es:
-#
-#     penaguillo.json
 # ============================================================
 
 def crear_backup() -> str | None:
@@ -2222,10 +2406,6 @@ def crear_backup() -> str | None:
             )
 
 
-            # ------------------------------------------------
-            # SUBIR BACKUP A DRIVE
-            # ------------------------------------------------
-
             sincronizar_backup_a_drive(
 
                 backup_path
@@ -2286,16 +2466,6 @@ def guardar_conocimiento(
         )
 
 
-    # --------------------------------------------------------
-    # SEGURIDAD
-    #
-    # No permitir guardar accidentalmente una lista vacía
-    # si ya existe conocimiento válido.
-    #
-    # Para eliminar el último registro se puede permitir
-    # explícitamente desde el endpoint de eliminación.
-    # --------------------------------------------------------
-
     if (
 
         len(conocimientos) == 0
@@ -2331,10 +2501,6 @@ def guardar_conocimiento(
 
             pass
 
-
-    # --------------------------------------------------------
-    # ARCHIVO TEMPORAL
-    # --------------------------------------------------------
 
     archivo_temporal = (
 
@@ -2380,10 +2546,6 @@ def guardar_conocimiento(
             )
 
 
-        # ----------------------------------------------------
-        # REEMPLAZO ATÓMICO
-        # ----------------------------------------------------
-
         os.replace(
 
             archivo_temporal,
@@ -2404,12 +2566,6 @@ def guardar_conocimiento(
         )
 
 
-        # ----------------------------------------------------
-        # SUBIR PRINCIPAL A DRIVE
-        #
-        # Solo se sube si es válido.
-        # ----------------------------------------------------
-
         if len(conocimientos) > 0:
 
             sincronizar_conocimiento_a_drive()
@@ -2424,10 +2580,6 @@ def guardar_conocimiento(
 
             )
 
-
-        # ----------------------------------------------------
-        # CREAR BACKUP
-        # ----------------------------------------------------
 
         if len(conocimientos) > 0:
 
@@ -2592,7 +2744,7 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "5.0.0",
+        "version": "5.1.0",
 
         "chat_model": CHAT_MODEL,
 
@@ -2825,10 +2977,6 @@ def ensenar(
         }
 
 
-        # ----------------------------------------------------
-        # APPEND
-        # ----------------------------------------------------
-
         conocimientos.append(
             nuevo
         )
@@ -3008,10 +3156,6 @@ def extraer_contenido_respuesta(
     )
 
 
-    # --------------------------------------------------------
-    # Respuesta normal
-    # --------------------------------------------------------
-
     if isinstance(
 
         content,
@@ -3027,10 +3171,6 @@ def extraer_contenido_respuesta(
 
             return contenido
 
-
-    # --------------------------------------------------------
-    # Respuesta por bloques
-    # --------------------------------------------------------
 
     if isinstance(
 
@@ -3868,10 +4008,6 @@ async def ensenar_pdf(
         contenido_final = ""
 
 
-        # ----------------------------------------------------
-        # PDF NORMAL
-        # ----------------------------------------------------
-
         if not es_escaneado:
 
             contenido_final = (
@@ -3880,10 +4016,6 @@ async def ensenar_pdf(
 
             )
 
-
-        # ----------------------------------------------------
-        # PDF ESCANEADO
-        # ----------------------------------------------------
 
         else:
 
@@ -4284,21 +4416,11 @@ def eliminar_conocimiento(
 
 
         # ----------------------------------------------------
-        # CASO ESPECIAL:
-        #
         # Si se elimina el último conocimiento,
-        # NO sobrescribimos Drive con [].
-        #
-        # El conocimiento local queda vacío,
-        # pero Drive conserva la última versión válida.
-        #
-        # Esto es deliberado como protección contra pérdida
-        # accidental de toda la base.
+        # NO sobrescribir Drive con [].
         # ----------------------------------------------------
 
         if len(nuevos_conocimientos) == 0:
-
-            # Guardar localmente vacío de forma controlada.
 
             archivo_temporal = (
 
