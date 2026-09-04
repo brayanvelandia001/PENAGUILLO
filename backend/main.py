@@ -80,6 +80,9 @@ BACKUP_DIR = CONOCIMIENTO_DIR / "backups"
 
 ARCHIVO_CONOCIMIENTO = CONOCIMIENTO_DIR / "penaguillo.json"
 
+# Archivo externo para la personalidad e instrucciones
+PROMPT_FILE = CONOCIMIENTO_DIR / "prompt.txt"
+
 
 # ============================================================
 # CREAR CARPETAS
@@ -274,6 +277,51 @@ def nombre_seguro(
         nombre
         or f"archivo_{generar_id()}"
     )
+
+
+# ============================================================
+# CARGAR SYSTEM PROMPT
+# ============================================================
+
+def cargar_system_prompt() -> str:
+
+    """
+    Carga las instrucciones de Penaguillo
+    desde conocimiento/prompt.txt.
+
+    El prompt se mantiene separado del
+    conocimiento almacenado en penaguillo.json.
+    """
+
+    if not PROMPT_FILE.exists():
+
+        raise RuntimeError(
+            f"No se encontró el archivo prompt.txt: {PROMPT_FILE}"
+        )
+
+    try:
+
+        with open(
+            PROMPT_FILE,
+            "r",
+            encoding="utf-8",
+        ) as archivo:
+
+            contenido = archivo.read().strip()
+
+        if not contenido:
+
+            raise RuntimeError(
+                "El archivo prompt.txt está vacío."
+            )
+
+        return contenido
+
+    except OSError as error:
+
+        raise RuntimeError(
+            f"No fue posible leer prompt.txt: {error}"
+        ) from error
 
 
 # ============================================================
@@ -599,46 +647,7 @@ DESCRIPCIÓN VISUAL:
 # SYSTEM PROMPT
 # ============================================================
 
-SYSTEM_PROMPT_BASE = """
-Eres Penaguillo, el asistente inteligente de Penagos Hermanos.
-
-Tu función es ayudar a usuarios y colaboradores con información
-sobre Penagos, sus productos, maquinaria, procesos de café,
-agricultura, servicio técnico, postventa, proyectos y conocimiento
-interno que haya sido proporcionado al sistema.
-
-REGLAS IMPORTANTES:
-
-1. No inventes información.
-
-2. Si no encuentras la respuesta en el conocimiento disponible,
-   dilo claramente.
-
-3. Diferencia entre información confirmada y suposiciones.
-
-4. No inventes precios, referencias, capacidades, especificaciones
-   técnicas, contactos ni disponibilidad.
-
-5. Si una pregunta requiere información que no existe en tu
-   conocimiento, solicita los datos necesarios.
-
-6. Responde de forma profesional pero natural.
-
-7. Puedes explicar temas técnicos de manera sencilla.
-
-8. Cuando corresponda, recomienda contactar al área comercial,
-   técnica o de servicio.
-
-9. Utiliza TODO el conocimiento proporcionado.
-
-10. El conocimiento interno tiene prioridad sobre respuestas
-    genéricas cuando responde directamente a la pregunta.
-
-11. Nunca digas que sabes algo si no aparece en la información
-    disponible o no puedes confirmarlo.
-
-Eres un asistente de Penagos Hermanos, no un asistente genérico.
-"""
+SYSTEM_PROMPT_BASE = cargar_system_prompt()
 
 
 # ============================================================
