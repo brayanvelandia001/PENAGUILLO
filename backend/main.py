@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 5.1
+# VERSIÓN 5.2
 #
 # FUNCIONES:
 # - Chat con Penaguillo
@@ -29,6 +29,18 @@
 # pero al iniciar vuelve a descargar penaguillo.json desde Drive.
 #
 # NUNCA se sube [] automáticamente a Drive durante el arranque.
+#
+# CORRECCIONES V5.2:
+#
+# - Búsqueda del maestro limitada a application/json.
+# - Diagnóstico completo de ID, MIME, tamaño y padres.
+# - Detección de shortcuts.
+# - Descarga con MediaIoBaseDownload.
+# - Verificación de bytes realmente descargados.
+# - Validación del JSON antes de reemplazar el archivo local.
+# - No se sobrescribe Drive con [] durante startup.
+# - Las carpetas encontradas se validan como carpetas.
+# - El conocimiento de Drive continúa siendo la fuente maestra.
 # ============================================================
 
 
@@ -256,7 +268,11 @@ GOOGLE_PROJECT_ID = os.getenv(
     "GOOGLE_PROJECT_ID"
 )
 
+# ============================================================
+# IMPORTANTE:
 # MANTENER ESTE NOMBRE
+# ============================================================
+
 GOOGLE_DRIVE_FOLDER_ID = os.getenv(
     "GOOGLE_DRIVE_FOLDER_ID"
 )
@@ -495,6 +511,26 @@ def inicializar_google_drive():
         )
 
 
+        # ----------------------------------------------------
+        # Validar que realmente sea una carpeta
+        # ----------------------------------------------------
+
+        mime_raiz = (
+            info_carpeta.get(
+                "mimeType"
+            )
+        )
+
+        if mime_raiz != (
+            "application/vnd.google-apps.folder"
+        ):
+
+            raise RuntimeError(
+                "GOOGLE_DRIVE_FOLDER_ID "
+                "no corresponde a una carpeta."
+            )
+
+
         DRIVE_SHARED_ID = (
             info_carpeta.get(
                 "driveId"
@@ -614,6 +650,7 @@ def inicializar_google_drive():
 def buscar_archivo_drive(
     nombre: str,
     folder_id: str,
+    solo_json: bool = False,
 ):
 
     if not drive_service:
@@ -640,6 +677,18 @@ def buscar_archivo_drive(
     )
 
 
+    # --------------------------------------------------------
+    # CORRECCIÓN:
+    # Cuando buscamos el maestro, exigir JSON real.
+    # --------------------------------------------------------
+
+    if solo_json:
+
+        query += (
+            " and mimeType = 'application/json'"
+        )
+
+
     try:
 
         parametros = {
@@ -659,7 +708,8 @@ def buscar_archivo_drive(
                 "mimeType,"
                 "size,"
                 "modifiedTime,"
-                "parents"
+                "parents,"
+                "shortcutDetails"
                 ")"
             ),
 
@@ -671,6 +721,10 @@ def buscar_archivo_drive(
 
         }
 
+
+        # ----------------------------------------------------
+        # Shared Drive
+        # ----------------------------------------------------
 
         if DRIVE_SHARED_ID:
 
@@ -711,6 +765,10 @@ def buscar_archivo_drive(
 
         print(
             f"   Carpeta: {folder_id}"
+        )
+
+        print(
+            f"   Solo JSON: {solo_json}"
         )
 
         print(
@@ -761,10 +819,58 @@ def buscar_archivo_drive(
                 f"{archivo.get('parents', [])}"
             )
 
+            if archivo.get("shortcutDetails"):
+
+                print(
+                    "   ⚠️ SHORTCUT DETECTADO:"
+                )
+
+                print(
+                    f"   {archivo.get('shortcutDetails')}"
+                )
+
+
+        # ====================================================
+        # SELECCIONAR ARCHIVO
+        # ====================================================
 
         if archivos:
 
             archivo = archivos[0]
+
+
+            # ------------------------------------------------
+            # No aceptar shortcut como maestro
+            # ------------------------------------------------
+
+            if archivo.get(
+                "mimeType"
+            ) == "application/vnd.google-apps.shortcut":
+
+                print(
+                    "🛑 El archivo encontrado "
+                    "es un shortcut."
+                )
+
+                return None
+
+
+            # ------------------------------------------------
+            # Si se pidió JSON, verificar MIME
+            # ------------------------------------------------
+
+            if solo_json:
+
+                if archivo.get(
+                    "mimeType"
+                ) != "application/json":
+
+                    print(
+                        "🛑 El archivo encontrado "
+                        "no es application/json."
+                    )
+
+                    return None
 
 
             print(
@@ -777,8 +883,23 @@ def buscar_archivo_drive(
             )
 
             print(
+                f"   Nombre = "
+                f"{archivo.get('name')}"
+            )
+
+            print(
+                f"   MIME = "
+                f"{archivo.get('mimeType')}"
+            )
+
+            print(
                 f"   Tamaño = "
                 f"{archivo.get('size', 'N/D')} bytes"
+            )
+
+            print(
+                f"   Modificado = "
+                f"{archivo.get('modifiedTime', 'N/D')}"
             )
 
 
@@ -911,9 +1032,41 @@ def obtener_o_crear_carpeta(
     )
 
 
+    # --------------------------------------------------------
+    # CORRECCIÓN:
+    # Solo aceptar un resultado que realmente sea carpeta.
+    # --------------------------------------------------------
+
     if existente:
 
-        return existente["id"]
+        mime_type = existente.get(
+            "mimeType"
+        )
+
+        if mime_type == (
+            "application/vnd.google-apps.folder"
+        ):
+
+            print(
+                f"📁 Carpeta existente encontrada: "
+                f"{nombre}"
+            )
+
+            return existente["id"]
+
+
+        print(
+            "⚠️ Existe un elemento llamado "
+            f"{nombre}, pero no es una carpeta."
+        )
+
+        print(
+            f"   MIME encontrado: {mime_type}"
+        )
+
+        print(
+            "⚠️ Se intentará crear la carpeta."
+        )
 
 
     metadata = {
@@ -938,7 +1091,7 @@ def obtener_o_crear_carpeta(
 
             body=metadata,
 
-            fields="id",
+            fields="id,name,mimeType,parents",
 
             supportsAllDrives=True,
 
@@ -985,9 +1138,24 @@ def subir_archivo_drive(
     )
 
 
+    # --------------------------------------------------------
+    # Para penaguillo.json buscar exclusivamente JSON.
+    # --------------------------------------------------------
+
+    es_json_maestro = (
+        nombre_drive.lower()
+        == "penaguillo.json"
+    )
+
+
     existente = buscar_archivo_drive(
+
         nombre_drive,
+
         folder_id,
+
+        solo_json=es_json_maestro,
+
     )
 
 
@@ -1026,6 +1194,27 @@ def subir_archivo_drive(
 
     try:
 
+        tamaño_local = ruta.stat().st_size
+
+
+        print(
+            "☁️ Preparando archivo para Drive:"
+        )
+
+        print(
+            f"   📄 Nombre: {nombre_drive}"
+        )
+
+        print(
+            f"   📦 MIME: {mime_type}"
+        )
+
+        print(
+            f"   📏 Tamaño local: "
+            f"{tamaño_local} bytes"
+        )
+
+
         media = MediaFileUpload(
 
             str(ruta),
@@ -1043,6 +1232,11 @@ def subir_archivo_drive(
 
         if existente:
 
+            print(
+                "🔄 Actualizando archivo existente "
+                "en Drive."
+            )
+
             archivo = (
                 drive_service
                 .files()
@@ -1052,7 +1246,14 @@ def subir_archivo_drive(
 
                     media_body=media,
 
-                    fields="id,name,size,modifiedTime",
+                    fields=(
+                        "id,"
+                        "name,"
+                        "mimeType,"
+                        "size,"
+                        "modifiedTime,"
+                        "parents"
+                    ),
 
                     supportsAllDrives=True,
 
@@ -1070,6 +1271,11 @@ def subir_archivo_drive(
             print(
                 f"   🆔 ID: "
                 f"{archivo.get('id')}"
+            )
+
+            print(
+                f"   📦 MIME: "
+                f"{archivo.get('mimeType')}"
             )
 
             print(
@@ -1094,6 +1300,8 @@ def subir_archivo_drive(
 
             "name": nombre_drive,
 
+            "mimeType": mime_type,
+
             "parents": [
                 folder_id
             ],
@@ -1110,7 +1318,14 @@ def subir_archivo_drive(
 
                 media_body=media,
 
-                fields="id,name,size,modifiedTime",
+                fields=(
+                    "id,"
+                    "name,"
+                    "mimeType,"
+                    "size,"
+                    "modifiedTime,"
+                    "parents"
+                ),
 
                 supportsAllDrives=True,
 
@@ -1122,6 +1337,22 @@ def subir_archivo_drive(
         print(
             "☁️ Archivo subido a Drive: "
             f"{nombre_drive}"
+        )
+
+
+        print(
+            f"   🆔 ID: "
+            f"{archivo.get('id')}"
+        )
+
+        print(
+            f"   📦 MIME: "
+            f"{archivo.get('mimeType')}"
+        )
+
+        print(
+            f"   📏 Tamaño: "
+            f"{archivo.get('size', 'N/D')} bytes"
         )
 
 
@@ -1172,7 +1403,8 @@ def descargar_archivo_drive(
                     "mimeType,"
                     "size,"
                     "modifiedTime,"
-                    "parents"
+                    "parents,"
+                    "shortcutDetails"
                 ),
 
                 supportsAllDrives=True,
@@ -1225,6 +1457,58 @@ def descargar_archivo_drive(
 
 
         # ----------------------------------------------------
+        # CORRECCIÓN:
+        # No descargar shortcuts.
+        # ----------------------------------------------------
+
+        if metadata.get(
+            "mimeType"
+        ) == "application/vnd.google-apps.shortcut":
+
+            print(
+                "🛑 El archivo es un shortcut."
+            )
+
+            print(
+                f"   Detalles: "
+                f"{metadata.get('shortcutDetails')}"
+            )
+
+            return False
+
+
+        # ----------------------------------------------------
+        # CORRECCIÓN:
+        # Si es penaguillo.json, debe ser JSON.
+        # ----------------------------------------------------
+
+        if (
+            metadata.get("name")
+            == "penaguillo.json"
+        ):
+
+            if metadata.get(
+                "mimeType"
+            ) != "application/json":
+
+                print(
+                    "🛑 BLOQUEADO:"
+                )
+
+                print(
+                    "🛑 penaguillo.json no tiene "
+                    "MIME application/json."
+                )
+
+                print(
+                    f"   MIME encontrado: "
+                    f"{metadata.get('mimeType')}"
+                )
+
+                return False
+
+
+        # ----------------------------------------------------
         # DESCARGAR CONTENIDO
         # ----------------------------------------------------
 
@@ -1252,10 +1536,17 @@ def descargar_archivo_drive(
 
             request,
 
+            chunksize=(
+                1024 * 1024
+            ),
+
         )
 
 
         terminado = False
+
+
+        ultimo_porcentaje = -1
 
 
         while not terminado:
@@ -1267,19 +1558,73 @@ def descargar_archivo_drive(
 
             if estado:
 
-                print(
-                    "⬇️ Progreso descarga: "
-                    f"{int(estado.progress() * 100)}%"
+                porcentaje = int(
+                    estado.progress()
+                    * 100
                 )
+
+
+                if porcentaje != ultimo_porcentaje:
+
+                    print(
+                        "⬇️ Progreso descarga: "
+                        f"{porcentaje}%"
+                    )
+
+                    ultimo_porcentaje = porcentaje
 
 
         datos = buffer.getvalue()
 
 
         print(
-            "📦 Bytes realmente descargados: "
+            "📏 Bytes realmente descargados: "
             f"{len(datos)}"
         )
+
+
+        # ----------------------------------------------------
+        # COMPARACIÓN CON TAMAÑO DE DRIVE
+        # ----------------------------------------------------
+
+        tamaño_drive = metadata.get(
+            "size"
+        )
+
+
+        if tamaño_drive is not None:
+
+            try:
+
+                tamaño_drive_int = int(
+                    tamaño_drive
+                )
+
+                if tamaño_drive_int != len(datos):
+
+                    print(
+                        "⚠️ ADVERTENCIA:"
+                    )
+
+                    print(
+                        "⚠️ El tamaño reportado "
+                        "por Drive no coincide "
+                        "con los bytes descargados."
+                    )
+
+                    print(
+                        f"   Drive: "
+                        f"{tamaño_drive_int} bytes"
+                    )
+
+                    print(
+                        f"   Descargado: "
+                        f"{len(datos)} bytes"
+                    )
+
+            except (TypeError, ValueError):
+
+                pass
 
 
         # ----------------------------------------------------
@@ -1296,6 +1641,99 @@ def descargar_archivo_drive(
             return False
 
 
+        # ----------------------------------------------------
+        # Para el maestro JSON, validar contenido
+        # ANTES de escribir el archivo destino.
+        # ----------------------------------------------------
+
+        if (
+            metadata.get("name")
+            == "penaguillo.json"
+        ):
+
+            try:
+
+                contenido_texto = (
+                    datos
+                    .decode("utf-8")
+                )
+
+                json_data = json.loads(
+                    contenido_texto
+                )
+
+
+                if not isinstance(
+                    json_data,
+                    list,
+                ):
+
+                    print(
+                        "🛑 El penaguillo.json "
+                        "descargado no contiene "
+                        "una lista en la raíz."
+                    )
+
+                    return False
+
+
+                if not all(
+                    isinstance(
+                        item,
+                        dict,
+                    )
+                    for item in json_data
+                ):
+
+                    print(
+                        "🛑 El penaguillo.json "
+                        "descargado contiene "
+                        "registros inválidos."
+                    )
+
+                    return False
+
+
+                print(
+                    "✅ JSON descargado "
+                    "y validado correctamente."
+                )
+
+                print(
+                    "📚 Registros encontrados: "
+                    f"{len(json_data)}"
+                )
+
+
+            except UnicodeDecodeError as error:
+
+                print(
+                    "🛑 El JSON descargado "
+                    "no está en UTF-8."
+                )
+
+                print(error)
+
+                return False
+
+
+            except json.JSONDecodeError as error:
+
+                print(
+                    "🛑 El penaguillo.json "
+                    "descargado contiene "
+                    "JSON inválido."
+                )
+
+                print(error)
+
+                return False
+
+
+        # ----------------------------------------------------
+        # ESCRITURA ATÓMICA DEL ARCHIVO DESCARGADO
+        # ----------------------------------------------------
+
         destino.parent.mkdir(
 
             parents=True,
@@ -1305,15 +1743,51 @@ def descargar_archivo_drive(
         )
 
 
-        with open(
+        temporal_destino = (
+            destino.parent
+            / f".{destino.name}.{generar_id()}.tmp"
+        )
 
-            destino,
 
-            "wb",
+        try:
 
-        ) as archivo:
+            with open(
 
-            archivo.write(datos)
+                temporal_destino,
+
+                "wb",
+
+            ) as archivo:
+
+                archivo.write(datos)
+
+                archivo.flush()
+
+                os.fsync(
+                    archivo.fileno()
+                )
+
+
+            os.replace(
+
+                temporal_destino,
+
+                destino,
+
+            )
+
+
+        finally:
+
+            if temporal_destino.exists():
+
+                try:
+
+                    temporal_destino.unlink()
+
+                except OSError:
+
+                    pass
 
 
         print(
@@ -1500,12 +1974,19 @@ def sincronizar_conocimiento_desde_drive():
 
     try:
 
+        # ----------------------------------------------------
+        # CORRECCIÓN:
+        # Buscar exclusivamente el JSON maestro.
+        # ----------------------------------------------------
+
         archivo_drive = (
             buscar_archivo_drive(
 
                 "penaguillo.json",
 
                 DRIVE_KNOWLEDGE_FOLDER,
+
+                solo_json=True,
 
             )
         )
@@ -1529,6 +2010,15 @@ def sincronizar_conocimiento_desde_drive():
                 "🆔 ID maestro Drive: "
 
                 f"{archivo_drive.get('id')}"
+
+            )
+
+
+            print(
+
+                "📦 MIME maestro Drive: "
+
+                f"{archivo_drive.get('mimeType')}"
 
             )
 
@@ -1596,6 +2086,11 @@ def sincronizar_conocimiento_desde_drive():
                 print(
                     "❌ No fue posible descargar "
                     "penaguillo.json."
+                )
+
+                print(
+                    "🛡️ El conocimiento local "
+                    "NO será reemplazado."
                 )
 
                 return
@@ -1721,6 +2216,12 @@ def sincronizar_conocimiento_desde_drive():
             print(
                 "🛑 penaguillo.json de Drive "
                 "está vacío o inválido."
+            )
+
+
+            print(
+                "🛡️ El conocimiento local "
+                "NO será reemplazado."
             )
 
 
@@ -1998,7 +2499,7 @@ app = FastAPI(
 
     title="Penaguillo IA",
 
-    version="5.1.0",
+    version="5.2.0",
 
     description=(
         "Backend del asistente inteligente Penaguillo"
@@ -2277,6 +2778,22 @@ def cargar_conocimiento() -> list[dict[str, Any]]:
         )
 
 
+    if not all(
+
+        isinstance(item, dict)
+
+        for item in data
+
+    ):
+
+        raise RuntimeError(
+
+            "penaguillo.json contiene "
+            "registros que no son objetos."
+
+        )
+
+
     print(
 
         "📚 Conocimiento local cargado: "
@@ -2466,6 +2983,12 @@ def guardar_conocimiento(
         )
 
 
+    # --------------------------------------------------------
+    # SEGURIDAD:
+    # Nunca permitir reemplazar un conocimiento existente
+    # por [].
+    # --------------------------------------------------------
+
     if (
 
         len(conocimientos) == 0
@@ -2482,6 +3005,7 @@ def guardar_conocimiento(
                 )
             )
 
+
             if valido_actual and len(data_actual) > 0:
 
                 raise RuntimeError(
@@ -2493,9 +3017,11 @@ def guardar_conocimiento(
 
                 )
 
+
         except RuntimeError:
 
             raise
+
 
         except Exception:
 
@@ -2565,6 +3091,10 @@ def guardar_conocimiento(
 
         )
 
+
+        # ----------------------------------------------------
+        # Solo sincronizar una lista no vacía.
+        # ----------------------------------------------------
 
         if len(conocimientos) > 0:
 
@@ -2744,7 +3274,7 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "5.1.0",
+        "version": "5.2.0",
 
         "chat_model": CHAT_MODEL,
 
@@ -3800,7 +4330,9 @@ Devuelve todo lo útil de esta página en texto estructurado.
 
 
         return extraer_contenido_respuesta(
+
             respuesta
+
         )
 
 
@@ -4092,7 +4624,6 @@ PÁGINA {indice}
             raise RuntimeError(
 
                 "No fue posible extraer "
-
                 "información del PDF."
 
             )
@@ -4118,7 +4649,6 @@ PÁGINA {indice}
             "descripcion": (
 
                 "Documento PDF procesado "
-
                 "por Penaguillo."
 
             ),
@@ -4176,7 +4706,6 @@ PÁGINA {indice}
             "mensaje": (
 
                 "PDF aprendido "
-
                 "correctamente."
 
             ),
@@ -4716,7 +5245,9 @@ def startup_event():
     try:
 
         conocimientos = (
+
             cargar_conocimiento()
+
         )
 
 
