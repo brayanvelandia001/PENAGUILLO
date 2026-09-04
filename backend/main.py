@@ -111,11 +111,20 @@ else:
 
 if os.getenv("RENDER") == "true":
 
-    CONOCIMIENTO_DIR = Path(
-        "/var/data/conocimiento"
+    # Render Free no tiene Persistent Disk.
+    # Usamos almacenamiento temporal local
+    # y Google Drive como almacenamiento permanente.
+
+    CONOCIMIENTO_DIR = (
+        BASE_DIR
+        / "storage"
+        / "conocimiento"
     )
 
 else:
+
+    # En el ejecutable/local se mantiene
+    # la carpeta conocimiento existente.
 
     CONOCIMIENTO_DIR = (
         BASE_DIR
