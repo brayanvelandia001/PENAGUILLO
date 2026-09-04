@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 5.2
+# VERSIÓN 5.3
 #
 # FUNCIONES:
 # - Chat con Penaguillo
@@ -16,31 +16,28 @@
 # - penaguillo.json como FUENTE MAESTRA de conocimiento
 # - Backups opcionales después de cada cambio
 # - Escritura atómica
-# - NO usa Tesseract
 #
-# IMPORTANTE:
+# CORRECCIÓN V5.3:
 #
-# GOOGLE_DRIVE_FOLDER_ID sigue siendo el ID de la carpeta
-# raíz de Penaguillo dentro del Shared Drive.
+# El penaguillo.json de Google Drive se descarga mediante
+# una sesión HTTP autenticada de Google.
 #
-# Google Drive conserva el penaguillo.json completo.
+# Esto evita el problema detectado:
 #
-# Render puede perder su almacenamiento local al hacer deploy,
-# pero al iniciar vuelve a descargar penaguillo.json desde Drive.
+# Drive:
+#     20491 bytes
 #
-# NUNCA se sube [] automáticamente a Drive durante el arranque.
+# Descarga anterior:
+#     211 bytes
 #
-# CORRECCIONES V5.2:
+# Ahora se verifica:
 #
-# - Búsqueda del maestro limitada a application/json.
-# - Diagnóstico completo de ID, MIME, tamaño y padres.
-# - Detección de shortcuts.
-# - Descarga con MediaIoBaseDownload.
-# - Verificación de bytes realmente descargados.
-# - Validación del JSON antes de reemplazar el archivo local.
-# - No se sobrescribe Drive con [] durante startup.
-# - Las carpetas encontradas se validan como carpetas.
-# - El conocimiento de Drive continúa siendo la fuente maestra.
+#     Tamaño reportado por Drive
+#     Bytes reales recibidos
+#     JSON válido
+#     Lista de registros
+#
+# NUNCA se sobrescribe Drive con [] durante el arranque.
 # ============================================================
 
 
@@ -87,10 +84,9 @@ try:
 
     from googleapiclient.discovery import build
 
-    from googleapiclient.http import (
-        MediaFileUpload,
-        MediaIoBaseDownload,
-    )
+    from googleapiclient.http import MediaFileUpload
+
+    from google.auth.transport.requests import AuthorizedSession
 
     GOOGLE_AVAILABLE = True
 
@@ -268,11 +264,6 @@ GOOGLE_PROJECT_ID = os.getenv(
     "GOOGLE_PROJECT_ID"
 )
 
-# ============================================================
-# IMPORTANTE:
-# MANTENER ESTE NOMBRE
-# ============================================================
-
 GOOGLE_DRIVE_FOLDER_ID = os.getenv(
     "GOOGLE_DRIVE_FOLDER_ID"
 )
@@ -290,6 +281,8 @@ DRIVE_SCOPES = [
 
 
 drive_service = None
+
+drive_session = None
 
 
 DRIVE_ROOT_FOLDER = None
@@ -310,6 +303,7 @@ DRIVE_BACKUPS_FOLDER = None
 def inicializar_google_drive():
 
     global drive_service
+    global drive_session
 
     global DRIVE_ROOT_FOLDER
     global DRIVE_SHARED_ID
@@ -460,7 +454,7 @@ def inicializar_google_drive():
 
 
         # ----------------------------------------------------
-        # Cliente Drive
+        # Cliente Google Drive API
         # ----------------------------------------------------
 
         drive_service = build(
@@ -473,6 +467,17 @@ def inicializar_google_drive():
 
             cache_discovery=False,
 
+        )
+
+
+        # ----------------------------------------------------
+        # Sesión HTTP autenticada
+        #
+        # ESTA ES LA CORRECCIÓN PRINCIPAL
+        # ----------------------------------------------------
+
+        drive_session = AuthorizedSession(
+            credentials
         )
 
 
@@ -511,15 +516,12 @@ def inicializar_google_drive():
         )
 
 
-        # ----------------------------------------------------
-        # Validar que realmente sea una carpeta
-        # ----------------------------------------------------
-
         mime_raiz = (
             info_carpeta.get(
                 "mimeType"
             )
         )
+
 
         if mime_raiz != (
             "application/vnd.google-apps.folder"
@@ -626,7 +628,7 @@ def inicializar_google_drive():
 
 
         # ----------------------------------------------------
-        # SINCRONIZAR CONOCIMIENTO
+        # DESCARGAR MAESTRO
         # ----------------------------------------------------
 
         sincronizar_conocimiento_desde_drive()
@@ -635,6 +637,8 @@ def inicializar_google_drive():
     except Exception as error:
 
         drive_service = None
+
+        drive_session = None
 
         print(
             "❌ Error inicializando Google Drive:"
@@ -677,11 +681,6 @@ def buscar_archivo_drive(
     )
 
 
-    # --------------------------------------------------------
-    # CORRECCIÓN:
-    # Cuando buscamos el maestro, exigir JSON real.
-    # --------------------------------------------------------
-
     if solo_json:
 
         query += (
@@ -722,10 +721,6 @@ def buscar_archivo_drive(
         }
 
 
-        # ----------------------------------------------------
-        # Shared Drive
-        # ----------------------------------------------------
-
         if DRIVE_SHARED_ID:
 
             parametros["corpora"] = "drive"
@@ -750,10 +745,6 @@ def buscar_archivo_drive(
             [],
         )
 
-
-        # ====================================================
-        # DIAGNÓSTICO
-        # ====================================================
 
         print(
             "🔎 Búsqueda Drive:"
@@ -819,7 +810,9 @@ def buscar_archivo_drive(
                 f"{archivo.get('parents', [])}"
             )
 
-            if archivo.get("shortcutDetails"):
+            if archivo.get(
+                "shortcutDetails"
+            ):
 
                 print(
                     "   ⚠️ SHORTCUT DETECTADO:"
@@ -830,22 +823,16 @@ def buscar_archivo_drive(
                 )
 
 
-        # ====================================================
-        # SELECCIONAR ARCHIVO
-        # ====================================================
-
         if archivos:
 
             archivo = archivos[0]
 
 
-            # ------------------------------------------------
-            # No aceptar shortcut como maestro
-            # ------------------------------------------------
-
             if archivo.get(
                 "mimeType"
-            ) == "application/vnd.google-apps.shortcut":
+            ) == (
+                "application/vnd.google-apps.shortcut"
+            ):
 
                 print(
                     "🛑 El archivo encontrado "
@@ -854,10 +841,6 @@ def buscar_archivo_drive(
 
                 return None
 
-
-            # ------------------------------------------------
-            # Si se pidió JSON, verificar MIME
-            # ------------------------------------------------
 
             if solo_json:
 
@@ -1032,16 +1015,12 @@ def obtener_o_crear_carpeta(
     )
 
 
-    # --------------------------------------------------------
-    # CORRECCIÓN:
-    # Solo aceptar un resultado que realmente sea carpeta.
-    # --------------------------------------------------------
-
     if existente:
 
         mime_type = existente.get(
             "mimeType"
         )
+
 
         if mime_type == (
             "application/vnd.google-apps.folder"
@@ -1060,9 +1039,11 @@ def obtener_o_crear_carpeta(
             f"{nombre}, pero no es una carpeta."
         )
 
+
         print(
             f"   MIME encontrado: {mime_type}"
         )
+
 
         print(
             "⚠️ Se intentará crear la carpeta."
@@ -1091,7 +1072,12 @@ def obtener_o_crear_carpeta(
 
             body=metadata,
 
-            fields="id,name,mimeType,parents",
+            fields=(
+                "id,"
+                "name,"
+                "mimeType,"
+                "parents"
+            ),
 
             supportsAllDrives=True,
 
@@ -1137,10 +1123,6 @@ def subir_archivo_drive(
         or ruta.name
     )
 
-
-    # --------------------------------------------------------
-    # Para penaguillo.json buscar exclusivamente JSON.
-    # --------------------------------------------------------
 
     es_json_maestro = (
         nombre_drive.lower()
@@ -1201,13 +1183,16 @@ def subir_archivo_drive(
             "☁️ Preparando archivo para Drive:"
         )
 
+
         print(
             f"   📄 Nombre: {nombre_drive}"
         )
 
+
         print(
             f"   📦 MIME: {mime_type}"
         )
+
 
         print(
             f"   📏 Tamaño local: "
@@ -1236,6 +1221,7 @@ def subir_archivo_drive(
                 "🔄 Actualizando archivo existente "
                 "en Drive."
             )
+
 
             archivo = (
                 drive_service
@@ -1273,15 +1259,18 @@ def subir_archivo_drive(
                 f"{archivo.get('id')}"
             )
 
+
             print(
                 f"   📦 MIME: "
                 f"{archivo.get('mimeType')}"
             )
 
+
             print(
                 f"   📏 Tamaño: "
                 f"{archivo.get('size', 'N/D')} bytes"
             )
+
 
             print(
                 f"   📅 Modificado: "
@@ -1345,10 +1334,12 @@ def subir_archivo_drive(
             f"{archivo.get('id')}"
         )
 
+
         print(
             f"   📦 MIME: "
             f"{archivo.get('mimeType')}"
         )
+
 
         print(
             f"   📏 Tamaño: "
@@ -1373,6 +1364,18 @@ def subir_archivo_drive(
 # ============================================================
 # GOOGLE DRIVE — DESCARGAR
 # ============================================================
+#
+# CORRECCIÓN PRINCIPAL:
+#
+# Ya NO usamos MediaIoBaseDownload.
+#
+# Usamos AuthorizedSession para hacer directamente:
+#
+# GET https://www.googleapis.com/drive/v3/files/{ID}
+# ?alt=media
+#
+# con las credenciales de la cuenta de servicio.
+# ============================================================
 
 def descargar_archivo_drive(
     file_id: str,
@@ -1384,10 +1387,20 @@ def descargar_archivo_drive(
         return False
 
 
+    if not drive_session:
+
+        print(
+            "❌ No existe sesión HTTP autenticada "
+            "de Google Drive."
+        )
+
+        return False
+
+
     try:
 
         # ----------------------------------------------------
-        # OBTENER METADATOS ANTES DE DESCARGAR
+        # METADATOS
         # ----------------------------------------------------
 
         metadata = (
@@ -1457,29 +1470,31 @@ def descargar_archivo_drive(
 
 
         # ----------------------------------------------------
-        # CORRECCIÓN:
-        # No descargar shortcuts.
+        # SHORTCUT
         # ----------------------------------------------------
 
         if metadata.get(
             "mimeType"
-        ) == "application/vnd.google-apps.shortcut":
+        ) == (
+            "application/vnd.google-apps.shortcut"
+        ):
 
             print(
                 "🛑 El archivo es un shortcut."
             )
+
 
             print(
                 f"   Detalles: "
                 f"{metadata.get('shortcutDetails')}"
             )
 
+
             return False
 
 
         # ----------------------------------------------------
-        # CORRECCIÓN:
-        # Si es penaguillo.json, debe ser JSON.
+        # JSON MAESTRO
         # ----------------------------------------------------
 
         if (
@@ -1495,86 +1510,98 @@ def descargar_archivo_drive(
                     "🛑 BLOQUEADO:"
                 )
 
+
                 print(
                     "🛑 penaguillo.json no tiene "
                     "MIME application/json."
                 )
+
 
                 print(
                     f"   MIME encontrado: "
                     f"{metadata.get('mimeType')}"
                 )
 
+
                 return False
 
 
         # ----------------------------------------------------
-        # DESCARGAR CONTENIDO
+        # URL DE DESCARGA
         # ----------------------------------------------------
 
-        request = (
-            drive_service
-            .files()
-            .get(
+        download_url = (
 
-                fileId=file_id,
-
-                alt="media",
-
-                supportsAllDrives=True,
-
-            )
-        )
-
-
-        buffer = io.BytesIO()
-
-
-        downloader = MediaIoBaseDownload(
-
-            buffer,
-
-            request,
-
-            chunksize=(
-                1024 * 1024
-            ),
+            "https://www.googleapis.com/"
+            "drive/v3/files/"
+            f"{file_id}"
 
         )
 
 
-        terminado = False
+        print(
+            "🌐 Descargando mediante "
+            "sesión autenticada de Google..."
+        )
 
 
-        ultimo_porcentaje = -1
+        # ----------------------------------------------------
+        # PETICIÓN HTTP AUTENTICADA
+        # ----------------------------------------------------
+
+        response = drive_session.get(
+
+            download_url,
+
+            params={
+
+                "alt": "media",
+
+                "supportsAllDrives": "true",
+
+            },
+
+            timeout=120,
+
+        )
 
 
-        while not terminado:
+        print(
+            "🌐 HTTP status descarga: "
+            f"{response.status_code}"
+        )
 
-            estado, terminado = (
-                downloader.next_chunk()
+
+        # ----------------------------------------------------
+        # ERROR HTTP
+        # ----------------------------------------------------
+
+        if response.status_code != 200:
+
+            print(
+                "🛑 Google Drive no devolvió "
+                "HTTP 200."
             )
 
 
-            if estado:
-
-                porcentaje = int(
-                    estado.progress()
-                    * 100
-                )
+            print(
+                "🛑 Respuesta:"
+            )
 
 
-                if porcentaje != ultimo_porcentaje:
-
-                    print(
-                        "⬇️ Progreso descarga: "
-                        f"{porcentaje}%"
-                    )
-
-                    ultimo_porcentaje = porcentaje
+            print(
+                response.text[:1000]
+            )
 
 
-        datos = buffer.getvalue()
+            return False
+
+
+        # ----------------------------------------------------
+        # CONTENIDO REAL
+        # ----------------------------------------------------
+
+        datos = response.content
 
 
         print(
@@ -1584,7 +1611,7 @@ def descargar_archivo_drive(
 
 
         # ----------------------------------------------------
-        # COMPARACIÓN CON TAMAÑO DE DRIVE
+        # COMPARAR TAMAÑOS
         # ----------------------------------------------------
 
         tamaño_drive = metadata.get(
@@ -1600,11 +1627,13 @@ def descargar_archivo_drive(
                     tamaño_drive
                 )
 
+
                 if tamaño_drive_int != len(datos):
 
                     print(
                         "⚠️ ADVERTENCIA:"
                     )
+
 
                     print(
                         "⚠️ El tamaño reportado "
@@ -1612,23 +1641,37 @@ def descargar_archivo_drive(
                         "con los bytes descargados."
                     )
 
+
                     print(
                         f"   Drive: "
                         f"{tamaño_drive_int} bytes"
                     )
+
 
                     print(
                         f"   Descargado: "
                         f"{len(datos)} bytes"
                     )
 
-            except (TypeError, ValueError):
+
+                else:
+
+                    print(
+                        "✅ Tamaño descargado "
+                        "coincide con Drive."
+                    )
+
+
+            except (
+                TypeError,
+                ValueError,
+            ):
 
                 pass
 
 
         # ----------------------------------------------------
-        # SEGURIDAD
+        # ARCHIVO VACÍO
         # ----------------------------------------------------
 
         if len(datos) == 0:
@@ -1638,13 +1681,13 @@ def descargar_archivo_drive(
                 "un archivo vacío."
             )
 
+
             return False
 
 
-        # ----------------------------------------------------
-        # Para el maestro JSON, validar contenido
-        # ANTES de escribir el archivo destino.
-        # ----------------------------------------------------
+        # ====================================================
+        # VALIDAR PENAGUILLO.JSON ANTES DE GUARDAR
+        # ====================================================
 
         if (
             metadata.get("name")
@@ -1658,14 +1701,18 @@ def descargar_archivo_drive(
                     .decode("utf-8")
                 )
 
+
                 json_data = json.loads(
                     contenido_texto
                 )
 
 
                 if not isinstance(
+
                     json_data,
+
                     list,
+
                 ):
 
                     print(
@@ -1674,15 +1721,19 @@ def descargar_archivo_drive(
                         "una lista en la raíz."
                     )
 
+
                     return False
 
 
                 if not all(
+
                     isinstance(
                         item,
                         dict,
                     )
+
                     for item in json_data
+
                 ):
 
                     print(
@@ -1691,6 +1742,7 @@ def descargar_archivo_drive(
                         "registros inválidos."
                     )
 
+
                     return False
 
 
@@ -1698,6 +1750,7 @@ def descargar_archivo_drive(
                     "✅ JSON descargado "
                     "y validado correctamente."
                 )
+
 
                 print(
                     "📚 Registros encontrados: "
@@ -1712,7 +1765,9 @@ def descargar_archivo_drive(
                     "no está en UTF-8."
                 )
 
+
                 print(error)
+
 
                 return False
 
@@ -1725,13 +1780,15 @@ def descargar_archivo_drive(
                     "JSON inválido."
                 )
 
+
                 print(error)
+
 
                 return False
 
 
         # ----------------------------------------------------
-        # ESCRITURA ATÓMICA DEL ARCHIVO DESCARGADO
+        # CREAR CARPETA DESTINO
         # ----------------------------------------------------
 
         destino.parent.mkdir(
@@ -1743,9 +1800,24 @@ def descargar_archivo_drive(
         )
 
 
+        # ----------------------------------------------------
+        # ESCRITURA ATÓMICA
+        # ----------------------------------------------------
+
         temporal_destino = (
+
             destino.parent
-            / f".{destino.name}.{generar_id()}.tmp"
+
+            / (
+
+                f".{destino.name}."
+
+                f"{generar_id()}"
+
+                ".tmp"
+
+            )
+
         )
 
 
@@ -1759,9 +1831,13 @@ def descargar_archivo_drive(
 
             ) as archivo:
 
-                archivo.write(datos)
+                archivo.write(
+                    datos
+                )
+
 
                 archivo.flush()
+
 
                 os.fsync(
                     archivo.fileno()
@@ -1811,7 +1887,9 @@ def descargar_archivo_drive(
             "desde Drive:"
         )
 
+
         print(error)
+
 
         return False
 
@@ -1829,6 +1907,7 @@ def validar_json_conocimiento(
         print(
             f"❌ Validación: no existe {ruta}"
         )
+
 
         return False, []
 
@@ -1852,6 +1931,7 @@ def validar_json_conocimiento(
             print(
                 "❌ Validación: archivo vacío."
             )
+
 
             return False, []
 
@@ -1887,6 +1967,7 @@ def validar_json_conocimiento(
 
             )
 
+
             return False, []
 
 
@@ -1905,6 +1986,7 @@ def validar_json_conocimiento(
                 "algún registro no es un objeto."
 
             )
+
 
             return False, []
 
@@ -1931,6 +2013,7 @@ def validar_json_conocimiento(
 
         )
 
+
         return False, []
 
 
@@ -1943,6 +2026,7 @@ def validar_json_conocimiento(
             f"{error}"
 
         )
+
 
         return False, []
 
@@ -1959,6 +2043,7 @@ def sincronizar_conocimiento_desde_drive():
             "⚠️ Google Drive no está disponible."
         )
 
+
         return
 
 
@@ -1969,14 +2054,14 @@ def sincronizar_conocimiento_desde_drive():
             "en Drive."
         )
 
+
         return
 
 
     try:
 
         # ----------------------------------------------------
-        # CORRECCIÓN:
-        # Buscar exclusivamente el JSON maestro.
+        # BUSCAR EXCLUSIVAMENTE JSON
         # ----------------------------------------------------
 
         archivo_drive = (
@@ -1993,7 +2078,6 @@ def sincronizar_conocimiento_desde_drive():
 
 
         # ====================================================
-        # CASO 1
         # JSON EXISTE EN DRIVE
         # ====================================================
 
@@ -2070,6 +2154,10 @@ def sincronizar_conocimiento_desde_drive():
                     pass
 
 
+            # ------------------------------------------------
+            # DESCARGA
+            # ------------------------------------------------
+
             descargado = (
                 descargar_archivo_drive(
 
@@ -2088,13 +2176,19 @@ def sincronizar_conocimiento_desde_drive():
                     "penaguillo.json."
                 )
 
+
                 print(
                     "🛡️ El conocimiento local "
                     "NO será reemplazado."
                 )
 
+
                 return
 
+
+            # ------------------------------------------------
+            # VALIDAR
+            # ------------------------------------------------
 
             valido, data = (
                 validar_json_conocimiento(
@@ -2103,17 +2197,21 @@ def sincronizar_conocimiento_desde_drive():
             )
 
 
-            # ------------------------------------------------
-            # JSON VÁLIDO
-            # ------------------------------------------------
-
             if valido:
 
                 archivo_temporal = (
 
                     CONOCIMIENTO_DIR
 
-                    / f"penaguillo_{generar_id()}.tmp"
+                    / (
+
+                        f"penaguillo_"
+
+                        f"{generar_id()}"
+
+                        ".tmp"
+
+                    )
 
                 )
 
@@ -2205,7 +2303,7 @@ def sincronizar_conocimiento_desde_drive():
 
 
             # ------------------------------------------------
-            # JSON VACÍO / CORRUPTO
+            # INVÁLIDO
             # ------------------------------------------------
 
             print(
@@ -2250,8 +2348,7 @@ def sincronizar_conocimiento_desde_drive():
 
 
         # ====================================================
-        # CASO 2
-        # NO EXISTE JSON EN DRIVE
+        # NO EXISTE EN DRIVE
         # ====================================================
 
         print(
@@ -2261,7 +2358,7 @@ def sincronizar_conocimiento_desde_drive():
 
 
         # ----------------------------------------------------
-        # Buscar conocimiento local
+        # Buscar local
         # ----------------------------------------------------
 
         if ARCHIVO_CONOCIMIENTO.exists():
@@ -2295,7 +2392,7 @@ def sincronizar_conocimiento_desde_drive():
 
 
         # ----------------------------------------------------
-        # No existe conocimiento
+        # Nada existe
         # ----------------------------------------------------
 
         print(
@@ -2317,6 +2414,7 @@ def sincronizar_conocimiento_desde_drive():
             "conocimiento desde Drive:"
         )
 
+
         print(error)
 
 
@@ -2333,6 +2431,7 @@ def sincronizar_conocimiento_a_drive():
             "Google Drive no disponible."
         )
 
+
         return
 
 
@@ -2343,6 +2442,7 @@ def sincronizar_conocimiento_a_drive():
             "carpeta Drive no disponible."
         )
 
+
         return
 
 
@@ -2352,6 +2452,7 @@ def sincronizar_conocimiento_a_drive():
             "⚠️ No se sincroniza conocimiento: "
             "penaguillo.json no existe."
         )
+
 
         return
 
@@ -2370,6 +2471,7 @@ def sincronizar_conocimiento_a_drive():
             "no se sube penaguillo.json "
             "porque es inválido o está vacío."
         )
+
 
         return
 
@@ -2499,7 +2601,7 @@ app = FastAPI(
 
     title="Penaguillo IA",
 
-    version="5.2.0",
+    version="5.3.0",
 
     description=(
         "Backend del asistente inteligente Penaguillo"
@@ -2722,6 +2824,7 @@ def cargar_conocimiento() -> list[dict[str, Any]]:
             "ℹ️ penaguillo.json no existe localmente."
         )
 
+
         return []
 
 
@@ -2833,6 +2936,7 @@ def crear_backup() -> str | None:
                 "el conocimiento actual "
                 "no contiene información válida."
             )
+
 
             return None
 
@@ -2985,8 +3089,7 @@ def guardar_conocimiento(
 
     # --------------------------------------------------------
     # SEGURIDAD:
-    # Nunca permitir reemplazar un conocimiento existente
-    # por [].
+    # No reemplazar conocimiento existente por [].
     # --------------------------------------------------------
 
     if (
@@ -3006,7 +3109,13 @@ def guardar_conocimiento(
             )
 
 
-            if valido_actual and len(data_actual) > 0:
+            if (
+
+                valido_actual
+
+                and len(data_actual) > 0
+
+            ):
 
                 raise RuntimeError(
 
@@ -3274,7 +3383,7 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "5.2.0",
+        "version": "5.3.0",
 
         "chat_model": CHAT_MODEL,
 
@@ -3286,6 +3395,10 @@ def root():
 
         "google_drive": (
             drive_service is not None
+        ),
+
+        "google_drive_session": (
+            drive_session is not None
         ),
 
         "shared_drive": (
@@ -4945,8 +5058,9 @@ def eliminar_conocimiento(
 
 
         # ----------------------------------------------------
-        # Si se elimina el último conocimiento,
-        # NO sobrescribir Drive con [].
+        # Si se elimina el último conocimiento:
+        # local puede quedar vacío,
+        # pero Drive NO se toca.
         # ----------------------------------------------------
 
         if len(nuevos_conocimientos) == 0:
@@ -5022,7 +5136,6 @@ def eliminar_conocimiento(
                 "⚠️ Se eliminó el último conocimiento "
 
                 "localmente."
-
             )
 
 
@@ -5045,7 +5158,7 @@ def eliminar_conocimiento(
 
 
         # ----------------------------------------------------
-        # Eliminar archivo local
+        # Eliminar archivo local asociado
         # ----------------------------------------------------
 
         archivo_relativo = (
@@ -5239,7 +5352,7 @@ def startup_event():
 
 
     # --------------------------------------------------------
-    # Mostrar estado final
+    # ESTADO FINAL
     # --------------------------------------------------------
 
     try:
