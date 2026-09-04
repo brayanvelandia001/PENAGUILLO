@@ -3086,57 +3086,6 @@ def guardar_conocimiento(
 
         )
 
-
-    # --------------------------------------------------------
-    # SEGURIDAD:
-    # No reemplazar conocimiento existente por [].
-    # --------------------------------------------------------
-
-    if (
-
-        len(conocimientos) == 0
-
-        and ARCHIVO_CONOCIMIENTO.exists()
-
-    ):
-
-        try:
-
-            valido_actual, data_actual = (
-                validar_json_conocimiento(
-                    ARCHIVO_CONOCIMIENTO
-                )
-            )
-
-
-            if (
-
-                valido_actual
-
-                and len(data_actual) > 0
-
-            ):
-
-                raise RuntimeError(
-
-                    "Operación bloqueada: "
-                    "se intentó reemplazar "
-                    "un conocimiento existente "
-                    "por una lista vacía."
-
-                )
-
-
-        except RuntimeError:
-
-            raise
-
-
-        except Exception:
-
-            pass
-
-
     archivo_temporal = (
 
         CONOCIMIENTO_DIR
@@ -3202,24 +3151,15 @@ def guardar_conocimiento(
 
 
         # ----------------------------------------------------
-        # Solo sincronizar una lista no vacía.
+        # GOOGLE DRIVE
+        # ----------------------------------------------------
+        # Sincronizar SIEMPRE, incluso cuando el conocimiento
+        # queda vacío. De esta forma Drive también recibe [].
         # ----------------------------------------------------
 
-        if len(conocimientos) > 0:
+        sincronizar_conocimiento_a_drive()
 
-            sincronizar_conocimiento_a_drive()
-
-        else:
-
-            print(
-
-                "⚠️ Lista vacía: "
-
-                "no se sobrescribe Drive."
-
-            )
-
-
+        # No crear backups vacíos.
         if len(conocimientos) > 0:
 
             crear_backup()
@@ -5058,103 +4998,14 @@ def eliminar_conocimiento(
 
 
         # ----------------------------------------------------
-        # Si se elimina el último conocimiento:
-        # local puede quedar vacío,
-        # pero Drive NO se toca.
+        # Guardar SIEMPRE el resultado.
+        # Si se elimina el último conocimiento, el resultado es
+        # [] y guardar_conocimiento() también sincroniza Drive.
         # ----------------------------------------------------
 
-        if len(nuevos_conocimientos) == 0:
-
-            archivo_temporal = (
-
-                CONOCIMIENTO_DIR
-
-                / f"penaguillo_{generar_id()}.tmp"
-
-            )
-
-
-            try:
-
-                with open(
-
-                    archivo_temporal,
-
-                    "w",
-
-                    encoding="utf-8",
-
-                ) as archivo:
-
-                    json.dump(
-
-                        [],
-
-                        archivo,
-
-                        ensure_ascii=False,
-
-                        indent=2,
-
-                    )
-
-
-                    archivo.flush()
-
-
-                    os.fsync(
-
-                        archivo.fileno()
-
-                    )
-
-
-                os.replace(
-
-                    archivo_temporal,
-
-                    ARCHIVO_CONOCIMIENTO,
-
-                )
-
-
-            finally:
-
-                if archivo_temporal.exists():
-
-                    try:
-
-                        archivo_temporal.unlink()
-
-                    except OSError:
-
-                        pass
-
-
-            print(
-
-                "⚠️ Se eliminó el último conocimiento "
-
-                "localmente."
-            )
-
-
-            print(
-
-                "🛡️ Drive NO fue sobrescrito "
-
-                "con una lista vacía."
-
-            )
-
-
-        else:
-
-            guardar_conocimiento(
-
-                nuevos_conocimientos
-
-            )
+        guardar_conocimiento(
+            nuevos_conocimientos
+        )
 
 
         # ----------------------------------------------------
