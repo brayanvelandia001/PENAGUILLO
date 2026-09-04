@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 4.0
+# VERSIÓN 4.1
 #
 # FUNCIONES:
 # - Chat con Penaguillo
@@ -12,27 +12,24 @@
 # - PDF escaneado -> OpenRouter Vision
 # - Imágenes -> OpenRouter Vision
 # - Persistencia local
-# - Persistencia en Google Drive cuando corre en Render
-# - Backup automático
+# - Google Drive como almacenamiento permanente en Render
+# - Backups completos después de cada cambio
+# - Recuperación automática desde el backup más reciente
 # - Escritura atómica
 # - NO usa Tesseract
 #
-# LOCAL:
-#   conocimiento/ se mantiene local.
+# IMPORTANTE:
 #
-# RENDER:
-#   storage/ se utiliza como caché/persistencia local
-#   y Google Drive funciona como almacenamiento remoto.
+# GOOGLE_DRIVE_FOLDER_ID sigue siendo el ID de la carpeta
+# raíz de Penaguillo dentro del Shared Drive.
 #
-# GOOGLE DRIVE:
-#   GOOGLE_SERVICE_ACCOUNT_EMAIL
-#   GOOGLE_PRIVATE_KEY
-#   GOOGLE_PROJECT_ID
-#   GOOGLE_DRIVE_FOLDER_ID
+# NO se debe colocar aquí el ID del Shared Drive.
+# El backend lo detecta automáticamente.
 # ============================================================
 
 
 import base64
+import io
 import json
 import os
 import re
@@ -75,7 +72,10 @@ try:
 
     from googleapiclient.discovery import build
 
-    from googleapiclient.http import MediaFileUpload
+    from googleapiclient.http import (
+        MediaFileUpload,
+        MediaIoBaseDownload,
+    )
 
     GOOGLE_AVAILABLE = True
 
@@ -112,8 +112,7 @@ else:
 if os.getenv("RENDER") == "true":
 
     # Render Free no tiene Persistent Disk.
-    # Usamos almacenamiento temporal local
-    # y Google Drive como almacenamiento permanente.
+    # Google Drive es el almacenamiento permanente.
 
     CONOCIMIENTO_DIR = (
         BASE_DIR
@@ -123,8 +122,7 @@ if os.getenv("RENDER") == "true":
 
 else:
 
-    # En el ejecutable/local se mantiene
-    # la carpeta conocimiento existente.
+    # Local / Electron.
 
     CONOCIMIENTO_DIR = (
         BASE_DIR
@@ -173,6 +171,11 @@ CONOCIMIENTO_DIR.mkdir(
     exist_ok=True,
 )
 
+ARCHIVOS_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
 PDF_DIR.mkdir(
     parents=True,
     exist_ok=True,
@@ -211,7 +214,6 @@ OPENROUTER_API_KEY = os.getenv(
     "OPENROUTER_API_KEY"
 )
 
-
 if not OPENROUTER_API_KEY:
 
     print(
@@ -235,7 +237,6 @@ CHAT_MODEL = (
     "openai/gpt-oss-20b"
 )
 
-
 VISION_MODEL = (
     "openrouter/free"
 )
@@ -257,6 +258,7 @@ GOOGLE_PROJECT_ID = os.getenv(
     "GOOGLE_PROJECT_ID"
 )
 
+# MANTENER ESTE NOMBRE
 GOOGLE_DRIVE_FOLDER_ID = os.getenv(
     "GOOGLE_DRIVE_FOLDER_ID"
 )
@@ -276,7 +278,12 @@ DRIVE_SCOPES = [
 drive_service = None
 
 
+# ID de la carpeta raíz
 DRIVE_ROOT_FOLDER = None
+
+# ID real del Shared Drive
+DRIVE_SHARED_ID = None
+
 DRIVE_KNOWLEDGE_FOLDER = None
 DRIVE_FILES_FOLDER = None
 DRIVE_PDF_FOLDER = None
@@ -285,7 +292,7 @@ DRIVE_BACKUPS_FOLDER = None
 
 
 # ============================================================
-# INICIALIZAR GOOGLE DRIVE
+# GOOGLE DRIVE — INICIALIZAR
 # ============================================================
 
 def inicializar_google_drive():
@@ -293,6 +300,8 @@ def inicializar_google_drive():
     global drive_service
 
     global DRIVE_ROOT_FOLDER
+    global DRIVE_SHARED_ID
+
     global DRIVE_KNOWLEDGE_FOLDER
     global DRIVE_FILES_FOLDER
     global DRIVE_PDF_FOLDER
@@ -301,7 +310,7 @@ def inicializar_google_drive():
 
 
     # --------------------------------------------------------
-    # Solo necesitamos Drive en Render
+    # Solo usar Drive en Render
     # --------------------------------------------------------
 
     if os.getenv("RENDER") != "true":
@@ -365,7 +374,7 @@ def inicializar_google_drive():
     try:
 
         # ----------------------------------------------------
-        # Corregir saltos de línea de la clave privada
+        # Corregir saltos de línea de la clave
         # ----------------------------------------------------
 
         private_key = (
@@ -439,7 +448,7 @@ def inicializar_google_drive():
 
 
         # ----------------------------------------------------
-        # Crear cliente Drive
+        # Cliente Drive
         # ----------------------------------------------------
 
         drive_service = build(
@@ -455,14 +464,76 @@ def inicializar_google_drive():
         )
 
 
+        # ----------------------------------------------------
+        # La variable sigue siendo la carpeta raíz
+        # ----------------------------------------------------
+
         DRIVE_ROOT_FOLDER = (
             GOOGLE_DRIVE_FOLDER_ID
+        )
+
+
+        # ----------------------------------------------------
+        # VALIDAR CARPETA RAÍZ
+        #
+        # Aquí obtenemos el verdadero Shared Drive ID.
+        # ----------------------------------------------------
+
+        info_carpeta = (
+            drive_service
+            .files()
+            .get(
+                fileId=DRIVE_ROOT_FOLDER,
+                fields=(
+                    "id,"
+                    "name,"
+                    "mimeType,"
+                    "driveId,"
+                    "parents"
+                ),
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+
+
+        DRIVE_SHARED_ID = (
+            info_carpeta.get(
+                "driveId"
+            )
         )
 
 
         print(
             "✅ Google Drive conectado."
         )
+
+
+        print(
+            "📁 Carpeta raíz: "
+            f"{info_carpeta.get('name')}"
+        )
+
+
+        print(
+            "🆔 Folder ID: "
+            f"{DRIVE_ROOT_FOLDER}"
+        )
+
+
+        if DRIVE_SHARED_ID:
+
+            print(
+                "🗂️ Shared Drive detectado: "
+                f"{DRIVE_SHARED_ID}"
+            )
+
+        else:
+
+            print(
+                "⚠️ La carpeta no reportó "
+                "un Shared Drive ID."
+            )
 
 
         # ----------------------------------------------------
@@ -515,7 +586,10 @@ def inicializar_google_drive():
 
 
         # ----------------------------------------------------
-        # Descargar conocimiento existente
+        # RECUPERACIÓN
+        #
+        # Primero intenta el JSON principal.
+        # Si no sirve, usa el backup más reciente.
         # ----------------------------------------------------
 
         sincronizar_conocimiento_desde_drive()
@@ -546,10 +620,6 @@ def buscar_archivo_drive(
         return None
 
 
-    # --------------------------------------------------------
-    # Escapar comillas simples
-    # --------------------------------------------------------
-
     nombre_escapado = (
         nombre.replace(
             "'",
@@ -571,18 +641,52 @@ def buscar_archivo_drive(
 
     try:
 
+        parametros = {
+
+            "q": query,
+
+            "spaces": "drive",
+
+            "includeItemsFromAllDrives": True,
+
+            "supportsAllDrives": True,
+
+            "fields": (
+                "files("
+                "id,"
+                "name,"
+                "mimeType,"
+                "size,"
+                "modifiedTime"
+                ")"
+            ),
+
+            "pageSize": 100,
+
+        }
+
+
+        # ----------------------------------------------------
+        # IMPORTANTE:
+        #
+        # driveId debe ser el Shared Drive ID real.
+        # NO el ID de la carpeta.
+        # ----------------------------------------------------
+
+        if DRIVE_SHARED_ID:
+
+            parametros["corpora"] = "drive"
+
+            parametros["driveId"] = (
+                DRIVE_SHARED_ID
+            )
+
+
         resultado = (
             drive_service
             .files()
             .list(
-                q=query,
-                spaces="drive",
-                includeItemsFromAllDrives=True,
-                supportsAllDrives=True,
-                fields=(
-                    "files(id,name,mimeType,size)"
-                ),
-                pageSize=10,
+                **parametros
             )
             .execute()
         )
@@ -612,6 +716,96 @@ def buscar_archivo_drive(
         print(error)
 
         return None
+
+
+# ============================================================
+# GOOGLE DRIVE — LISTAR ARCHIVOS DE UNA CARPETA
+# ============================================================
+
+def listar_archivos_drive(
+    folder_id: str,
+):
+
+    if not drive_service:
+
+        return []
+
+
+    query = (
+
+        f"'{folder_id}' in parents"
+
+        " and trashed = false"
+
+    )
+
+
+    try:
+
+        parametros = {
+
+            "q": query,
+
+            "spaces": "drive",
+
+            "includeItemsFromAllDrives": True,
+
+            "supportsAllDrives": True,
+
+            "fields": (
+                "files("
+                "id,"
+                "name,"
+                "mimeType,"
+                "size,"
+                "modifiedTime"
+                ")"
+            ),
+
+            "pageSize": 1000,
+
+            "orderBy": (
+                "modifiedTime desc"
+            ),
+
+        }
+
+
+        if DRIVE_SHARED_ID:
+
+            parametros["corpora"] = "drive"
+
+            parametros["driveId"] = (
+                DRIVE_SHARED_ID
+            )
+
+
+        resultado = (
+            drive_service
+            .files()
+            .list(
+                **parametros
+            )
+            .execute()
+        )
+
+
+        return resultado.get(
+            "files",
+            [],
+        )
+
+
+    except Exception as error:
+
+        print(
+            "❌ Error listando archivos "
+            "de Drive:"
+        )
+
+        print(error)
+
+        return []
 
 
 # ============================================================
@@ -670,7 +864,7 @@ def obtener_o_crear_carpeta(
 
 
 # ============================================================
-# GOOGLE DRIVE — SUBIR / ACTUALIZAR ARCHIVO
+# GOOGLE DRIVE — SUBIR / ACTUALIZAR
 # ============================================================
 
 def subir_archivo_drive(
@@ -738,18 +932,18 @@ def subir_archivo_drive(
     )
 
 
-    media = MediaFileUpload(
-
-        str(ruta),
-
-        mimetype=mime_type,
-
-        resumable=True,
-
-    )
-
-
     try:
+
+        media = MediaFileUpload(
+
+            str(ruta),
+
+            mimetype=mime_type,
+
+            resumable=True,
+
+        )
+
 
         # ----------------------------------------------------
         # ACTUALIZAR
@@ -761,10 +955,15 @@ def subir_archivo_drive(
                 drive_service
                 .files()
                 .update(
+
                     fileId=existente["id"],
+
                     media_body=media,
+
                     fields="id,name",
+
                     supportsAllDrives=True,
+
                 )
                 .execute()
             )
@@ -798,10 +997,15 @@ def subir_archivo_drive(
             drive_service
             .files()
             .create(
+
                 body=metadata,
+
                 media_body=media,
+
                 fields="id,name",
+
                 supportsAllDrives=True,
+
             )
             .execute()
         )
@@ -828,7 +1032,7 @@ def subir_archivo_drive(
 
 
 # ============================================================
-# GOOGLE DRIVE — DESCARGAR ARCHIVO
+# GOOGLE DRIVE — DESCARGAR
 # ============================================================
 
 def descargar_archivo_drive(
@@ -843,20 +1047,17 @@ def descargar_archivo_drive(
 
     try:
 
-        from googleapiclient.http import (
-            MediaIoBaseDownload
-        )
-
-        import io
-
-
         request = (
             drive_service
             .files()
             .get(
+
                 fileId=file_id,
+
                 alt="media",
+
                 supportsAllDrives=True,
+
             )
         )
 
@@ -921,7 +1122,319 @@ def descargar_archivo_drive(
 
 
 # ============================================================
-# GOOGLE DRIVE — SINCRONIZAR JSON DESDE DRIVE
+# VALIDAR JSON DE CONOCIMIENTO
+# ============================================================
+
+def validar_json_conocimiento(
+    ruta: Path,
+) -> tuple[bool, list[dict[str, Any]]]:
+
+    if not ruta.exists():
+
+        return False, []
+
+
+    try:
+
+        with open(
+
+            ruta,
+
+            "r",
+
+            encoding="utf-8",
+
+        ) as archivo:
+
+            data = json.load(
+                archivo
+            )
+
+
+        if not isinstance(
+            data,
+            list,
+        ):
+
+            return False, []
+
+
+        # ----------------------------------------------------
+        # Lista vacía = no es una recuperación útil
+        # ----------------------------------------------------
+
+        if len(data) == 0:
+
+            return False, []
+
+
+        return True, data
+
+
+    except Exception:
+
+        return False, []
+
+
+# ============================================================
+# GOOGLE DRIVE — RECUPERAR BACKUP MÁS RECIENTE
+# ============================================================
+
+def recuperar_backup_mas_reciente():
+
+    if not drive_service:
+
+        return False
+
+
+    if not DRIVE_BACKUPS_FOLDER:
+
+        return False
+
+
+    try:
+
+        archivos = listar_archivos_drive(
+
+            DRIVE_BACKUPS_FOLDER
+
+        )
+
+
+        backups = [
+
+            archivo
+
+            for archivo in archivos
+
+            if archivo.get("name", "").startswith(
+                "penaguillo_"
+            )
+
+            and archivo.get(
+                "name",
+                "",
+            ).endswith(
+                ".json"
+            )
+
+        ]
+
+
+        if not backups:
+
+            print(
+                "ℹ️ No hay backups disponibles "
+                "en Drive."
+            )
+
+            return False
+
+
+        # ----------------------------------------------------
+        # Ordenar por modifiedTime
+        # ----------------------------------------------------
+
+        backups.sort(
+
+            key=lambda archivo:
+                archivo.get(
+                    "modifiedTime",
+                    "",
+                ),
+
+            reverse=True,
+
+        )
+
+
+        for backup in backups:
+
+            print(
+                "🔎 Probando backup: "
+                f"{backup.get('name')}"
+            )
+
+
+            temporal = (
+                CONOCIMIENTO_DIR
+                / "penaguillo_backup.tmp"
+            )
+
+
+            if temporal.exists():
+
+                try:
+                    temporal.unlink()
+                except OSError:
+                    pass
+
+
+            if not descargar_archivo_drive(
+
+                backup["id"],
+
+                temporal,
+
+            ):
+
+                continue
+
+
+            valido, data = (
+                validar_json_conocimiento(
+                    temporal
+                )
+            )
+
+
+            if not valido:
+
+                print(
+                    "⚠️ Backup inválido: "
+                    f"{backup.get('name')}"
+                )
+
+
+                try:
+
+                    temporal.unlink()
+
+                except OSError:
+
+                    pass
+
+
+                continue
+
+
+            # ------------------------------------------------
+            # Recuperar backup
+            # ------------------------------------------------
+
+            archivo_temporal = (
+                CONOCIMIENTO_DIR
+                / f"penaguillo_recovery_{generar_id()}.tmp"
+            )
+
+
+            try:
+
+                with open(
+
+                    archivo_temporal,
+
+                    "w",
+
+                    encoding="utf-8",
+
+                ) as archivo:
+
+                    json.dump(
+
+                        data,
+
+                        archivo,
+
+                        ensure_ascii=False,
+
+                        indent=2,
+
+                    )
+
+                    archivo.flush()
+
+                    os.fsync(
+                        archivo.fileno()
+                    )
+
+
+                os.replace(
+
+                    archivo_temporal,
+
+                    ARCHIVO_CONOCIMIENTO,
+
+                )
+
+
+                print(
+                    "♻️ CONOCIMIENTO RECUPERADO "
+                    "DESDE BACKUP."
+                )
+
+
+                print(
+                    "📚 Registros recuperados: "
+                    f"{len(data)}"
+                )
+
+
+                try:
+
+                    temporal.unlink()
+
+                except OSError:
+
+                    pass
+
+
+                # ------------------------------------------------
+                # Volver a sincronizar el principal
+                # ------------------------------------------------
+
+                sincronizar_conocimiento_a_drive()
+
+
+                return True
+
+
+            except Exception as error:
+
+                print(
+                    "❌ Error recuperando backup:"
+                )
+
+                print(error)
+
+
+                if archivo_temporal.exists():
+
+                    try:
+
+                        archivo_temporal.unlink()
+
+                    except OSError:
+
+                        pass
+
+
+                try:
+
+                    temporal.unlink()
+
+                except OSError:
+
+                    pass
+
+
+        return False
+
+
+    except Exception as error:
+
+        print(
+            "❌ Error buscando backup "
+            "más reciente:"
+        )
+
+        print(error)
+
+        return False
+
+
+# ============================================================
+# GOOGLE DRIVE — SINCRONIZAR CONOCIMIENTO DESDE DRIVE
 # ============================================================
 
 def sincronizar_conocimiento_desde_drive():
@@ -949,33 +1462,67 @@ def sincronizar_conocimiento_desde_drive():
         )
 
 
+        # ====================================================
+        # CASO 1:
+        # NO EXISTE JSON PRINCIPAL
+        # ====================================================
+
         if not archivo_drive:
 
             print(
                 "ℹ️ No existe penaguillo.json "
-                "en Drive todavía."
+                "en Drive."
             )
 
 
             # ------------------------------------------------
-            # Si existe localmente,
-            # lo subimos.
+            # Intentar recuperar backup
+            # ------------------------------------------------
+
+            recuperado = (
+                recuperar_backup_mas_reciente()
+            )
+
+
+            if recuperado:
+
+                return
+
+
+            # ------------------------------------------------
+            # Si existe local, subirlo
             # ------------------------------------------------
 
             if ARCHIVO_CONOCIMIENTO.exists():
 
-                subir_archivo_drive(
-
-                    ARCHIVO_CONOCIMIENTO,
-
-                    DRIVE_KNOWLEDGE_FOLDER,
-
-                    "penaguillo.json",
-
+                valido, data = (
+                    validar_json_conocimiento(
+                        ARCHIVO_CONOCIMIENTO
+                    )
                 )
+
+
+                if valido:
+
+                    print(
+                        "☁️ Subiendo conocimiento "
+                        "local a Drive."
+                    )
+
+
+                    sincronizar_conocimiento_a_drive()
+
+
+                return
+
 
             return
 
+
+        # ====================================================
+        # CASO 2:
+        # EXISTE JSON EN DRIVE
+        # ====================================================
 
         print(
             "☁️ Descargando "
@@ -989,6 +1536,14 @@ def sincronizar_conocimiento_desde_drive():
         )
 
 
+        if temporal.exists():
+
+            try:
+                temporal.unlink()
+            except OSError:
+                pass
+
+
         if descargar_archivo_drive(
 
             archivo_drive["id"],
@@ -997,31 +1552,59 @@ def sincronizar_conocimiento_desde_drive():
 
         ):
 
-            try:
-
-                with open(
-
-                    temporal,
-
-                    "r",
-
-                    encoding="utf-8",
-
-                ) as archivo:
-
-                    data = json.load(
-                        archivo
-                    )
+            valido, data = (
+                validar_json_conocimiento(
+                    temporal
+                )
+            )
 
 
-                if isinstance(
-                    data,
-                    list,
-                ):
+            # ------------------------------------------------
+            # JSON válido y con información
+            # ------------------------------------------------
+
+            if valido:
+
+                archivo_temporal = (
+                    CONOCIMIENTO_DIR
+                    / f"penaguillo_{generar_id()}.tmp"
+                )
+
+
+                try:
+
+                    with open(
+
+                        archivo_temporal,
+
+                        "w",
+
+                        encoding="utf-8",
+
+                    ) as archivo:
+
+                        json.dump(
+
+                            data,
+
+                            archivo,
+
+                            ensure_ascii=False,
+
+                            indent=2,
+
+                        )
+
+                        archivo.flush()
+
+                        os.fsync(
+                            archivo.fileno()
+                        )
+
 
                     os.replace(
 
-                        temporal,
+                        archivo_temporal,
 
                         ARCHIVO_CONOCIMIENTO,
 
@@ -1033,30 +1616,74 @@ def sincronizar_conocimiento_desde_drive():
                         "sincronizado desde Drive."
                     )
 
-                else:
 
                     print(
-                        "⚠️ penaguillo.json "
-                        "de Drive no contiene "
-                        "una lista."
+                        "📚 Registros cargados: "
+                        f"{len(data)}"
                     )
 
 
-            except Exception as error:
+                except Exception as error:
 
-                print(
-                    "⚠️ No se pudo validar "
-                    "penaguillo.json de Drive:"
-                )
+                    print(
+                        "❌ Error guardando "
+                        "conocimiento descargado:"
+                    )
 
-                print(error)
+                    print(error)
 
 
-            finally:
+                    if archivo_temporal.exists():
 
-                if temporal.exists():
+                        try:
+                            archivo_temporal.unlink()
+                        except OSError:
+                            pass
 
+
+                finally:
+
+                    if temporal.exists():
+
+                        try:
+                            temporal.unlink()
+                        except OSError:
+                            pass
+
+
+                return
+
+
+            # ------------------------------------------------
+            # JSON vacío o inválido
+            # ------------------------------------------------
+
+            print(
+                "⚠️ penaguillo.json de Drive "
+                "está vacío o inválido."
+            )
+
+
+            if temporal.exists():
+
+                try:
                     temporal.unlink()
+                except OSError:
+                    pass
+
+
+            # ------------------------------------------------
+            # RECUPERAR BACKUP
+            # ------------------------------------------------
+
+            recuperado = (
+                recuperar_backup_mas_reciente()
+            )
+
+
+            if recuperado:
+
+                return
 
 
     except Exception as error:
@@ -1067,6 +1694,14 @@ def sincronizar_conocimiento_desde_drive():
         )
 
         print(error)
+
+
+        # ----------------------------------------------------
+        # Último intento:
+        # recuperar backup
+        # ----------------------------------------------------
+
+        recuperar_backup_mas_reciente()
 
 
 # ============================================================
@@ -1081,6 +1716,11 @@ def sincronizar_conocimiento_a_drive():
 
 
     if not DRIVE_KNOWLEDGE_FOLDER:
+
+        return
+
+
+    if not ARCHIVO_CONOCIMIENTO.exists():
 
         return
 
@@ -1191,7 +1831,7 @@ app = FastAPI(
 
     title="Penaguillo IA",
 
-    version="4.0.0",
+    version="4.1.0",
 
     description=(
         "Backend del asistente inteligente Penaguillo"
@@ -1480,6 +2120,20 @@ def cargar_conocimiento() -> list[dict[str, Any]]:
 # ============================================================
 # BACKUP
 # ============================================================
+#
+# IMPORTANTE:
+#
+# El backup se crea DESPUÉS de guardar correctamente.
+#
+# De esta manera:
+#
+# 1 conocimiento  -> backup con 1
+# 2 conocimientos -> backup con 2
+# 100 conocimientos -> backup con 100
+#
+# El backup más reciente siempre representa
+# el estado actual de Penaguillo.
+# ============================================================
 
 def crear_backup() -> str | None:
 
@@ -1488,60 +2142,135 @@ def crear_backup() -> str | None:
         return None
 
 
-    timestamp = (
-
-        datetime.now()
-
-        .strftime(
-
-            "%Y%m%d_%H%M%S_%f"
-
-        )
-
-    )
-
-
-    backup_path = (
-
-        BACKUP_DIR
-
-        / f"penaguillo_{timestamp}.json"
-
-    )
-
-
     try:
 
-        shutil.copy2(
+        valido, data = (
+            validar_json_conocimiento(
+                ARCHIVO_CONOCIMIENTO
+            )
+        )
 
-            ARCHIVO_CONOCIMIENTO,
 
-            backup_path,
+        if not valido:
+
+            print(
+                "⚠️ No se crea backup porque "
+                "el conocimiento actual "
+                "no contiene información válida."
+            )
+
+            return None
+
+
+        timestamp = (
+
+            datetime.now()
+
+            .strftime(
+
+                "%Y%m%d_%H%M%S_%f"
+
+            )
 
         )
 
 
-        print(
+        backup_path = (
 
-            "🛡️ Backup creado: "
+            BACKUP_DIR
 
-            f"{backup_path.name}"
-
-        )
-
-
-        sincronizar_backup_a_drive(
-
-            backup_path
+            / f"penaguillo_{timestamp}.json"
 
         )
 
 
-        return str(
+        archivo_temporal = (
 
-            backup_path
+            BACKUP_DIR
+
+            / f"backup_{generar_id()}.tmp"
 
         )
+
+
+        try:
+
+            with open(
+
+                archivo_temporal,
+
+                "w",
+
+                encoding="utf-8",
+
+            ) as archivo:
+
+                json.dump(
+
+                    data,
+
+                    archivo,
+
+                    ensure_ascii=False,
+
+                    indent=2,
+
+                )
+
+                archivo.flush()
+
+                os.fsync(
+                    archivo.fileno()
+                )
+
+
+            os.replace(
+
+                archivo_temporal,
+
+                backup_path,
+
+            )
+
+
+            print(
+
+                "🛡️ Backup creado: "
+
+                f"{backup_path.name} "
+
+                f"({len(data)} registros)"
+
+            )
+
+
+            # --------------------------------------------
+            # SUBIR BACKUP A DRIVE
+            # --------------------------------------------
+
+            sincronizar_backup_a_drive(
+
+                backup_path
+
+            )
+
+
+            return str(
+                backup_path
+            )
+
+
+        finally:
+
+            if archivo_temporal.exists():
+
+                try:
+
+                    archivo_temporal.unlink()
+
+                except OSError:
+
+                    pass
 
 
     except OSError as error:
@@ -1549,7 +2278,6 @@ def crear_backup() -> str | None:
         raise RuntimeError(
 
             "No se pudo crear backup: "
-
             f"{error}"
 
         ) from error
@@ -1578,13 +2306,6 @@ def guardar_conocimiento(
             "El conocimiento debe ser una lista."
 
         )
-
-
-    # --------------------------------------------------------
-    # BACKUP ANTES DE MODIFICAR
-    # --------------------------------------------------------
-
-    crear_backup()
 
 
     # --------------------------------------------------------
@@ -1635,6 +2356,10 @@ def guardar_conocimiento(
             )
 
 
+        # ----------------------------------------------------
+        # REEMPLAZO ATÓMICO
+        # ----------------------------------------------------
+
         os.replace(
 
             archivo_temporal,
@@ -1648,7 +2373,7 @@ def guardar_conocimiento(
 
             "💾 Conocimiento guardado. "
 
-            f"Total registros: "
+            "Total registros: "
 
             f"{len(conocimientos)}"
 
@@ -1656,10 +2381,17 @@ def guardar_conocimiento(
 
 
         # ----------------------------------------------------
-        # GOOGLE DRIVE
+        # SUBIR PRINCIPAL A DRIVE
         # ----------------------------------------------------
 
         sincronizar_conocimiento_a_drive()
+
+
+        # ----------------------------------------------------
+        # CREAR BACKUP DEL ESTADO NUEVO
+        # ----------------------------------------------------
+
+        crear_backup()
 
 
     except OSError as error:
@@ -1678,7 +2410,6 @@ def guardar_conocimiento(
         raise RuntimeError(
 
             "No se pudo guardar "
-
             f"penaguillo.json: {error}"
 
         ) from error
@@ -1821,22 +2552,22 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "4.0.0",
+        "version": "4.1.0",
 
         "chat_model": CHAT_MODEL,
 
         "vision_model": VISION_MODEL,
 
         "conocimientos": len(
-
             conocimientos
-
         ),
 
         "google_drive": (
-
             drive_service is not None
+        ),
 
+        "shared_drive": (
+            DRIVE_SHARED_ID is not None
         ),
 
     }
@@ -1854,11 +2585,8 @@ def chat(
 ):
 
     mensaje = (
-
         data.message
-
         .strip()
-
     )
 
 
@@ -1869,10 +2597,8 @@ def chat(
             status_code=400,
 
             detail=(
-
                 "El mensaje no puede "
                 "estar vacío."
-
             ),
 
         )
@@ -1881,9 +2607,7 @@ def chat(
     try:
 
         conocimiento = (
-
             construir_conocimiento()
-
         )
 
 
@@ -1937,9 +2661,7 @@ def chat(
                         "role": "system",
 
                         "content": (
-
                             system_prompt
-
                         ),
 
                     },
@@ -1990,9 +2712,7 @@ def chat(
     except Exception as error:
 
         print(
-
             f"❌ Error en /chat: {error}"
-
         )
 
 
@@ -2001,10 +2721,8 @@ def chat(
             status_code=500,
 
             detail=(
-
                 "Error consultando "
                 f"Penaguillo: {error}"
-
             ),
 
         )
@@ -2022,11 +2740,8 @@ def ensenar(
 ):
 
     texto = (
-
         data.conocimiento
-
         .strip()
-
     )
 
 
@@ -2037,10 +2752,8 @@ def ensenar(
             status_code=400,
 
             detail=(
-
                 "El conocimiento "
                 "no puede estar vacío."
-
             ),
 
         )
@@ -2049,9 +2762,7 @@ def ensenar(
     try:
 
         conocimientos = (
-
             cargar_conocimiento()
-
         )
 
 
@@ -2062,9 +2773,7 @@ def ensenar(
             "tipo": "texto",
 
             "titulo": (
-
                 "Conocimiento manual"
-
             ),
 
             "contenido": texto,
@@ -2076,10 +2785,14 @@ def ensenar(
         }
 
 
+        # ----------------------------------------------------
+        # APPEND
+        #
+        # NUNCA reemplaza los anteriores.
+        # ----------------------------------------------------
+
         conocimientos.append(
-
             nuevo
-
         )
 
 
@@ -2095,18 +2808,14 @@ def ensenar(
             "ok": True,
 
             "mensaje": (
-
                 "Conocimiento guardado "
                 "correctamente."
-
             ),
 
             "conocimiento": nuevo,
 
             "total": len(
-
                 conocimientos
-
             ),
 
         }
@@ -2124,7 +2833,7 @@ def ensenar(
 
 
 # ============================================================
-# IMAGEN
+# IMAGEN — BASE64
 # ============================================================
 
 def imagen_a_base64(
@@ -2155,6 +2864,10 @@ def imagen_a_base64(
     )
 
 
+# ============================================================
+# MIME IMAGEN
+# ============================================================
+
 def mime_imagen(
 
     ruta: Path,
@@ -2162,11 +2875,8 @@ def mime_imagen(
 ) -> str:
 
     extension = (
-
         ruta.suffix
-
         .lower()
-
     )
 
 
@@ -2193,6 +2903,157 @@ def mime_imagen(
 
 
 # ============================================================
+# EXTRAER CONTENIDO DE RESPUESTA OPENROUTER
+# ============================================================
+
+def extraer_contenido_respuesta(
+    respuesta,
+) -> str:
+
+    if respuesta is None:
+
+        raise RuntimeError(
+            "El proveedor de IA "
+            "no devolvió respuesta."
+        )
+
+
+    choices = getattr(
+
+        respuesta,
+
+        "choices",
+
+        None,
+
+    )
+
+
+    if not choices:
+
+        raise RuntimeError(
+            "El proveedor de IA "
+            "no devolvió choices."
+        )
+
+
+    choice = choices[0]
+
+
+    message = getattr(
+
+        choice,
+
+        "message",
+
+        None,
+
+    )
+
+
+    if message is None:
+
+        raise RuntimeError(
+            "El proveedor de IA "
+            "no devolvió message."
+        )
+
+
+    content = getattr(
+
+        message,
+
+        "content",
+
+        None,
+
+    )
+
+
+    # --------------------------------------------------------
+    # Respuesta normal
+    # --------------------------------------------------------
+
+    if isinstance(
+
+        content,
+
+        str,
+
+    ):
+
+        contenido = content.strip()
+
+
+        if contenido:
+
+            return contenido
+
+
+    # --------------------------------------------------------
+    # Algunos proveedores pueden devolver
+    # una lista de bloques.
+    # --------------------------------------------------------
+
+    if isinstance(
+
+        content,
+
+        list,
+
+    ):
+
+        partes = []
+
+
+        for bloque in content:
+
+            if isinstance(
+
+                bloque,
+
+                dict,
+
+            ):
+
+                texto = bloque.get(
+                    "text"
+                )
+
+            else:
+
+                texto = getattr(
+                    bloque,
+                    "text",
+                    None,
+                )
+
+
+            if texto:
+
+                partes.append(
+                    str(texto)
+                )
+
+
+        resultado = (
+            "\n".join(partes)
+            .strip()
+        )
+
+
+        if resultado:
+
+            return resultado
+
+
+    raise RuntimeError(
+        "El proveedor de IA "
+        "no devolvió contenido de texto."
+    )
+
+
+# ============================================================
 # VISION
 # ============================================================
 
@@ -2215,16 +3076,12 @@ def analizar_imagen_con_vision(
 
 
     imagen_base64 = (
-
         imagen_a_base64(ruta)
-
     )
 
 
-    mime = mime_imagen(
-
-        ruta
-
+    mime = (
+        mime_imagen(ruta)
     )
 
 
@@ -2327,27 +3184,15 @@ Devuelve una descripción estructurada y detallada.
         )
 
 
-        return (
-
+        return extraer_contenido_respuesta(
             respuesta
-
-            .choices[0]
-
-            .message
-
-            .content
-
-            or ""
-
         )
 
 
     except Exception as error:
 
         print(
-
             f"❌ Error Vision: {error}"
-
         )
 
 
@@ -2534,7 +3379,6 @@ async def ensenar_imagen(
 
                 "Imagen aprendida "
                 "correctamente."
-
             ),
 
             "conocimiento": nuevo,
@@ -2606,7 +3450,7 @@ async def ensenar_imagen(
 
 
 # ============================================================
-# PDF
+# PDF — CONVERTIR PÁGINA A BASE64
 # ============================================================
 
 def pdf_a_imagen_base64(
@@ -2652,7 +3496,7 @@ def pdf_a_imagen_base64(
 
 
 # ============================================================
-# PDF VISION
+# PDF — VISION
 # ============================================================
 
 def analizar_pagina_pdf_con_vision(
@@ -2778,18 +3622,8 @@ Devuelve todo lo útil de esta página en texto estructurado.
         )
 
 
-        return (
-
+        return extraer_contenido_respuesta(
             respuesta
-
-            .choices[0]
-
-            .message
-
-            .content
-
-            or ""
-
         )
 
 
@@ -3144,6 +3978,10 @@ PÁGINA {indice}
 
         }
 
+
+        # ----------------------------------------------------
+        # APPEND
+        # ----------------------------------------------------
 
         conocimientos.append(
 
@@ -3519,7 +4357,7 @@ def eliminar_conocimiento(
 
 
 # ============================================================
-# BACKUPS
+# BACKUPS LOCALES
 # ============================================================
 
 @app.get("/backups")
@@ -3596,7 +4434,7 @@ def startup_event():
 
     print(
 
-        f"📂 CONOCIMIENTO_DIR: "
+        "📂 CONOCIMIENTO_DIR: "
 
         f"{CONOCIMIENTO_DIR}"
 
@@ -3605,7 +4443,7 @@ def startup_event():
 
     print(
 
-        f"🌐 RENDER: "
+        "🌐 RENDER: "
 
         f"{os.getenv('RENDER')}"
 
@@ -3613,6 +4451,33 @@ def startup_event():
 
 
     inicializar_google_drive()
+
+
+    # --------------------------------------------------------
+    # Mostrar estado final de conocimiento
+    # --------------------------------------------------------
+
+    try:
+
+        conocimientos = (
+            cargar_conocimiento()
+        )
+
+
+        print(
+
+            "📚 Conocimientos disponibles: "
+
+            f"{len(conocimientos)}"
+
+        )
+
+    except Exception as error:
+
+        print(
+            "⚠️ No se pudo cargar "
+            f"el conocimiento: {error}"
+        )
 
 
     print(
