@@ -1,0 +1,31 @@
+# Python
+backend/.env
+backend/__pycache__/
+backend/*.pyc
+backend/venv/
+backend/.venv/
+
+# Datos generados
+backend/conocimiento/
+
+# Compilaciones
+backend/build/
+backend/dist/
+
+# Ejecutables
+*.exe
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# Electron
+release/
+
+# Logs
+*.log
+
+# Sistema
+.DS_Store
+Thumbs.db

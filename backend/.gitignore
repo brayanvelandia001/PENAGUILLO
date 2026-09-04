@@ -1,0 +1,45 @@
+# ==========================================
+# PENAGUILLO - GITIGNORE
+# ==========================================
+
+# --------------------------
+# Python / Backend
+# --------------------------
+backend/.env
+backend/__pycache__/
+backend/*.pyc
+backend/venv/
+backend/.venv/
+
+# Datos generados por Penaguillo
+backend/conocimiento/
+
+# Compilaciones backend
+backend/build/
+backend/dist/
+
+# Ejecutables
+*.exe
+
+# --------------------------
+# Frontend / Node
+# --------------------------
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# --------------------------
+# Electron
+# --------------------------
+release/
+
+# --------------------------
+# Logs
+# --------------------------
+*.log
+
+# --------------------------
+# Sistema operativo
+# --------------------------
+.DS_Store
+Thumbs.db
