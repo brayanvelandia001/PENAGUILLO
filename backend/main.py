@@ -21,7 +21,7 @@
 #   conocimiento/ se mantiene local.
 #
 # RENDER:
-#   /var/data se utiliza como caché/persistencia local
+#   storage/ se utiliza como caché/persistencia local
 #   y Google Drive funciona como almacenamiento remoto.
 #
 # GOOGLE DRIVE:
@@ -364,6 +364,10 @@ def inicializar_google_drive():
 
     try:
 
+        # ----------------------------------------------------
+        # Corregir saltos de línea de la clave privada
+        # ----------------------------------------------------
+
         private_key = (
             GOOGLE_PRIVATE_KEY
             .replace(
@@ -372,6 +376,10 @@ def inicializar_google_drive():
             )
         )
 
+
+        # ----------------------------------------------------
+        # Credenciales
+        # ----------------------------------------------------
 
         credentials_info = {
 
@@ -429,6 +437,10 @@ def inicializar_google_drive():
             )
         )
 
+
+        # ----------------------------------------------------
+        # Crear cliente Drive
+        # ----------------------------------------------------
 
         drive_service = build(
 
@@ -534,9 +546,21 @@ def buscar_archivo_drive(
         return None
 
 
+    # --------------------------------------------------------
+    # Escapar comillas simples
+    # --------------------------------------------------------
+
+    nombre_escapado = (
+        nombre.replace(
+            "'",
+            "\\'",
+        )
+    )
+
+
     query = (
 
-        f"name = '{nombre.replace(chr(39), chr(92) + chr(39))}'"
+        f"name = '{nombre_escapado}'"
 
         f" and '{folder_id}' in parents"
 
@@ -545,38 +569,49 @@ def buscar_archivo_drive(
     )
 
 
-    resultado = (
-        drive_service
-        .files()
-        .list(
+    try:
 
-            q=query,
-
-            spaces="drive",
-
-            fields=(
-                "files(id,name,mimeType,size)"
-            ),
-
-            pageSize=10,
-
+        resultado = (
+            drive_service
+            .files()
+            .list(
+                q=query,
+                spaces="drive",
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+                fields=(
+                    "files(id,name,mimeType,size)"
+                ),
+                pageSize=10,
+            )
+            .execute()
         )
-        .execute()
-    )
 
 
-    archivos = resultado.get(
-        "files",
-        [],
-    )
+        archivos = resultado.get(
+            "files",
+            [],
+        )
 
 
-    if archivos:
+        if archivos:
 
-        return archivos[0]
+            return archivos[0]
 
 
-    return None
+        return None
+
+
+    except Exception as error:
+
+        print(
+            "❌ Error buscando archivo "
+            "en Drive:"
+        )
+
+        print(error)
+
+        return None
 
 
 # ============================================================
@@ -618,11 +653,9 @@ def obtener_o_crear_carpeta(
         drive_service
         .files()
         .create(
-
             body=metadata,
-
             fields="id",
-
+            supportsAllDrives=True,
         )
         .execute()
     )
@@ -728,13 +761,10 @@ def subir_archivo_drive(
                 drive_service
                 .files()
                 .update(
-
                     fileId=existente["id"],
-
                     media_body=media,
-
                     fields="id,name",
-
+                    supportsAllDrives=True,
                 )
                 .execute()
             )
@@ -768,13 +798,10 @@ def subir_archivo_drive(
             drive_service
             .files()
             .create(
-
                 body=metadata,
-
                 media_body=media,
-
                 fields="id,name",
-
+                supportsAllDrives=True,
             )
             .execute()
         )
@@ -827,11 +854,9 @@ def descargar_archivo_drive(
             drive_service
             .files()
             .get(
-
                 fileId=file_id,
-
                 alt="media",
-
+                supportsAllDrives=True,
             )
         )
 
@@ -931,8 +956,12 @@ def sincronizar_conocimiento_desde_drive():
                 "en Drive todavía."
             )
 
+
+            # ------------------------------------------------
             # Si existe localmente,
             # lo subimos.
+            # ------------------------------------------------
+
             if ARCHIVO_CONOCIMIENTO.exists():
 
                 subir_archivo_drive(
@@ -1430,8 +1459,11 @@ def cargar_conocimiento() -> list[dict[str, Any]]:
 
 
     if not isinstance(
+
         data,
+
         list,
+
     ):
 
         raise RuntimeError(
@@ -1457,10 +1489,15 @@ def crear_backup() -> str | None:
 
 
     timestamp = (
+
         datetime.now()
+
         .strftime(
+
             "%Y%m%d_%H%M%S_%f"
+
         )
+
     )
 
 
@@ -1485,18 +1522,25 @@ def crear_backup() -> str | None:
 
 
         print(
+
             "🛡️ Backup creado: "
+
             f"{backup_path.name}"
+
         )
 
 
         sincronizar_backup_a_drive(
+
             backup_path
+
         )
 
 
         return str(
+
             backup_path
+
         )
 
 
@@ -1505,6 +1549,7 @@ def crear_backup() -> str | None:
         raise RuntimeError(
 
             "No se pudo crear backup: "
+
             f"{error}"
 
         ) from error
@@ -1521,12 +1566,17 @@ def guardar_conocimiento(
 ) -> None:
 
     if not isinstance(
+
         conocimientos,
+
         list,
+
     ):
 
         raise RuntimeError(
+
             "El conocimiento debe ser una lista."
+
         )
 
 
@@ -1579,7 +1629,9 @@ def guardar_conocimiento(
 
 
             os.fsync(
+
                 archivo.fileno()
+
             )
 
 
@@ -1597,6 +1649,7 @@ def guardar_conocimiento(
             "💾 Conocimiento guardado. "
 
             f"Total registros: "
+
             f"{len(conocimientos)}"
 
         )
@@ -1625,6 +1678,7 @@ def guardar_conocimiento(
         raise RuntimeError(
 
             "No se pudo guardar "
+
             f"penaguillo.json: {error}"
 
         ) from error
@@ -1663,26 +1717,38 @@ def construir_conocimiento() -> str:
     ):
 
         tipo = item.get(
+
             "tipo",
+
             "desconocido",
+
         )
 
 
         titulo = item.get(
+
             "titulo",
+
             "",
+
         )
 
 
         contenido = item.get(
+
             "contenido",
+
             "",
+
         )
 
 
         descripcion = item.get(
+
             "descripcion",
+
             "",
+
         )
 
 
@@ -1709,7 +1775,9 @@ DESCRIPCIÓN VISUAL:
 
 
         bloques.append(
+
             texto.strip()
+
         )
 
 
@@ -1718,7 +1786,9 @@ DESCRIPCIÓN VISUAL:
         "\n\n==============================\n\n"
 
         .join(
+
             bloques
+
         )
 
     )
@@ -1758,11 +1828,15 @@ def root():
         "vision_model": VISION_MODEL,
 
         "conocimientos": len(
+
             conocimientos
+
         ),
 
         "google_drive": (
+
             drive_service is not None
+
         ),
 
     }
@@ -1774,12 +1848,17 @@ def root():
 
 @app.post("/chat")
 def chat(
+
     data: ChatRequest,
+
 ):
 
     mensaje = (
+
         data.message
+
         .strip()
+
     )
 
 
@@ -1790,8 +1869,10 @@ def chat(
             status_code=400,
 
             detail=(
+
                 "El mensaje no puede "
                 "estar vacío."
+
             ),
 
         )
@@ -1800,7 +1881,9 @@ def chat(
     try:
 
         conocimiento = (
+
             construir_conocimiento()
+
         )
 
 
@@ -1836,9 +1919,13 @@ def chat(
     try:
 
         respuesta = (
+
             client
+
             .chat
+
             .completions
+
             .create(
 
                 model=CHAT_MODEL,
@@ -1850,7 +1937,9 @@ def chat(
                         "role": "system",
 
                         "content": (
+
                             system_prompt
+
                         ),
 
                     },
@@ -1868,6 +1957,7 @@ def chat(
                 temperature=0.2,
 
             )
+
         )
 
 
@@ -1889,7 +1979,9 @@ def chat(
             "ok": True,
 
             "response": (
+
                 contenido or ""
+
             ),
 
         }
@@ -1898,7 +1990,9 @@ def chat(
     except Exception as error:
 
         print(
+
             f"❌ Error en /chat: {error}"
+
         )
 
 
@@ -1922,12 +2016,17 @@ def chat(
 
 @app.post("/ensenar")
 def ensenar(
+
     data: EnsenarRequest,
+
 ):
 
     texto = (
+
         data.conocimiento
+
         .strip()
+
     )
 
 
@@ -1938,8 +2037,10 @@ def ensenar(
             status_code=400,
 
             detail=(
+
                 "El conocimiento "
                 "no puede estar vacío."
+
             ),
 
         )
@@ -1948,7 +2049,9 @@ def ensenar(
     try:
 
         conocimientos = (
+
             cargar_conocimiento()
+
         )
 
 
@@ -1959,7 +2062,9 @@ def ensenar(
             "tipo": "texto",
 
             "titulo": (
+
                 "Conocimiento manual"
+
             ),
 
             "contenido": texto,
@@ -1972,12 +2077,16 @@ def ensenar(
 
 
         conocimientos.append(
+
             nuevo
+
         )
 
 
         guardar_conocimiento(
+
             conocimientos
+
         )
 
 
@@ -1986,14 +2095,18 @@ def ensenar(
             "ok": True,
 
             "mensaje": (
+
                 "Conocimiento guardado "
                 "correctamente."
+
             ),
 
             "conocimiento": nuevo,
 
             "total": len(
+
                 conocimientos
+
             ),
 
         }
@@ -2015,7 +2128,9 @@ def ensenar(
 # ============================================================
 
 def imagen_a_base64(
+
     ruta: Path,
+
 ) -> str:
 
     with open(
@@ -2030,19 +2145,28 @@ def imagen_a_base64(
 
 
     return base64.b64encode(
+
         contenido
+
     ).decode(
+
         "utf-8"
+
     )
 
 
 def mime_imagen(
+
     ruta: Path,
+
 ) -> str:
 
     extension = (
+
         ruta.suffix
+
         .lower()
+
     )
 
 
@@ -2091,12 +2215,16 @@ def analizar_imagen_con_vision(
 
 
     imagen_base64 = (
+
         imagen_a_base64(ruta)
+
     )
 
 
     mime = mime_imagen(
+
         ruta
+
     )
 
 
@@ -2217,7 +2345,9 @@ Devuelve una descripción estructurada y detallada.
     except Exception as error:
 
         print(
+
             f"❌ Error Vision: {error}"
+
         )
 
 
@@ -2287,8 +2417,11 @@ async def ensenar_imagen(
             status_code=400,
 
             detail=(
+
                 "La imagen supera "
+
                 "15 MB."
+
             ),
 
         )
@@ -2323,19 +2456,27 @@ async def ensenar_imagen(
         ) as archivo:
 
             archivo.write(
+
                 contenido
+
             )
 
 
         descripcion = (
+
             analizar_imagen_con_vision(
+
                 ruta
+
             )
+
         )
 
 
         conocimientos = (
+
             cargar_conocimiento()
+
         )
 
 
@@ -2352,7 +2493,9 @@ async def ensenar_imagen(
             "descripcion": descripcion,
 
             "archivo": (
+
                 f"/archivos/imagenes/{nombre}"
+
             ),
 
             "nombre_archivo": nombre_original,
@@ -2363,17 +2506,23 @@ async def ensenar_imagen(
 
 
         conocimientos.append(
+
             nuevo
+
         )
 
 
         guardar_conocimiento(
+
             conocimientos
+
         )
 
 
         sincronizar_imagen_a_drive(
+
             ruta
+
         )
 
 
@@ -2382,14 +2531,18 @@ async def ensenar_imagen(
             "ok": True,
 
             "mensaje": (
+
                 "Imagen aprendida "
                 "correctamente."
+
             ),
 
             "conocimiento": nuevo,
 
             "total": len(
+
                 conocimientos
+
             ),
 
         }
@@ -2420,7 +2573,9 @@ async def ensenar_imagen(
     except Exception as error:
 
         print(
+
             f"❌ Error /ensenar-imagen: {error}"
+
         )
 
 
@@ -2455,7 +2610,9 @@ async def ensenar_imagen(
 # ============================================================
 
 def pdf_a_imagen_base64(
+
     pagina: fitz.Page,
+
 ) -> str:
 
     matriz = fitz.Matrix(
@@ -2477,14 +2634,20 @@ def pdf_a_imagen_base64(
 
 
     imagen_bytes = (
+
         pixmap.tobytes("png")
+
     )
 
 
     return base64.b64encode(
+
         imagen_bytes
+
     ).decode(
+
         "utf-8"
+
     )
 
 
@@ -2503,14 +2666,20 @@ def analizar_pagina_pdf_con_vision(
     if not OPENROUTER_API_KEY:
 
         raise RuntimeError(
+
             "No existe OPENROUTER_API_KEY."
+
         )
 
 
     imagen_base64 = (
+
         pdf_a_imagen_base64(
+
             pagina
+
         )
+
     )
 
 
@@ -2662,12 +2831,16 @@ def extraer_texto_pdf(
         if texto.strip():
 
             paginas.append(
+
                 texto.strip()
+
             )
 
 
     return "\n\n".join(
+
         paginas
+
     )
 
 
@@ -2709,7 +2882,9 @@ async def ensenar_pdf(
             status_code=400,
 
             detail=(
+
                 "El archivo debe ser un PDF."
+
             ),
 
         )
@@ -2725,8 +2900,11 @@ async def ensenar_pdf(
             status_code=400,
 
             detail=(
+
                 "El PDF supera "
+
                 "el límite de 50 MB."
+
             ),
 
         )
@@ -2742,8 +2920,11 @@ async def ensenar_pdf(
 
 
     ruta = (
+
         PDF_DIR
+
         / nombre
+
     )
 
 
@@ -2761,24 +2942,34 @@ async def ensenar_pdf(
         ) as archivo:
 
             archivo.write(
+
                 contenido
+
             )
 
 
         documento = fitz.open(
+
             str(ruta)
+
         )
 
 
         numero_paginas = (
+
             documento.page_count
+
         )
 
 
         texto_extraido = (
+
             extraer_texto_pdf(
+
                 documento
+
             )
+
         )
 
 
@@ -2813,7 +3004,9 @@ async def ensenar_pdf(
         if not es_escaneado:
 
             contenido_final = (
+
                 texto_extraido
+
             )
 
 
@@ -2839,6 +3032,7 @@ async def ensenar_pdf(
                     "🔎 Analizando PDF — "
 
                     f"página "
+
                     f"{indice}/{numero_paginas}"
 
                 )
@@ -2875,9 +3069,13 @@ PÁGINA {indice}
 
 
             contenido_final = (
+
                 "\n\n".join(
+
                     paginas_vision
+
                 )
+
             )
 
 
@@ -2891,13 +3089,16 @@ PÁGINA {indice}
             raise RuntimeError(
 
                 "No fue posible extraer "
+
                 "información del PDF."
 
             )
 
 
         conocimientos = (
+
             cargar_conocimiento()
+
         )
 
 
@@ -2912,12 +3113,17 @@ PÁGINA {indice}
             "contenido": contenido_final,
 
             "descripcion": (
+
                 "Documento PDF procesado "
+
                 "por Penaguillo."
+
             ),
 
             "archivo": (
+
                 f"/archivos/pdf/{nombre}"
+
             ),
 
             "nombre_archivo": nombre_original,
@@ -2940,17 +3146,23 @@ PÁGINA {indice}
 
 
         conocimientos.append(
+
             nuevo
+
         )
 
 
         guardar_conocimiento(
+
             conocimientos
+
         )
 
 
         sincronizar_pdf_a_drive(
+
             ruta
+
         )
 
 
@@ -2959,14 +3171,19 @@ PÁGINA {indice}
             "ok": True,
 
             "mensaje": (
+
                 "PDF aprendido "
+
                 "correctamente."
+
             ),
 
             "conocimiento": nuevo,
 
             "total": len(
+
                 conocimientos
+
             ),
 
             "numero_paginas": numero_paginas,
@@ -3042,7 +3259,9 @@ PÁGINA {indice}
 
 
         print(
+
             f"❌ Error /ensenar-pdf: {error}"
+
         )
 
 
@@ -3071,7 +3290,9 @@ def obtener_conocimiento():
     try:
 
         conocimientos = (
+
             cargar_conocimiento()
+
         )
 
 
@@ -3080,7 +3301,9 @@ def obtener_conocimiento():
             "ok": True,
 
             "total": len(
+
                 conocimientos
+
             ),
 
             "conocimientos": conocimientos,
@@ -3113,7 +3336,9 @@ def eliminar_conocimiento(
     try:
 
         conocimientos = (
+
             cargar_conocimiento()
+
         )
 
 
@@ -3125,8 +3350,11 @@ def eliminar_conocimiento(
             if str(
 
                 item.get(
+
                     "id",
+
                     "",
+
                 )
 
             ) == str(
@@ -3147,8 +3375,11 @@ def eliminar_conocimiento(
                 status_code=404,
 
                 detail=(
+
                     "No se encontró "
+
                     "ese conocimiento."
+
                 ),
 
             )
@@ -3163,8 +3394,11 @@ def eliminar_conocimiento(
             if str(
 
                 item.get(
+
                     "id",
+
                     "",
+
                 )
 
             )
@@ -3188,7 +3422,9 @@ def eliminar_conocimiento(
         archivo_relativo = (
 
             encontrado.get(
+
                 "archivo"
+
             )
 
         )
@@ -3201,9 +3437,13 @@ def eliminar_conocimiento(
                 archivo_relativo
 
                 .replace(
+
                     "/archivos/",
+
                     "",
+
                     1,
+
                 )
 
                 .lstrip("/")
@@ -3231,6 +3471,7 @@ def eliminar_conocimiento(
                     print(
 
                         "⚠️ No se pudo "
+
                         "eliminar archivo: "
 
                         f"{error}"
@@ -3243,14 +3484,19 @@ def eliminar_conocimiento(
             "ok": True,
 
             "mensaje": (
+
                 "Conocimiento eliminado "
+
                 "correctamente."
+
             ),
 
             "eliminado": encontrado,
 
             "total": len(
+
                 nuevos_conocimientos
+
             ),
 
         }
@@ -3282,10 +3528,13 @@ def listar_backups():
     archivos = sorted(
 
         BACKUP_DIR.glob(
+
             "penaguillo_*.json"
+
         ),
 
         key=lambda archivo:
+
             archivo.stat().st_mtime,
 
         reverse=True,
@@ -3298,7 +3547,9 @@ def listar_backups():
         "ok": True,
 
         "total": len(
+
             archivos
+
         ),
 
         "backups": [
@@ -3317,7 +3568,7 @@ def listar_backups():
 
             for archivo in archivos
 
-        ],
+        ]
 
     }
 
@@ -3330,24 +3581,34 @@ def listar_backups():
 def startup_event():
 
     print(
+
         "🚀 Iniciando Penaguillo IA..."
+
     )
 
 
     print(
+
         f"📂 BASE_DIR: {BASE_DIR}"
+
     )
 
 
     print(
+
         f"📂 CONOCIMIENTO_DIR: "
+
         f"{CONOCIMIENTO_DIR}"
+
     )
 
 
     print(
+
         f"🌐 RENDER: "
+
         f"{os.getenv('RENDER')}"
+
     )
 
 
@@ -3355,7 +3616,9 @@ def startup_event():
 
 
     print(
+
         "✅ Penaguillo IA iniciado."
+
     )
 
 
