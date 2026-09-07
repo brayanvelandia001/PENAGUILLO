@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 5.8
+# VERSIÓN 5.9
 #
 # PROVEEDOR DE IA:
 # - OpenRouter
@@ -23,25 +23,15 @@
 # - Escritura atómica
 # - Búsqueda local por relevancia
 # - Deduplicación inteligente durante retrieval
-# - max_tokens objetivo: 3000
-# - Una sola adaptación de tokens por créditos
-# - Manejo controlado de in_flight_budget_exhausted
 #
-# CORRECCIONES V5.8:
-#
-# - La pregunta actual tiene mayor peso en retrieval.
-# - El historial anterior ya no domina la búsqueda.
-# - Se utilizan como máximo 2 preguntas anteriores para
-#   contexto de retrieval.
-# - Los duplicados reales se eliminan únicamente durante
-#   retrieval, incluso si tienen IDs diferentes.
-# - max_tokens objetivo permanece en 3000.
-# - Se permite UNA adaptación si OpenRouter informa un
-#   límite menor por créditos.
-# - No se encadenan adaptaciones 3000 -> 2875 -> 2352.
-# - in_flight_budget_exhausted se maneja de forma controlada.
-# - Google Drive permanece sin cambios.
-# - Enseñar texto / imagen / PDF permanece sin cambios.
+# CORRECCIONES V5.9:
+# - Se limpian espacios invisibles corruptos.
+# - Modelo por defecto: google/gemini-2.5-flash
+# - MAX_TOKENS fijo en 3000 (Sin adaptación automática).
+# - MAX_KB_CONOCIMIENTO_CHAT ajustado a 25.
+# - Eliminada la lógica de reducción automática de tokens.
+# - Corrección: Si la pregunta actual no tiene palabras clave
+#   (ej. "hola"), se utiliza el contexto completo.
 # ============================================================
 
 import base64
@@ -219,7 +209,7 @@ OPENROUTER_API_KEY = os.getenv(
 
 OPENROUTER_MODEL = os.getenv(
     "OPENROUTER_MODEL",
-    "google/gemma-2-9b-it:free",
+    "google/gemini-2.5-flash",
 )
 
 OPENROUTER_URL = (
@@ -255,8 +245,6 @@ VISION_MODEL = OPENROUTER_MODEL
 
 MAX_OUTPUT_TOKENS = 3000
 
-MIN_OUTPUT_TOKENS = 256
-
 
 # ============================================================
 # CONFIGURACIÓN DEL RETRIEVAL LOCAL
@@ -264,7 +252,7 @@ MIN_OUTPUT_TOKENS = 256
 
 RELEVANCIA_TOP_K = 5
 
-MAX_KB_CONOCIMIENTO_CHAT = 30
+MAX_KB_CONOCIMIENTO_CHAT = 25
 
 MAX_CHARS_CONOCIMIENTO_CHAT = (
     MAX_KB_CONOCIMIENTO_CHAT * 1024
@@ -282,9 +270,6 @@ MAX_MENSAJES_HISTORIAL = 10
 # CONFIGURACIÓN DE BÚSQUEDA CONTEXTUAL
 # ============================================================
 
-# Se redujo de 6 a 2 para que las conversaciones anteriores
-# no contaminen demasiado la búsqueda actual.
-
 MAX_MENSAJES_RETRIEVAL = 2
 
 MAX_CHARS_CONSULTA_RETRIEVAL = 2500
@@ -296,88 +281,14 @@ MAX_CHARS_CONSULTA_RETRIEVAL = 2500
 
 STOPWORDS_ES = {
 
-    "a",
-    "al",
-    "algo",
-    "algunas",
-    "algunos",
-    "ante",
-    "antes",
-    "como",
-    "con",
-    "contra",
-    "cual",
-    "cuales",
-    "cuando",
-    "de",
-    "del",
-    "desde",
-    "donde",
-    "dos",
-    "el",
-    "ella",
-    "ellas",
-    "ello",
-    "ellos",
-    "en",
-    "entre",
-    "era",
-    "es",
-    "esa",
-    "esas",
-    "ese",
-    "eso",
-    "esos",
-    "esta",
-    "estas",
-    "este",
-    "esto",
-    "estos",
-    "fue",
-    "ha",
-    "hay",
-    "la",
-    "las",
-    "le",
-    "les",
-    "lo",
-    "los",
-    "más",
-    "me",
-    "mi",
-    "mis",
-    "muy",
-    "no",
-    "nos",
-    "o",
-    "para",
-    "pero",
-    "por",
-    "que",
-    "qué",
-    "se",
-    "sea",
-    "si",
-    "sí",
-    "sin",
-    "sobre",
-    "son",
-    "su",
-    "sus",
-    "también",
-    "te",
-    "tener",
-    "ti",
-    "tu",
-    "tus",
-    "un",
-    "una",
-    "unas",
-    "uno",
-    "unos",
-    "y",
-    "ya",
-    "yo",
+    "a", "al", "algo", "algunas", "algunos", "ante", "antes", "como", "con", "contra",
+    "cual", "cuales", "cuando", "de", "del", "desde", "donde", "dos", "el", "ella",
+    "ellas", "ello", "ellos", "en", "entre", "era", "es", "esa", "esas", "ese", "eso",
+    "esos", "esta", "estas", "este", "esto", "estos", "fue", "ha", "hay", "la", "las",
+    "le", "les", "lo", "los", "más", "me", "mi", "mis", "muy", "no", "nos", "o", "para",
+    "pero", "por", "que", "qué", "se", "sea", "si", "sí", "sin", "sobre", "son", "su",
+    "sus", "también", "te", "tener", "ti", "tu", "tus", "un", "una", "unas", "uno",
+    "unos", "y", "ya", "yo",
 
 }
 
@@ -404,74 +315,6 @@ class OpenRouterError(RuntimeError):
 
 
 # ============================================================
-# OPENROUTER — EXTRAER TOKENS DISPONIBLES DEL ERROR 402
-# ============================================================
-
-def extraer_tokens_disponibles(
-    mensaje_error: str,
-) -> int | None:
-
-    if not mensaje_error:
-
-        return None
-
-
-    patrones = [
-
-        r"can only afford\s+(\d+)",
-
-        r"only afford\s+(\d+)",
-
-        r"puede pagar\s+(\d+)",
-
-        r"solo puede pagar\s+(\d+)",
-
-        r"can afford\s+(\d+)",
-
-        r"afford\s+(\d+)\s+tokens",
-
-    ]
-
-
-    for patron in patrones:
-
-        coincidencia = re.search(
-
-            patron,
-
-            mensaje_error,
-
-            flags=re.IGNORECASE,
-
-        )
-
-
-        if coincidencia:
-
-            try:
-
-                tokens = int(
-                    coincidencia.group(1)
-                )
-
-
-                if tokens >= MIN_OUTPUT_TOKENS:
-
-                    return tokens
-
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-
-                pass
-
-
-    return None
-
-
-# ============================================================
 # OPENROUTER — EXTRAER RETRY-AFTER
 # ============================================================
 
@@ -480,12 +323,9 @@ def extraer_retry_after(
     mensaje_error: str,
 ) -> int | None:
 
-    # Primero intentamos leer el header real.
-
     valor_header = respuesta.headers.get(
         "Retry-After"
     )
-
 
     if valor_header:
 
@@ -506,10 +346,6 @@ def extraer_retry_after(
 
             pass
 
-
-    # Algunas respuestas de OpenRouter incluyen el dato
-    # dentro de metadata.headers.
-
     patrones = [
 
         r'"Retry-After"\s*:\s*"(\d+)"',
@@ -520,7 +356,6 @@ def extraer_retry_after(
 
     ]
 
-
     for patron in patrones:
 
         coincidencia = re.search(
@@ -528,7 +363,6 @@ def extraer_retry_after(
             mensaje_error,
             flags=re.IGNORECASE,
         )
-
 
         if coincidencia:
 
@@ -548,7 +382,6 @@ def extraer_retry_after(
             ):
 
                 pass
-
 
     return None
 
@@ -588,31 +421,8 @@ def generar_con_openrouter(
     }
 
 
-    # ========================================================
-    # TOKENS
-    # ========================================================
-
-    max_tokens_actual = MAX_OUTPUT_TOKENS
-
-    # IMPORTANTE:
-    #
-    # Solamente permitimos UNA adaptación.
-    #
-    # No hacemos:
-    #
-    # 3000 -> 2875 -> 2352 -> ...
-    #
-    # Esto evita consumir solicitudes adicionales y evitar
-    # que una misma consulta termine empeorando el presupuesto.
-
-    ajuste_por_creditos = False
-
     ultimo_error = None
 
-
-    # ========================================================
-    # REINTENTOS
-    # ========================================================
 
     for intento in range(
         1,
@@ -630,7 +440,7 @@ def generar_con_openrouter(
 
                 "messages": messages,
 
-                "max_tokens": max_tokens_actual,
+                "max_tokens": MAX_OUTPUT_TOKENS,
 
             }
 
@@ -639,7 +449,7 @@ def generar_con_openrouter(
                 f"🤖 OpenRouter -> "
                 f"modelo={model}, "
                 f"intento={intento}/{max_retries}, "
-                f"max_tokens={max_tokens_actual}"
+                f"max_tokens={MAX_OUTPUT_TOKENS}"
             )
 
 
@@ -688,16 +498,6 @@ def generar_con_openrouter(
                         status_code=200,
                     ) from error
 
-
-                if ajuste_por_creditos:
-
-                    print(
-                        "✅ Solicitud adaptada "
-                        "una sola vez a "
-                        f"{max_tokens_actual} tokens."
-                    )
-
-
                 return datos
 
 
@@ -727,147 +527,20 @@ def generar_con_openrouter(
             )
 
 
-            # =================================================
-            # 402 — CRÉDITOS
-            # =================================================
+            if respuesta.status_code in (402, 400, 404):
 
-            if respuesta.status_code == 402:
+                texto_error_lower = mensaje_error.lower()
 
-                texto_error_lower = (
-                    mensaje_error.lower()
-                )
-
-
-                # ---------------------------------------------
-                # IN-FLIGHT BUDGET
-                # ---------------------------------------------
-
-                if (
-                    "in_flight_budget_exhausted"
-                    in texto_error_lower
-                    or
-                    "current in-flight requests"
-                    in texto_error_lower
-                ):
-
-                    retry_after = (
-                        extraer_retry_after(
-                            respuesta,
-                            mensaje_error,
-                        )
-                    )
-
-
-                    print(
-                        "⏳ OpenRouter indica que "
-                        "existen solicitudes en vuelo."
-                    )
-
-
-                    if retry_after is not None:
-
-                        print(
-                            "⏱️ Retry-After: "
-                            f"{retry_after}s"
-                        )
-
-
+                if "in_flight_budget_exhausted" in texto_error_lower or "current in-flight requests" in texto_error_lower:
+                    retry_after = extraer_retry_after(respuesta, mensaje_error)
                     raise OpenRouterError(
-
-                        "OpenRouter está esperando "
-                        "que finalicen solicitudes anteriores. "
-                        + (
-                            f"Intenta nuevamente en "
-                            f"{retry_after} segundos."
-                            if retry_after is not None
-                            else
-                            "Intenta nuevamente en unos segundos."
-                        ),
-
+                        "OpenRouter está esperando que finalicen solicitudes anteriores.",
                         status_code=429,
-
                         retry_after=retry_after,
-
                     )
-
-
-                # ---------------------------------------------
-                # CRÉDITOS NORMALES
-                # ---------------------------------------------
-
-                tokens_disponibles = (
-                    extraer_tokens_disponibles(
-                        mensaje_error
-                    )
-                )
-
-
-                if (
-                    tokens_disponibles is not None
-                    and not ajuste_por_creditos
-                    and tokens_disponibles
-                    < max_tokens_actual
-                    and tokens_disponibles
-                    >= MIN_OUTPUT_TOKENS
-                ):
-
-                    print(
-                        "💰 Créditos insuficientes "
-                        "para el límite objetivo."
-                    )
-
-
-                    print(
-                        "🔄 ÚNICO ajuste automático:"
-                    )
-
-
-                    print(
-                        f"   Objetivo: "
-                        f"{max_tokens_actual}"
-                    )
-
-
-                    print(
-                        f"   Disponible: "
-                        f"{tokens_disponibles}"
-                    )
-
-
-                    max_tokens_actual = (
-                        tokens_disponibles
-                    )
-
-
-                    ajuste_por_creditos = True
-
-
-                    print(
-                        "➡️ Se realizará "
-                        "una sola nueva solicitud "
-                        f"con {max_tokens_actual} tokens."
-                    )
-
-
-                    continue
-
-
-                # ---------------------------------------------
-                # SEGUNDO 402
-                # ---------------------------------------------
-
-                print(
-                    "🛑 OpenRouter no permite "
-                    "otra adaptación de tokens."
-                )
-
 
                 raise ultimo_error
 
-
-            # =================================================
-            # ERRORES TEMPORALES
-            # =================================================
 
             texto_error = (
                 mensaje_error.upper()
@@ -3254,6 +2927,11 @@ def calcular_relevancia(
             else pregunta
         )
     )
+    
+    # CORRECCIÓN V5.9: Si la pregunta actual no tiene palabras clave ("hola")
+    # y el historial sí, usamos las del historial combinado.
+    if not palabras_actuales:
+        palabras_actuales = palabras
 
 
     if not palabras:
@@ -4283,7 +3961,7 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "5.8.0",
+        "version": "5.9.0",
 
         "provider": "OpenRouter",
 
@@ -4320,14 +3998,6 @@ def root():
         "max_output_tokens": (
             MAX_OUTPUT_TOKENS
         ),
-
-        "min_output_tokens": (
-            MIN_OUTPUT_TOKENS
-        ),
-
-        "automatic_token_adjustment": True,
-
-        "single_token_adjustment": True,
 
         "duplicate_retrieval_filter": True,
 
@@ -6244,12 +5914,6 @@ def startup_event():
     print(
         "🤖 MAX OUTPUT TOKENS OBJETIVO: "
         f"{MAX_OUTPUT_TOKENS}"
-    )
-
-
-    print(
-        "🤖 AJUSTE AUTOMÁTICO DE TOKENS: "
-        "UNA SOLA VEZ"
     )
 
 
