@@ -47,6 +47,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 
 from datetime import datetime
@@ -217,32 +218,118 @@ load_dotenv(
 # GOOGLE GEMINI
 # ============================================================
 
-# Preferimos GEMINI_API_KEY.
-# También aceptamos OPENROUTER_API_KEY como compatibilidad temporal
-# para que puedas dejar el mismo nombre de variable en Render.
-GEMINI_API_KEY = (
-    os.getenv("GEMINI_API_KEY")
-    or os.getenv("OPENROUTER_API_KEY")
-)
+# ============================================================
+# GEMINI — CONFIGURACIÓN
+# ============================================================
+# En Render debe existir una variable llamada GEMINI_API_KEY.
+# No usamos OPENROUTER_API_KEY como respaldo para evitar que una
+# clave de OpenRouter sea enviada accidentalmente al SDK de Gemini.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not GEMINI_API_KEY:
-    print(
-        "⚠️ ADVERTENCIA: "
-        "No se encontró GEMINI_API_KEY "
-        "ni OPENROUTER_API_KEY."
-    )
+    print("⚠️ ADVERTENCIA: GEMINI_API_KEY no está configurada.")
+else:
+    print("🔑 GEMINI_API_KEY: configurada")
 
 client = (
-    genai.Client(
-        api_key=GEMINI_API_KEY
-    )
+    genai.Client(api_key=GEMINI_API_KEY)
     if GEMINI_API_KEY
     else None
 )
 
-CHAT_MODEL = "gemini-3.6-flash"
+# Modelos estables actualmente disponibles en Gemini API.
+# Gemini 2.5 Flash es adecuado para chat, imágenes y PDF.
+CHAT_MODEL = "gemini-2.5-flash"
+VISION_MODEL = "gemini-2.5-flash"
 
-VISION_MODEL = "gemini-3.6-flash"
+
+# ============================================================
+# GEMINI — RETRIES PARA 503 / 429 / ERRORES TEMPORALES
+# ============================================================
+
+def generar_con_gemini(
+    *,
+    model: str,
+    contents,
+    config,
+    max_retries: int = 3,
+):
+    """
+    Ejecuta Gemini con reintentos automáticos para errores temporales.
+
+    Google recomienda exponential backoff para respuestas como 503
+    UNAVAILABLE y 429 RESOURCE_EXHAUSTED.
+    """
+
+    if client is None:
+        raise RuntimeError(
+            "GEMINI_API_KEY no está configurada."
+        )
+
+    ultimo_error = None
+
+    for intento in range(1, max_retries + 1):
+        try:
+            inicio = time.time()
+
+            print(
+                f"🤖 Gemini -> modelo={model}, "
+                f"intento={intento}/{max_retries}"
+            )
+
+            respuesta = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+
+            duracion = time.time() - inicio
+
+            print(
+                f"✅ Gemini respondió en {duracion:.2f}s"
+            )
+
+            return respuesta
+
+        except Exception as error:
+            ultimo_error = error
+            mensaje_error = str(error)
+            texto_error = mensaje_error.upper()
+
+            es_temporal = any(
+                codigo in texto_error
+                for codigo in (
+                    "503",
+                    "UNAVAILABLE",
+                    "429",
+                    "RESOURCE_EXHAUSTED",
+                    "500",
+                    "INTERNAL",
+                    "502",
+                    "BAD_GATEWAY",
+                    "504",
+                    "DEADLINE_EXCEEDED",
+                )
+            )
+
+            print(
+                f"⚠️ Gemini falló en intento {intento}: "
+                f"{error}"
+            )
+
+            if not es_temporal or intento >= max_retries:
+                raise
+
+            espera = 2 ** intento
+
+            print(
+                f"⏳ Error temporal. Reintentando en "
+                f"{espera}s..."
+            )
+
+            time.sleep(espera)
+
+    raise ultimo_error
 
 
 # ============================================================
@@ -3382,7 +3469,7 @@ def chat(
         )
 
     try:
-        respuesta = client.models.generate_content(
+        respuesta = generar_con_gemini(
             model=CHAT_MODEL,
             contents=mensaje,
             config=types.GenerateContentConfig(
@@ -3400,6 +3487,28 @@ def chat(
 
     except Exception as error:
         print(f"❌ Error en /chat: {error}")
+
+        texto_error = str(error).upper()
+
+        if "503" in texto_error or "UNAVAILABLE" in texto_error:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Gemini está temporalmente saturado. "
+                    "Penaguillo reintentó automáticamente y "
+                    "no pudo completar la consulta. Intenta de nuevo."
+                ),
+            )
+
+        if "429" in texto_error or "RESOURCE_EXHAUSTED" in texto_error:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Se alcanzó temporalmente el límite de Gemini. "
+                    "Intenta nuevamente en unos segundos."
+                ),
+            )
+
         raise HTTPException(
             status_code=500,
             detail=f"Error consultando Penaguillo: {error}",
@@ -3649,7 +3758,7 @@ Devuelve una descripción estructurada y detallada.
 """
 
     try:
-        respuesta = client.models.generate_content(
+        respuesta = generar_con_gemini(
             model=VISION_MODEL,
             contents=[
                 types.Part.from_bytes(
@@ -4002,7 +4111,7 @@ Devuelve todo lo útil de esta página en texto estructurado.
 """
 
     try:
-        respuesta = client.models.generate_content(
+        respuesta = generar_con_gemini(
             model=VISION_MODEL,
             contents=[
                 types.Part.from_bytes(
