@@ -3707,13 +3707,15 @@ normalmente utilizando tus capacidades.
             }
         ]
         
-        # Agregar historial si existe
-        if data.history:
-            for msg in data.history:
-                mensajes_api.append({
-                    "role": msg.role,
-                    "content": msg.content
-                })
+    # Agregar solamente el historial reciente
+    if data.history:
+        historial_reciente = data.history[-10:]
+
+        for msg in historial_reciente:
+            mensajes_api.append({
+                "role": msg.role,
+                "content": msg.content
+            })
                 
         # Agregar el mensaje actual del usuario
         mensajes_api.append({
