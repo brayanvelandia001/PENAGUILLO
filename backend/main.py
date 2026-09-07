@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 5.6
+# VERSIÓN 5.7
 #
 # PROVEEDOR DE IA:
 # - OpenRouter
@@ -22,13 +22,23 @@
 # - Backups opcionales después de cada cambio
 # - Escritura atómica
 # - Búsqueda local por relevancia
+# - Ajuste automático de max_tokens según créditos disponibles
 #
-# CORRECCIONES V5.6:
+# CORRECCIONES V5.7:
 #
 # - El chat conserva los últimos 10 mensajes como historial.
-# - La búsqueda de conocimiento utiliza contexto de los
-#   últimos mensajes del usuario.
+# - La búsqueda utiliza contexto de los últimos mensajes
+#   del usuario.
 # - La pregunta actual siempre participa en la búsqueda.
+# - Retrieval máximo: 5 registros.
+# - Contexto máximo del retrieval: 30 KB.
+# - Se eliminan duplicados únicamente durante retrieval.
+# - max_tokens objetivo: 3000.
+# - Si OpenRouter no permite 3000 por créditos disponibles,
+#   el backend detecta automáticamente el máximo permitido
+#   y reintenta con ese valor.
+# - No es necesario modificar el código cuando disminuye
+#   el saldo disponible de OpenRouter.
 # - Se mantiene OpenRouter + Gemini 2.5 Flash.
 # - No se modifica la lógica de Google Drive.
 # - No se modifica enseñar texto / imagen / PDF.
@@ -238,16 +248,6 @@ else:
 # ============================================================
 # MODELOS
 # ============================================================
-#
-# Chat y Vision utilizan el mismo modelo configurable.
-#
-# Ejemplo:
-#
-# OPENROUTER_MODEL=google/gemini-2.5-flash
-#
-# Si posteriormente quieres cambiar de modelo,
-# solamente modificas OPENROUTER_MODEL en Render.
-# ============================================================
 
 CHAT_MODEL = OPENROUTER_MODEL
 
@@ -255,12 +255,71 @@ VISION_MODEL = OPENROUTER_MODEL
 
 
 # ============================================================
-# CONFIGURACIÓN DEL RETRIEVAL LOCAL
+# CONFIGURACIÓN DE TOKENS
+# ============================================================
+#
+# Este valor es el objetivo máximo de salida.
+#
+# IMPORTANTE:
+#
+# NO se modifica automáticamente este valor.
+#
+# Si OpenRouter indica que el saldo disponible solamente
+# permite menos tokens, generar_con_openrouter() ajustará
+# automáticamente la petición actual.
+#
+# Ejemplo:
+#
+# Objetivo = 3000
+# Disponible = 2875
+#
+# -> primera petición: 3000
+# -> OpenRouter responde 402
+# -> backend detecta 2875
+# -> segunda petición: 2875
+#
+# Si posteriormente el saldo permite 2400:
+#
+# -> primera petición: 3000
+# -> OpenRouter responde 402
+# -> backend detecta 2400
+# -> segunda petición: 2400
+#
+# No hace falta modificar el código.
 # ============================================================
 
-RELEVANCIA_TOP_K = 8
+MAX_OUTPUT_TOKENS = 3000
 
-MAX_KB_CONOCIMIENTO_CHAT = 80
+MIN_OUTPUT_TOKENS = 256
+
+
+# ============================================================
+# CONFIGURACIÓN DEL RETRIEVAL LOCAL
+# ============================================================
+#
+# Antes:
+#
+# RELEVANCIA_TOP_K = 8
+# MAX_KB_CONOCIMIENTO_CHAT = 80
+#
+# Ahora:
+#
+# Menos registros y menos contexto evitan mandar información
+# innecesaria al modelo.
+#
+# IMPORTANTE:
+#
+# Esto NO elimina conocimiento.
+#
+# penaguillo.json continúa teniendo todos sus registros.
+#
+# Solamente se limita lo que se envía a la IA para una
+# pregunta concreta.
+# ============================================================
+
+RELEVANCIA_TOP_K = 5
+
+MAX_KB_CONOCIMIENTO_CHAT = 30
 
 MAX_CHARS_CONOCIMIENTO_CHAT = (
     MAX_KB_CONOCIMIENTO_CHAT * 1024
@@ -271,30 +330,11 @@ MAX_CHARS_CONOCIMIENTO_CHAT = (
 # CONFIGURACIÓN DEL HISTORIAL
 # ============================================================
 
-# Cantidad máxima de mensajes enviados al modelo.
-#
-# Esto evita enviar una conversación completa cuando
-# la conversación crece demasiado.
-#
-# 10 mensajes = aproximadamente 5 intercambios.
-#
-# La aplicación puede conservar más mensajes localmente,
-# pero solamente estos se envían a OpenRouter.
-# ============================================================
-
 MAX_MENSAJES_HISTORIAL = 10
 
 
 # ============================================================
 # CONFIGURACIÓN DE BÚSQUEDA CONTEXTUAL
-# ============================================================
-
-# Cantidad de mensajes anteriores del usuario utilizados
-# para construir la consulta de búsqueda.
-#
-# Se utilizan menos mensajes para retrieval que para el
-# historial enviado al modelo porque la búsqueda solamente
-# necesita contexto suficiente para identificar el tema.
 # ============================================================
 
 MAX_MENSAJES_RETRIEVAL = 6
@@ -395,6 +435,74 @@ STOPWORDS_ES = {
 
 
 # ============================================================
+# OPENROUTER — EXTRAER TOKENS DISPONIBLES DEL ERROR 402
+# ============================================================
+
+def extraer_tokens_disponibles(
+    mensaje_error: str,
+) -> int | None:
+
+    if not mensaje_error:
+
+        return None
+
+
+    patrones = [
+
+        r"can only afford\s+(\d+)",
+
+        r"only afford\s+(\d+)",
+
+        r"puede pagar\s+(\d+)",
+
+        r"solo puede pagar\s+(\d+)",
+
+        r"can afford\s+(\d+)",
+
+        r"afford\s+(\d+)\s+tokens",
+
+    ]
+
+
+    for patron in patrones:
+
+        coincidencia = re.search(
+
+            patron,
+
+            mensaje_error,
+
+            flags=re.IGNORECASE,
+
+        )
+
+
+        if coincidencia:
+
+            try:
+
+                tokens = int(
+                    coincidencia.group(1)
+                )
+
+
+                if tokens >= MIN_OUTPUT_TOKENS:
+
+                    return tokens
+
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                pass
+
+
+    return None
+
+
+# ============================================================
 # OPENROUTER — GENERAR RESPUESTA
 # ============================================================
 
@@ -429,19 +537,21 @@ def generar_con_openrouter(
     }
 
 
-    payload = {
+    # ========================================================
+    # TOKENS
+    # ========================================================
 
-        "model": model,
+    max_tokens_actual = MAX_OUTPUT_TOKENS
 
-        "messages": messages,
-
-        "max_tokens": 3000,
-
-    }
+    ajuste_por_creditos = False
 
 
     ultimo_error = None
 
+
+    # ========================================================
+    # PERMITIR UNA PETICIÓN INICIAL + UNA ADAPTACIÓN
+    # ========================================================
 
     for intento in range(
         1,
@@ -453,10 +563,22 @@ def generar_con_openrouter(
             inicio = time.time()
 
 
+            payload = {
+
+                "model": model,
+
+                "messages": messages,
+
+                "max_tokens": max_tokens_actual,
+
+            }
+
+
             print(
                 f"🤖 OpenRouter -> "
                 f"modelo={model}, "
-                f"intento={intento}/{max_retries}"
+                f"intento={intento}/{max_retries}, "
+                f"max_tokens={max_tokens_actual}"
             )
 
 
@@ -505,6 +627,16 @@ def generar_con_openrouter(
                     ) from error
 
 
+                if ajuste_por_creditos:
+
+                    print(
+                        "✅ Solicitud adaptada "
+                        "automáticamente a los "
+                        f"{max_tokens_actual} tokens "
+                        "disponibles."
+                    )
+
+
                 return datos
 
 
@@ -527,6 +659,118 @@ def generar_con_openrouter(
             )
 
 
+            print(
+                "⚠️ OpenRouter falló:"
+            )
+
+
+            print(
+                mensaje_error
+            )
+
+
+            # =================================================
+            # 402 — CRÉDITOS INSUFICIENTES
+            # =================================================
+            #
+            # OpenRouter puede responder algo como:
+            #
+            # You requested up to 3000 tokens,
+            # but can only afford 2875.
+            #
+            # En ese caso NO fallamos inmediatamente.
+            #
+            # Detectamos 2875 y hacemos una nueva petición.
+            # =================================================
+
+            if respuesta.status_code == 402:
+
+                tokens_disponibles = (
+                    extraer_tokens_disponibles(
+                        mensaje_error
+                    )
+                )
+
+
+                if tokens_disponibles is not None:
+
+                    if (
+                        tokens_disponibles
+                        < max_tokens_actual
+                    ):
+
+                        nuevo_limite = min(
+
+                            max_tokens_actual,
+
+                            tokens_disponibles,
+
+                        )
+
+
+                        if (
+                            nuevo_limite
+                            >= MIN_OUTPUT_TOKENS
+                        ):
+
+                            print(
+                                "💰 Créditos insuficientes "
+                                "para el límite actual."
+                            )
+
+
+                            print(
+                                "🔄 Ajuste automático:"
+                            )
+
+
+                            print(
+                                f"   Solicitado: "
+                                f"{max_tokens_actual}"
+                            )
+
+
+                            print(
+                                f"   Disponible: "
+                                f"{tokens_disponibles}"
+                            )
+
+
+                            print(
+                                f"   Nuevo límite: "
+                                f"{nuevo_limite}"
+                            )
+
+
+                            # Evitar repetir infinitamente
+                            # el mismo límite.
+                            if (
+                                nuevo_limite
+                                != max_tokens_actual
+                            ):
+
+                                max_tokens_actual = (
+                                    nuevo_limite
+                                )
+
+                                ajuste_por_creditos = True
+
+                                continue
+
+
+                    print(
+                        "🛑 OpenRouter informa "
+                        "créditos insuficientes."
+                    )
+
+
+                raise ultimo_error
+
+
+            # =================================================
+            # ERRORES TEMPORALES
+            # =================================================
+
             es_temporal = any(
 
                 codigo in texto_error
@@ -545,16 +789,6 @@ def generar_con_openrouter(
 
                 )
 
-            )
-
-
-            print(
-                "⚠️ OpenRouter falló:"
-            )
-
-
-            print(
-                mensaje_error
             )
 
 
@@ -2306,10 +2540,6 @@ def sincronizar_conocimiento_desde_drive():
             return
 
 
-        # ----------------------------------------------------
-        # NO EXISTE EN DRIVE
-        # ----------------------------------------------------
-
         print(
             "ℹ️ No existe penaguillo.json "
             "en Google Drive."
@@ -2490,7 +2720,7 @@ app = FastAPI(
 
     title="Penaguillo IA",
 
-    version="5.6.0",
+    version="5.7.0",
 
     description=(
         "Backend del asistente inteligente Penaguillo"
@@ -3012,6 +3242,65 @@ def calcular_relevancia(
 
 
 # ============================================================
+# CREAR CLAVE PARA DETECTAR DUPLICADOS
+# ============================================================
+
+def clave_unica_conocimiento(
+    item: dict[str, Any],
+) -> str:
+
+    item_id = str(
+        item.get(
+            "id",
+            "",
+        )
+    ).strip()
+
+
+    if item_id:
+
+        return f"id:{item_id}"
+
+
+    titulo = normalizar_texto(
+        str(
+            item.get(
+                "titulo",
+                "",
+            )
+        )
+    )
+
+
+    contenido = normalizar_texto(
+        str(
+            item.get(
+                "contenido",
+                "",
+            )
+        )
+    )
+
+
+    descripcion = normalizar_texto(
+        str(
+            item.get(
+                "descripcion",
+                "",
+            )
+        )
+    )
+
+
+    return (
+        f"contenido:"
+        f"{titulo}|"
+        f"{contenido}|"
+        f"{descripcion}"
+    )
+
+
+# ============================================================
 # BUSCAR CONOCIMIENTO RELEVANTE
 # ============================================================
 
@@ -3029,9 +3318,31 @@ def buscar_conocimiento_relevante(
     resultados = []
 
 
+    # ========================================================
+    # EVITAR DUPLICADOS DURANTE LA BÚSQUEDA
+    # ========================================================
+
+    claves_vistas = set()
+
+
     for indice, item in enumerate(
         conocimientos
     ):
+
+        clave = clave_unica_conocimiento(
+            item
+        )
+
+
+        if clave in claves_vistas:
+
+            continue
+
+
+        claves_vistas.add(
+            clave
+        )
+
 
         puntuacion = (
             calcular_relevancia(
@@ -3092,6 +3403,12 @@ def buscar_conocimiento_relevante(
     print(
         f"   Registros totales: "
         f"{len(conocimientos)}"
+    )
+
+
+    print(
+        f"   Registros únicos evaluados: "
+        f"{len(claves_vistas)}"
     )
 
 
@@ -3680,7 +3997,7 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "5.6.0",
+        "version": "5.7.0",
 
         "provider": "OpenRouter",
 
@@ -3702,6 +4019,10 @@ def root():
             MAX_CHARS_CONOCIMIENTO_CHAT
         ),
 
+        "max_context_kb": (
+            MAX_KB_CONOCIMIENTO_CHAT
+        ),
+
         "max_history_messages": (
             MAX_MENSAJES_HISTORIAL
         ),
@@ -3710,7 +4031,15 @@ def root():
             MAX_MENSAJES_RETRIEVAL
         ),
 
-        "max_output_tokens": 3000,
+        "max_output_tokens": (
+            MAX_OUTPUT_TOKENS
+        ),
+
+        "min_output_tokens": (
+            MIN_OUTPUT_TOKENS
+        ),
+
+        "automatic_token_adjustment": True,
 
         "openrouter": (
             bool(OPENROUTER_API_KEY)
@@ -3779,33 +4108,6 @@ def chat(
 
         # ====================================================
         # BUSCAR CONOCIMIENTO CON CONTEXTO
-        # ====================================================
-        #
-        # ANTES:
-        #
-        # construir_contexto_relevante(
-        #     mensaje,
-        #     conocimientos,
-        # )
-        #
-        # AHORA:
-        #
-        # Se utilizan los últimos mensajes del usuario
-        # junto con la pregunta actual.
-        #
-        # Esto permite resolver conversaciones como:
-        #
-        # Usuario:
-        # ¿Qué hace Penagos?
-        #
-        # Usuario:
-        # ¿Dónde queda?
-        #
-        # Usuario:
-        # ¿Cuál es el teléfono?
-        #
-        # La búsqueda no recibe únicamente
-        # "¿Cuál es el teléfono?"
         # ====================================================
 
         consulta_retrieval = (
@@ -3940,13 +4242,6 @@ normalmente.
         # ====================================================
         # AGREGAR HISTORIAL RECIENTE
         # ====================================================
-        #
-        # Se conservan todos los mensajes en el frontend,
-        # pero solamente se envían los últimos 10 a la IA.
-        #
-        # Esto evita que el consumo de tokens crezca
-        # indefinidamente durante conversaciones largas.
-        # ====================================================
 
         if data.history:
 
@@ -3988,10 +4283,6 @@ normalmente.
                     continue
 
 
-                # --------------------------------------------
-                # Validar roles permitidos
-                # --------------------------------------------
-
                 if msg.role not in (
                     "user",
                     "assistant",
@@ -4017,16 +4308,6 @@ normalmente.
 
         # ====================================================
         # AGREGAR MENSAJE ACTUAL
-        # ====================================================
-        #
-        # Importante:
-        #
-        # El mensaje actual NO se agrega al historial
-        # previamente enviado.
-        #
-        # Se agrega solamente aquí.
-        #
-        # Así evitamos duplicarlo.
         # ====================================================
 
         mensajes_api.append(
@@ -5585,8 +5866,14 @@ def startup_event():
 
 
     print(
-        "🤖 MAX OUTPUT TOKENS: "
-        "3000"
+        "🤖 MAX OUTPUT TOKENS OBJETIVO: "
+        f"{MAX_OUTPUT_TOKENS}"
+    )
+
+
+    print(
+        "🤖 AJUSTE AUTOMÁTICO DE TOKENS: "
+        "ACTIVADO"
     )
 
 
