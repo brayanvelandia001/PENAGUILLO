@@ -3699,43 +3699,34 @@ normalmente utilizando tus capacidades.
         )
 
 
-        # Construir la lista de mensajes con el historial
+       # Construir la lista de mensajes con el historial
         mensajes_api = [
             {
                 "role": "system",
                 "content": system_prompt,
             }
         ]
-        
-        # Agregar historial si existe
+
+        # Agregar historial completo para mantener el hilo
         if data.history:
             for msg in data.history:
                 mensajes_api.append({
                     "role": msg.role,
                     "content": msg.content
                 })
-                
-        # Agregar el mensaje actual del usuario
+
+        # Agregar el mensaje actual
         mensajes_api.append({
             "role": "user",
             "content": mensaje,
         })
 
-
         respuesta = generar_con_openrouter(
-
             model=CHAT_MODEL,
-
             messages=mensajes_api,
-
         )
 
-
-        contenido = (
-            extraer_contenido_openrouter(
-                respuesta
-            )
-        )
+        contenido = extraer_contenido_openrouter(respuesta)
 
 
         return {
