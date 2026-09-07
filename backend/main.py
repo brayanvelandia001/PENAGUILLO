@@ -1,15 +1,18 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 6.0 (MIGRADO A GEMINI NATIVO)
+# VERSIÓN 6.1
 #
 # PROVEEDOR DE IA:
-# - Google Gemini
-# - Modelo configurable mediante GEMINI_MODEL
+# - Google Gemini Native API
+#
+# MODELO:
+# - gemini-3.5-flash-lite
 #
 # FUNCIONES:
-# - Chat con Penaguillo (CON HISTORIAL)
-# - Chat con búsqueda contextual
+# - Chat con Penaguillo
+# - Chat con historial
+# - Búsqueda contextual
 # - Enseñar texto
 # - Enseñar imágenes
 # - Enseñar PDF
@@ -17,20 +20,23 @@
 # - PDF escaneado -> Gemini Vision
 # - Imágenes -> Gemini Vision
 # - Persistencia local
-# - Google Drive como almacenamiento permanente en Render
-# - penaguillo.json como FUENTE MAESTRA de conocimiento
-# - Backups opcionales después de cada cambio
+# - Google Drive como almacenamiento permanente
+# - penaguillo.json como fuente maestra
+# - Backups
 # - Escritura atómica
 # - Búsqueda local por relevancia
-# - Deduplicación inteligente durante retrieval
+# - Deduplicación inteligente
 #
-# CORRECCIONES V6.0:
-# - Se migró la generación de OpenRouter a Google Gemini API.
-# - Se limpiaron espacios invisibles corruptos.
-# - Modelo por defecto: gemini-2.5-flash
-# - MAX_TOKENS fijo en 3000 (Sin adaptación automática).
-# - Corrección: Si la pregunta actual no tiene palabras clave
-#   (ej. "hola"), se utiliza el contexto completo.
+# CORRECCIONES V6.1:
+# - Gemini Native API
+# - Modelo gemini-3.5-flash-lite
+# - Menor latencia del chat
+# - Menor contexto enviado a Gemini
+# - Menor historial enviado a Gemini
+# - Retrieval reducido a 3 registros
+# - Pregunta actual siempre conservada
+# - Corrección de priorización de pregunta actual
+# - Menos coincidencias irrelevantes
 # ============================================================
 
 import base64
@@ -231,6 +237,7 @@ else:
 # ============================================================
 
 CHAT_MODEL = GEMINI_MODEL
+
 VISION_MODEL = GEMINI_MODEL
 
 
@@ -238,16 +245,20 @@ VISION_MODEL = GEMINI_MODEL
 # CONFIGURACIÓN DE TOKENS
 # ============================================================
 
-MAX_OUTPUT_TOKENS = 3000
+# Reducido para mejorar la velocidad del chat.
+MAX_OUTPUT_TOKENS = 1200
 
 
 # ============================================================
 # CONFIGURACIÓN DEL RETRIEVAL LOCAL
 # ============================================================
 
-RELEVANCIA_TOP_K = 5
+# Antes: 5
+RELEVANCIA_TOP_K = 3
 
-MAX_KB_CONOCIMIENTO_CHAT = 25
+
+# Antes: 25 KB
+MAX_KB_CONOCIMIENTO_CHAT = 10
 
 MAX_CHARS_CONOCIMIENTO_CHAT = (
     MAX_KB_CONOCIMIENTO_CHAT * 1024
@@ -258,7 +269,8 @@ MAX_CHARS_CONOCIMIENTO_CHAT = (
 # CONFIGURACIÓN DEL HISTORIAL
 # ============================================================
 
-MAX_MENSAJES_HISTORIAL = 10
+# Antes: 10
+MAX_MENSAJES_HISTORIAL = 6
 
 
 # ============================================================
@@ -276,14 +288,21 @@ MAX_CHARS_CONSULTA_RETRIEVAL = 2500
 
 STOPWORDS_ES = {
 
-    "a", "al", "algo", "algunas", "algunos", "ante", "antes", "como", "con", "contra",
-    "cual", "cuales", "cuando", "de", "del", "desde", "donde", "dos", "el", "ella",
-    "ellas", "ello", "ellos", "en", "entre", "era", "es", "esa", "esas", "ese", "eso",
-    "esos", "esta", "estas", "este", "esto", "estos", "fue", "ha", "hay", "la", "las",
-    "le", "les", "lo", "los", "más", "me", "mi", "mis", "muy", "no", "nos", "o", "para",
-    "pero", "por", "que", "qué", "se", "sea", "si", "sí", "sin", "sobre", "son", "su",
-    "sus", "también", "te", "tener", "ti", "tu", "tus", "un", "una", "unas", "uno",
-    "unos", "y", "ya", "yo",
+    "a", "al", "algo", "algunas", "algunos",
+    "ante", "antes", "como", "con", "contra",
+    "cual", "cuales", "cuando", "de", "del",
+    "desde", "donde", "dos", "el", "ella",
+    "ellas", "ello", "ellos", "en", "entre",
+    "era", "es", "esa", "esas", "ese", "eso",
+    "esos", "esta", "estas", "este", "esto",
+    "estos", "fue", "ha", "hay", "la", "las",
+    "le", "les", "lo", "los", "más", "me",
+    "mi", "mis", "muy", "no", "nos", "o",
+    "para", "pero", "por", "que", "qué", "se",
+    "sea", "si", "sí", "sin", "sobre", "son",
+    "su", "sus", "también", "te", "tener",
+    "ti", "tu", "tus", "un", "una", "unas",
+    "uno", "unos", "y", "ya", "yo",
 
 }
 
@@ -306,6 +325,7 @@ class GeminiError(RuntimeError):
         )
 
         self.status_code = status_code
+
         self.retry_after = retry_after
 
 
@@ -342,6 +362,55 @@ def extraer_retry_after(
             pass
 
 
+    # Intentar encontrar segundos dentro
+    # del mensaje de error de Gemini.
+
+    patrones = [
+
+        r"retry in ([0-9]+(?:\.[0-9]+)?)s",
+
+        r"retryDelay.*?([0-9]+)s",
+
+        r"seconds.*?([0-9]+)",
+
+    ]
+
+
+    texto = (
+        mensaje_error
+        or ""
+    )
+
+
+    for patron in patrones:
+
+        coincidencia = re.search(
+            patron,
+            texto,
+            re.IGNORECASE,
+        )
+
+        if coincidencia:
+
+            try:
+
+                return max(
+                    1,
+                    int(
+                        float(
+                            coincidencia.group(1)
+                        )
+                    ),
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                pass
+
+
     return None
 
 
@@ -353,7 +422,7 @@ def generar_con_gemini(
     *,
     model: str,
     messages: list,
-    max_retries: int = 3,
+    max_retries: int = 2,
 ):
 
     if not GEMINI_API_KEY:
@@ -363,7 +432,10 @@ def generar_con_gemini(
         )
 
 
-    # URL Nativa de Google Gemini
+    # ========================================================
+    # URL GEMINI NATIVE
+    # ========================================================
+
     url = (
         "https://generativelanguage.googleapis.com"
         f"/v1beta/models/{model}:generateContent"
@@ -383,86 +455,200 @@ def generar_con_gemini(
     gemini_contents = []
 
 
-    # Convertir el formato estándar al formato de Gemini
+    # ========================================================
+    # CONVERTIR MENSAJES A GEMINI
+    # ========================================================
+
     for msg in messages:
 
-        role = msg.get("role")
+        role = msg.get(
+            "role"
+        )
 
-        content = msg.get("content")
+        content = msg.get(
+            "content"
+        )
 
 
         if role == "system":
 
-            system_instruction = {
-                "parts": [
-                    {
-                        "text": content
-                    }
-                ]
-            }
+            if isinstance(
+                content,
+                str,
+            ):
+
+                system_instruction = {
+
+                    "parts": [
+
+                        {
+                            "text": content
+                        }
+
+                    ]
+
+                }
 
             continue
 
 
-        gemini_role = "model" if role == "assistant" else "user"
+        gemini_role = (
+            "model"
+            if role == "assistant"
+            else "user"
+        )
+
 
         parts = []
 
 
-        if isinstance(content, str):
+        if isinstance(
+            content,
+            str,
+        ):
 
-            parts.append(
-                {
-                    "text": content
-                }
-            )
+            if content.strip():
 
-        elif isinstance(content, list):
+                parts.append(
+
+                    {
+                        "text": content
+                    }
+
+                )
+
+
+        elif isinstance(
+            content,
+            list,
+        ):
 
             for item in content:
 
-                if item.get("type") == "text":
+                if not isinstance(
+                    item,
+                    dict,
+                ):
 
-                    parts.append(
-                        {
-                            "text": item.get("text")
-                        }
+                    continue
+
+
+                item_type = item.get(
+                    "type"
+                )
+
+
+                if item_type == "text":
+
+                    texto = item.get(
+                        "text",
+                        "",
                     )
 
-                elif item.get("type") == "image_url":
+                    if texto:
 
-                    url_img = item["image_url"]["url"]
+                        parts.append(
 
-                    header, b64_data = url_img.split(",", 1)
-
-                    mime_type = header.split(":")[1].split(";")[0]
-
-
-                    parts.append(
-                        {
-                            "inlineData": {
-                                "mimeType": mime_type,
-                                "data": b64_data
+                            {
+                                "text": texto
                             }
-                        }
+
+                        )
+
+
+                elif item_type == "image_url":
+
+                    image_data = item.get(
+                        "image_url",
+                        {}
                     )
 
 
-        gemini_contents.append(
-            {
-                "role": gemini_role,
-                "parts": parts,
-            }
-        )
+                    url_img = image_data.get(
+                        "url",
+                        ""
+                    )
 
+
+                    if not url_img.startswith(
+                        "data:"
+                    ):
+
+                        continue
+
+
+                    try:
+
+                        header,
+                        b64_data = url_img.split(
+                            ",",
+                            1,
+                        )
+
+
+                        mime_type = (
+                            header
+                            .split(":")[1]
+                            .split(";")[0]
+                        )
+
+
+                        parts.append(
+
+                            {
+                                "inlineData": {
+
+                                    "mimeType": mime_type,
+
+                                    "data": b64_data,
+
+                                }
+
+                            }
+
+                        )
+
+                    except (
+                        ValueError,
+                        IndexError,
+                    ):
+
+                        print(
+                            "⚠️ Imagen Base64 "
+                            "con formato inválido."
+                        )
+
+
+        if parts:
+
+            gemini_contents.append(
+
+                {
+                    "role": gemini_role,
+
+                    "parts": parts,
+
+                }
+
+            )
+
+
+    # ========================================================
+    # PAYLOAD
+    # ========================================================
 
     payload = {
 
         "contents": gemini_contents,
 
         "generationConfig": {
-            "maxOutputTokens": MAX_OUTPUT_TOKENS,
+
+            "maxOutputTokens": (
+                MAX_OUTPUT_TOKENS
+            ),
+
             "temperature": 0.3,
+
         }
 
     }
@@ -470,11 +656,17 @@ def generar_con_gemini(
 
     if system_instruction:
 
-        payload["systemInstruction"] = system_instruction
+        payload[
+            "systemInstruction"
+        ] = system_instruction
 
 
     ultimo_error = None
 
+
+    # ========================================================
+    # PETICIÓN
+    # ========================================================
 
     for intento in range(
         1,
@@ -534,10 +726,14 @@ def generar_con_gemini(
                 except ValueError as error:
 
                     raise GeminiError(
+
                         "Gemini devolvió "
                         "una respuesta que no es JSON.",
+
                         status_code=200,
+
                     ) from error
+
 
                 return datos
 
@@ -547,13 +743,25 @@ def generar_con_gemini(
             )
 
 
+            retry_after = (
+                extraer_retry_after(
+                    respuesta,
+                    mensaje_error,
+                )
+            )
+
+
             ultimo_error = GeminiError(
 
                 "Gemini HTTP "
                 f"{respuesta.status_code}: "
                 f"{mensaje_error}",
 
-                status_code=respuesta.status_code,
+                status_code=(
+                    respuesta.status_code
+                ),
+
+                retry_after=retry_after,
 
             )
 
@@ -568,13 +776,25 @@ def generar_con_gemini(
             )
 
 
-            if respuesta.status_code in (400, 403, 404):
+            # Errores de configuración.
+            if respuesta.status_code in (
+                400,
+                403,
+                404,
+            ):
 
                 raise ultimo_error
 
 
-            es_temporal = respuesta.status_code in (
-                429, 500, 502, 503, 504
+            es_temporal = (
+                respuesta.status_code
+                in (
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                )
             )
 
 
@@ -586,9 +806,20 @@ def generar_con_gemini(
                 raise ultimo_error
 
 
-            espera = (
-                2 ** intento
-            )
+            # =================================================
+            # ESPERA
+            # =================================================
+
+            if retry_after is not None:
+
+                espera = min(
+                    retry_after,
+                    15,
+                )
+
+            else:
+
+                espera = 2 ** intento
 
 
             print(
@@ -629,9 +860,7 @@ def generar_con_gemini(
                 raise ultimo_error
 
 
-            espera = (
-                2 ** intento
-            )
+            espera = 2 ** intento
 
 
             print(
@@ -715,9 +944,16 @@ def extraer_contenido_gemini(
 
         if "text" in parte:
 
-            texto_final.append(
-                parte["text"]
+            texto = parte.get(
+                "text",
+                "",
             )
+
+            if texto:
+
+                texto_final.append(
+                    texto
+                )
 
 
     resultado = "\n".join(
@@ -769,15 +1005,21 @@ DRIVE_SCOPES = [
 
 
 drive_service = None
+
 drive_session = None
 
 DRIVE_ROOT_FOLDER = None
+
 DRIVE_SHARED_ID = None
 
 DRIVE_KNOWLEDGE_FOLDER = None
+
 DRIVE_FILES_FOLDER = None
+
 DRIVE_PDF_FOLDER = None
+
 DRIVE_IMAGES_FOLDER = None
+
 DRIVE_BACKUPS_FOLDER = None
 
 
@@ -1306,6 +1548,7 @@ def inicializar_google_drive():
                 supportsAllDrives=True,
 
             )
+
             .execute()
         )
 
@@ -2445,7 +2688,7 @@ app = FastAPI(
 
     title="Penaguillo IA",
 
-    version="6.0.0",
+    version="6.1.0",
 
     description=(
         "Backend del asistente inteligente Penaguillo"
@@ -2539,12 +2782,14 @@ EXTENSIONES_PDF = {
 class ChatMessage(BaseModel):
 
     role: str
+
     content: str
 
 
 class ChatRequest(BaseModel):
 
     message: str
+
     history: list[ChatMessage] = []
 
 
@@ -2675,6 +2920,16 @@ def construir_consulta_retrieval(
     history: list[ChatMessage],
 ) -> str:
 
+    # ========================================================
+    # IMPORTANTE
+    #
+    # mensaje es SIEMPRE la pregunta real actual.
+    #
+    # No se modifica.
+    # No se corta.
+    # No se toma solamente la primera palabra.
+    # ========================================================
+
     mensaje_actual = (
         str(mensaje)
         .strip()
@@ -2686,20 +2941,12 @@ def construir_consulta_retrieval(
         return ""
 
 
-    # ========================================================
-    # IMPORTANTE
-    #
-    # La pregunta actual es la fuente principal.
-    #
-    # Solo agregamos las últimas 2 preguntas del usuario
-    # para resolver referencias como:
-    #
-    # "¿y cuál?"
-    # "¿y dónde?"
-    # "¿y esa máquina?"
-    #
-    # No concatenamos todo el historial.
-    # ========================================================
+    palabras_actuales = (
+        extraer_palabras_importantes(
+            mensaje_actual
+        )
+    )
+
 
     historial_usuario = []
 
@@ -2708,13 +2955,17 @@ def construir_consulta_retrieval(
 
         historial_usuario = [
 
-            str(msg.content).strip()
+            str(
+                msg.content
+            ).strip()
 
             for msg in history
 
             if msg.role == "user"
 
-            and str(msg.content).strip()
+            and str(
+                msg.content
+            ).strip()
 
         ]
 
@@ -2724,54 +2975,77 @@ def construir_consulta_retrieval(
     ]
 
 
-    # Si la pregunta actual es suficientemente descriptiva,
-    # la búsqueda utiliza principalmente esa pregunta.
-
-    palabras_actuales = (
-        extraer_palabras_importantes(
-            mensaje_actual
-        )
-    )
-
-
-    partes = []
-
+    # ========================================================
+    # PREGUNTA DESCRIPTIVA
+    #
+    # Ejemplo:
+    #
+    # "manejan tratamiento de datos?"
+    #
+    # Se utiliza completa.
+    # ========================================================
 
     if palabras_actuales:
 
-        partes.append(
+        partes = [
             mensaje_actual
-        )
+        ]
 
 
-        # Las preguntas anteriores solamente aportan
-        # contexto adicional.
-
+        # Añadir únicamente contexto anterior
+        # cuando puede aportar información.
         for anterior in anteriores:
 
-            if normalizar_texto(
-                anterior
-            ) == normalizar_texto(
-                mensaje_actual
+            if (
+                normalizar_texto(
+                    anterior
+                )
+                ==
+                normalizar_texto(
+                    mensaje_actual
+                )
             ):
 
                 continue
 
 
+            palabras_anterior = (
+                extraer_palabras_importantes(
+                    anterior
+                )
+            )
+
+
+            if palabras_anterior:
+
+                partes.append(
+                    anterior
+                )
+
+
+    # ========================================================
+    # PREGUNTA MUY CORTA
+    #
+    # Ejemplos:
+    #
+    # "hola"
+    # "¿y cuál?"
+    # "¿y dónde?"
+    #
+    # Aquí sí usamos historial.
+    # ========================================================
+
+    else:
+
+        partes = []
+
+
+        for anterior in anteriores:
+
             partes.append(
                 anterior
             )
 
-    else:
-
-        # Si la pregunta actual es algo como:
-        # "¿y cuál?"
-        #
-        # necesitamos el contexto anterior.
-
-        partes.extend(
-            anteriores
-        )
 
         partes.append(
             mensaje_actual
@@ -2780,58 +3054,62 @@ def construir_consulta_retrieval(
 
     consulta = " ".join(
         partes
-    )
+    ).strip()
 
 
-    if len(consulta) > MAX_CHARS_CONSULTA_RETRIEVAL:
+    # ========================================================
+    # LIMITE
+    # ========================================================
 
-        # Conservamos SIEMPRE la pregunta actual.
+    if len(
+        consulta
+    ) > MAX_CHARS_CONSULTA_RETRIEVAL:
 
-        consulta_actual_normalizada = (
+        pregunta_actual = (
             mensaje_actual
         )
 
 
-        espacio_disponible = (
+        espacio = (
 
             MAX_CHARS_CONSULTA_RETRIEVAL
 
-            - len(consulta_actual_normalizada)
+            - len(
+                pregunta_actual
+            )
 
             - 1
 
         )
 
 
-        if espacio_disponible > 0:
+        if espacio > 0:
 
-            contexto_anterior = " ".join(
+            contexto = " ".join(
                 anteriores
             )
 
 
-            contexto_anterior = (
-                contexto_anterior[
-                    -espacio_disponible:
-                ]
-            )
+            contexto = contexto[
+                -espacio:
+            ]
 
 
             consulta = (
 
-                contexto_anterior
+                contexto
 
                 + " "
 
-                + consulta_actual_normalizada
+                + pregunta_actual
 
             )
 
         else:
 
             consulta = (
-                consulta_actual_normalizada[
-                    -MAX_CHARS_CONSULTA_RETRIEVAL:
+                pregunta_actual[
+                    :MAX_CHARS_CONSULTA_RETRIEVAL
                 ]
             )
 
@@ -2878,15 +3156,24 @@ def calcular_relevancia(
 
     palabras_actuales = (
         extraer_palabras_importantes(
+
             pregunta_actual
+
             if pregunta_actual
+
             else pregunta
+
         )
     )
-    
-    # CORRECCIÓN V5.9: Si la pregunta actual no tiene palabras clave ("hola")
-    # y el historial sí, usamos las del historial combinado.
+
+
+    # ========================================================
+    # Si la pregunta actual no tiene palabras útiles,
+    # utilizamos las palabras de la consulta contextual.
+    # ========================================================
+
     if not palabras_actuales:
+
         palabras_actuales = palabras
 
 
@@ -2954,8 +3241,6 @@ def calcular_relevancia(
 
     # ========================================================
     # PALABRAS DE LA PREGUNTA ACTUAL
-    #
-    # Tienen más peso que el contexto histórico.
     # ========================================================
 
     for palabra in palabras_actuales:
@@ -2995,19 +3280,23 @@ def calcular_relevancia(
         )
 
 
+        # Título tiene mayor peso.
         puntuacion += (
-            coincidencias_titulo * 18
+            coincidencias_titulo
+            * 18
         )
 
 
         puntuacion += (
-            coincidencias_descripcion * 8
+            coincidencias_descripcion
+            * 8
         )
 
 
         puntuacion += min(
 
-            coincidencias_contenido * 2,
+            coincidencias_contenido
+            * 2,
 
             12,
 
@@ -3024,7 +3313,8 @@ def calcular_relevancia(
 
         for palabra in palabras
 
-        if palabra not in palabras_actuales
+        if palabra
+        not in palabras_actuales
 
     ]
 
@@ -3064,7 +3354,8 @@ def calcular_relevancia(
 
         puntuacion += min(
 
-            coincidencias * 0.75,
+            coincidencias
+            * 0.75,
 
             4,
 
@@ -3082,7 +3373,9 @@ def calcular_relevancia(
 
     coincidencias_actuales = (
 
-        set(palabras_actuales)
+        set(
+            palabras_actuales
+        )
 
         & palabras_en_texto
 
@@ -3097,7 +3390,8 @@ def calcular_relevancia(
     if cantidad_actuales >= 2:
 
         puntuacion += (
-            cantidad_actuales * 5
+            cantidad_actuales
+            * 8
         )
 
 
@@ -3108,11 +3402,13 @@ def calcular_relevancia(
         and
 
         cantidad_actuales
-        == len(palabras_actuales)
+        == len(
+            palabras_actuales
+        )
 
     ):
 
-        puntuacion += 20
+        puntuacion += 30
 
 
     return puntuacion
@@ -3125,21 +3421,6 @@ def calcular_relevancia(
 def clave_unica_conocimiento(
     item: dict[str, Any],
 ) -> str:
-
-    # ========================================================
-    # IMPORTANTE:
-    #
-    # NO usamos solamente el ID.
-    #
-    # Dos registros pueden tener:
-    #
-    # id=A
-    # id=B
-    #
-    # pero contener exactamente el mismo PDF.
-    #
-    # Por eso generamos una huella utilizando contenido.
-    # ========================================================
 
     titulo = normalizar_texto(
         str(
@@ -3195,9 +3476,11 @@ def clave_unica_conocimiento(
 
 
     huella = hashlib.sha256(
+
         material.encode(
             "utf-8"
         )
+
     ).hexdigest()
 
 
@@ -3231,8 +3514,10 @@ def buscar_conocimiento_relevante(
         conocimientos
     ):
 
-        clave = clave_unica_conocimiento(
-            item
+        clave = (
+            clave_unica_conocimiento(
+                item
+            )
         )
 
 
@@ -3259,7 +3544,13 @@ def buscar_conocimiento_relevante(
         )
 
 
-        if puntuacion > 0:
+        # ====================================================
+        # FILTRO MÍNIMO
+        #
+        # Evita documentos con coincidencias demasiado débiles.
+        # ====================================================
+
+        if puntuacion >= 3:
 
             resultados.append(
 
@@ -3325,18 +3616,26 @@ def buscar_conocimiento_relevante(
     )
 
 
-    if len(conocimientos) != len(claves_vistas):
+    if (
+        len(conocimientos)
+        != len(claves_vistas)
+    ):
 
         print(
+
             "♻️ Duplicados ignorados durante retrieval: "
+
             f"{len(conocimientos) - len(claves_vistas)}"
+
         )
 
 
     if resultados:
 
         for puntuacion, _, item in (
+
             resultados[:top_k]
+
         ):
 
             print(
@@ -3377,7 +3676,9 @@ def construir_contexto_relevante(
 
             conocimientos,
 
-            pregunta_actual=pregunta_actual,
+            pregunta_actual=(
+                pregunta_actual
+            ),
 
         )
     )
@@ -3450,7 +3751,9 @@ DESCRIPCIÓN:
 
             caracteres_actuales
 
-            + len(bloque)
+            + len(
+                bloque
+            )
 
         )
 
@@ -3867,9 +4170,13 @@ def guardar_conocimiento(
 
 
         print(
+
             "💾 Conocimiento guardado. "
+
             "Total registros: "
+
             f"{len(conocimientos)}"
+
         )
 
 
@@ -3917,7 +4224,7 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "6.0.0",
+        "version": "6.1.0",
 
         "provider": "Google Gemini Native",
 
@@ -3987,7 +4294,10 @@ def chat(
     data: ChatRequest,
 ):
 
-    mensaje = data.message.strip()
+    mensaje = (
+        data.message
+        .strip()
+    )
 
 
     if not mensaje:
@@ -4019,13 +4329,20 @@ def chat(
 
     try:
 
+        tiempo_inicio_chat = time.time()
+
+
+        # ====================================================
+        # CARGAR CONOCIMIENTO
+        # ====================================================
+
         conocimientos = (
             cargar_conocimiento()
         )
 
 
         # ====================================================
-        # BUSCAR CONOCIMIENTO
+        # RETRIEVAL
         # ====================================================
 
         consulta_retrieval = (
@@ -4079,9 +4396,7 @@ con la conversación y la pregunta del usuario.
 Debes tomar tú la decisión final sobre qué
 información utilizar para responder.
 
-La pregunta actual del usuario tiene prioridad
-sobre el contexto anterior utilizado para realizar
-la búsqueda.
+La pregunta ACTUAL del usuario tiene prioridad.
 
 No asumas que todos los registros son relevantes.
 
@@ -4094,9 +4409,9 @@ Si la pregunta no necesita conocimiento
 específico de Penaguillo, puedes responder
 normalmente utilizando tus capacidades.
 
-Utiliza también el historial de conversación
-proporcionado por el sistema para comprender
-referencias, pronombres y preguntas de seguimiento.
+Utiliza el historial de conversación proporcionado
+por el sistema para comprender referencias,
+pronombres y preguntas de seguimiento.
 
 Si el usuario dice cosas como:
 
@@ -4119,6 +4434,14 @@ que ya proporcionó anteriormente.
 Si el contexto de conversación permite saber
 a qué se refiere, continúa la conversación
 normalmente.
+
+IMPORTANTE:
+
+La pregunta actual que debes responder es
+la última pregunta enviada por el usuario.
+
+No reemplaces la pregunta actual por una
+palabra aislada del mensaje.
 
 """
 
@@ -4147,7 +4470,7 @@ normalmente.
 
 
         # ====================================================
-        # CONSTRUIR MENSAJES
+        # MENSAJES API
         # ====================================================
 
         mensajes_api = [
@@ -4255,7 +4578,7 @@ normalmente.
 
 
         # ====================================================
-        # GENERAR
+        # GEMINI
         # ====================================================
 
         respuesta = generar_con_gemini(
@@ -4271,6 +4594,18 @@ normalmente.
             extraer_contenido_gemini(
                 respuesta
             )
+        )
+
+
+        duracion_total = (
+            time.time()
+            - tiempo_inicio_chat
+        )
+
+
+        print(
+            f"⏱️ Tiempo total /chat: "
+            f"{duracion_total:.2f}s"
         )
 
 
@@ -4422,6 +4757,7 @@ normalmente.
             detail=(
 
                 "Error consultando Penaguillo: "
+
                 f"{error}"
 
             ),
@@ -4934,6 +5270,7 @@ async def ensenar_imagen(
             detail=(
 
                 "Error procesando imagen: "
+
                 f"{error}"
 
             ),
@@ -5500,8 +5837,10 @@ async def ensenar_pdf(
 
 
         print(
+
             f"❌ Error /ensenar-pdf: "
             f"{error}"
+
         )
 
 
@@ -5512,6 +5851,7 @@ async def ensenar_pdf(
             detail=(
 
                 "Error procesando PDF: "
+
                 f"{error}"
 
             ),
@@ -5583,10 +5923,12 @@ def eliminar_conocimiento(
         for item in conocimientos:
 
             if str(
+
                 item.get(
                     "id",
                     "",
                 )
+
             ) == str(
                 data.id
             ):
@@ -5619,10 +5961,12 @@ def eliminar_conocimiento(
             for item in conocimientos
 
             if str(
+
                 item.get(
                     "id",
                     "",
                 )
+
             )
 
             != str(
@@ -5758,11 +6102,17 @@ def listar_backups():
                 "nombre": archivo.name,
 
                 "fecha": (
+
                     datetime
+
                     .fromtimestamp(
+
                         archivo.stat().st_mtime
+
                     )
+
                     .isoformat()
+
                 ),
 
             }
@@ -5864,6 +6214,12 @@ def startup_event():
 
 
     print(
+        "⚡ OPTIMIZACIÓN DE LATENCIA: "
+        "ACTIVADA"
+    )
+
+
+    print(
         "🔑 GEMINI_API: "
         f"{'CONFIGURADO' if GEMINI_API_KEY else 'NO CONFIGURADO'}"
     )
@@ -5888,8 +6244,11 @@ def startup_event():
 
 
         print(
+
             "📚 Conocimientos disponibles: "
+
             f"{len(conocimientos)}"
+
         )
 
 
