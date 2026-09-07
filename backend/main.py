@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 5.7
+# VERSIÓN 5.8
 #
 # PROVEEDOR DE IA:
 # - OpenRouter
@@ -22,29 +22,30 @@
 # - Backups opcionales después de cada cambio
 # - Escritura atómica
 # - Búsqueda local por relevancia
-# - Ajuste automático de max_tokens según créditos disponibles
+# - Deduplicación inteligente durante retrieval
+# - max_tokens objetivo: 3000
+# - Una sola adaptación de tokens por créditos
+# - Manejo controlado de in_flight_budget_exhausted
 #
-# CORRECCIONES V5.7:
+# CORRECCIONES V5.8:
 #
-# - El chat conserva los últimos 10 mensajes como historial.
-# - La búsqueda utiliza contexto de los últimos mensajes
-#   del usuario.
-# - La pregunta actual siempre participa en la búsqueda.
-# - Retrieval máximo: 5 registros.
-# - Contexto máximo del retrieval: 30 KB.
-# - Se eliminan duplicados únicamente durante retrieval.
-# - max_tokens objetivo: 3000.
-# - Si OpenRouter no permite 3000 por créditos disponibles,
-#   el backend detecta automáticamente el máximo permitido
-#   y reintenta con ese valor.
-# - No es necesario modificar el código cuando disminuye
-#   el saldo disponible de OpenRouter.
-# - Se mantiene OpenRouter + Gemini 2.5 Flash.
-# - No se modifica la lógica de Google Drive.
-# - No se modifica enseñar texto / imagen / PDF.
+# - La pregunta actual tiene mayor peso en retrieval.
+# - El historial anterior ya no domina la búsqueda.
+# - Se utilizan como máximo 2 preguntas anteriores para
+#   contexto de retrieval.
+# - Los duplicados reales se eliminan únicamente durante
+#   retrieval, incluso si tienen IDs diferentes.
+# - max_tokens objetivo permanece en 3000.
+# - Se permite UNA adaptación si OpenRouter informa un
+#   límite menor por créditos.
+# - No se encadenan adaptaciones 3000 -> 2875 -> 2352.
+# - in_flight_budget_exhausted se maneja de forma controlada.
+# - Google Drive permanece sin cambios.
+# - Enseñar texto / imagen / PDF permanece sin cambios.
 # ============================================================
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -69,9 +70,7 @@ from fastapi import (
 )
 
 from fastapi.middleware.cors import CORSMiddleware
-
 from fastapi.staticfiles import StaticFiles
-
 from pydantic import BaseModel
 
 
@@ -82,11 +81,8 @@ from pydantic import BaseModel
 try:
 
     from google.oauth2 import service_account
-
     from googleapiclient.discovery import build
-
     from googleapiclient.http import MediaFileUpload
-
     from google.auth.transport.requests import AuthorizedSession
 
     GOOGLE_AVAILABLE = True
@@ -250,42 +246,11 @@ else:
 # ============================================================
 
 CHAT_MODEL = OPENROUTER_MODEL
-
 VISION_MODEL = OPENROUTER_MODEL
 
 
 # ============================================================
 # CONFIGURACIÓN DE TOKENS
-# ============================================================
-#
-# Este valor es el objetivo máximo de salida.
-#
-# IMPORTANTE:
-#
-# NO se modifica automáticamente este valor.
-#
-# Si OpenRouter indica que el saldo disponible solamente
-# permite menos tokens, generar_con_openrouter() ajustará
-# automáticamente la petición actual.
-#
-# Ejemplo:
-#
-# Objetivo = 3000
-# Disponible = 2875
-#
-# -> primera petición: 3000
-# -> OpenRouter responde 402
-# -> backend detecta 2875
-# -> segunda petición: 2875
-#
-# Si posteriormente el saldo permite 2400:
-#
-# -> primera petición: 3000
-# -> OpenRouter responde 402
-# -> backend detecta 2400
-# -> segunda petición: 2400
-#
-# No hace falta modificar el código.
 # ============================================================
 
 MAX_OUTPUT_TOKENS = 3000
@@ -295,26 +260,6 @@ MIN_OUTPUT_TOKENS = 256
 
 # ============================================================
 # CONFIGURACIÓN DEL RETRIEVAL LOCAL
-# ============================================================
-#
-# Antes:
-#
-# RELEVANCIA_TOP_K = 8
-# MAX_KB_CONOCIMIENTO_CHAT = 80
-#
-# Ahora:
-#
-# Menos registros y menos contexto evitan mandar información
-# innecesaria al modelo.
-#
-# IMPORTANTE:
-#
-# Esto NO elimina conocimiento.
-#
-# penaguillo.json continúa teniendo todos sus registros.
-#
-# Solamente se limita lo que se envía a la IA para una
-# pregunta concreta.
 # ============================================================
 
 RELEVANCIA_TOP_K = 5
@@ -337,9 +282,12 @@ MAX_MENSAJES_HISTORIAL = 10
 # CONFIGURACIÓN DE BÚSQUEDA CONTEXTUAL
 # ============================================================
 
-MAX_MENSAJES_RETRIEVAL = 6
+# Se redujo de 6 a 2 para que las conversaciones anteriores
+# no contaminen demasiado la búsqueda actual.
 
-MAX_CHARS_CONSULTA_RETRIEVAL = 4000
+MAX_MENSAJES_RETRIEVAL = 2
+
+MAX_CHARS_CONSULTA_RETRIEVAL = 2500
 
 
 # ============================================================
@@ -435,6 +383,27 @@ STOPWORDS_ES = {
 
 
 # ============================================================
+# ERROR CONTROLADO DE OPENROUTER
+# ============================================================
+
+class OpenRouterError(RuntimeError):
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        retry_after: int | None = None,
+    ):
+
+        super().__init__(
+            message
+        )
+
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+# ============================================================
 # OPENROUTER — EXTRAER TOKENS DISPONIBLES DEL ERROR 402
 # ============================================================
 
@@ -503,6 +472,88 @@ def extraer_tokens_disponibles(
 
 
 # ============================================================
+# OPENROUTER — EXTRAER RETRY-AFTER
+# ============================================================
+
+def extraer_retry_after(
+    respuesta: requests.Response,
+    mensaje_error: str,
+) -> int | None:
+
+    # Primero intentamos leer el header real.
+
+    valor_header = respuesta.headers.get(
+        "Retry-After"
+    )
+
+
+    if valor_header:
+
+        try:
+
+            segundos = int(
+                valor_header
+            )
+
+            if segundos >= 0:
+
+                return segundos
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            pass
+
+
+    # Algunas respuestas de OpenRouter incluyen el dato
+    # dentro de metadata.headers.
+
+    patrones = [
+
+        r'"Retry-After"\s*:\s*"(\d+)"',
+
+        r'"retry-after"\s*:\s*"(\d+)"',
+
+        r"Retry-After[\"']?\s*:\s*[\"']?(\d+)",
+
+    ]
+
+
+    for patron in patrones:
+
+        coincidencia = re.search(
+            patron,
+            mensaje_error,
+            flags=re.IGNORECASE,
+        )
+
+
+        if coincidencia:
+
+            try:
+
+                segundos = int(
+                    coincidencia.group(1)
+                )
+
+                if segundos >= 0:
+
+                    return segundos
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                pass
+
+
+    return None
+
+
+# ============================================================
 # OPENROUTER — GENERAR RESPUESTA
 # ============================================================
 
@@ -515,7 +566,7 @@ def generar_con_openrouter(
 
     if not OPENROUTER_API_KEY:
 
-        raise RuntimeError(
+        raise OpenRouterError(
             "OPENROUTER_API_KEY no está configurada."
         )
 
@@ -543,14 +594,24 @@ def generar_con_openrouter(
 
     max_tokens_actual = MAX_OUTPUT_TOKENS
 
-    ajuste_por_creditos = False
+    # IMPORTANTE:
+    #
+    # Solamente permitimos UNA adaptación.
+    #
+    # No hacemos:
+    #
+    # 3000 -> 2875 -> 2352 -> ...
+    #
+    # Esto evita consumir solicitudes adicionales y evitar
+    # que una misma consulta termine empeorando el presupuesto.
 
+    ajuste_por_creditos = False
 
     ultimo_error = None
 
 
     # ========================================================
-    # PERMITIR UNA PETICIÓN INICIAL + UNA ADAPTACIÓN
+    # REINTENTOS
     # ========================================================
 
     for intento in range(
@@ -621,9 +682,10 @@ def generar_con_openrouter(
 
                 except ValueError as error:
 
-                    raise RuntimeError(
+                    raise OpenRouterError(
                         "OpenRouter devolvió "
-                        "una respuesta que no es JSON."
+                        "una respuesta que no es JSON.",
+                        status_code=200,
                     ) from error
 
 
@@ -631,9 +693,8 @@ def generar_con_openrouter(
 
                     print(
                         "✅ Solicitud adaptada "
-                        "automáticamente a los "
-                        f"{max_tokens_actual} tokens "
-                        "disponibles."
+                        "una sola vez a "
+                        f"{max_tokens_actual} tokens."
                     )
 
 
@@ -641,21 +702,18 @@ def generar_con_openrouter(
 
 
             mensaje_error = (
-                respuesta.text[:3000]
+                respuesta.text[:5000]
             )
 
 
-            ultimo_error = RuntimeError(
+            ultimo_error = OpenRouterError(
 
                 "OpenRouter HTTP "
                 f"{respuesta.status_code}: "
-                f"{mensaje_error}"
+                f"{mensaje_error}",
 
-            )
+                status_code=respuesta.status_code,
 
-
-            texto_error = (
-                mensaje_error.upper()
             )
 
 
@@ -670,20 +728,72 @@ def generar_con_openrouter(
 
 
             # =================================================
-            # 402 — CRÉDITOS INSUFICIENTES
-            # =================================================
-            #
-            # OpenRouter puede responder algo como:
-            #
-            # You requested up to 3000 tokens,
-            # but can only afford 2875.
-            #
-            # En ese caso NO fallamos inmediatamente.
-            #
-            # Detectamos 2875 y hacemos una nueva petición.
+            # 402 — CRÉDITOS
             # =================================================
 
             if respuesta.status_code == 402:
+
+                texto_error_lower = (
+                    mensaje_error.lower()
+                )
+
+
+                # ---------------------------------------------
+                # IN-FLIGHT BUDGET
+                # ---------------------------------------------
+
+                if (
+                    "in_flight_budget_exhausted"
+                    in texto_error_lower
+                    or
+                    "current in-flight requests"
+                    in texto_error_lower
+                ):
+
+                    retry_after = (
+                        extraer_retry_after(
+                            respuesta,
+                            mensaje_error,
+                        )
+                    )
+
+
+                    print(
+                        "⏳ OpenRouter indica que "
+                        "existen solicitudes en vuelo."
+                    )
+
+
+                    if retry_after is not None:
+
+                        print(
+                            "⏱️ Retry-After: "
+                            f"{retry_after}s"
+                        )
+
+
+                    raise OpenRouterError(
+
+                        "OpenRouter está esperando "
+                        "que finalicen solicitudes anteriores. "
+                        + (
+                            f"Intenta nuevamente en "
+                            f"{retry_after} segundos."
+                            if retry_after is not None
+                            else
+                            "Intenta nuevamente en unos segundos."
+                        ),
+
+                        status_code=429,
+
+                        retry_after=retry_after,
+
+                    )
+
+
+                # ---------------------------------------------
+                # CRÉDITOS NORMALES
+                # ---------------------------------------------
 
                 tokens_disponibles = (
                     extraer_tokens_disponibles(
@@ -692,76 +802,64 @@ def generar_con_openrouter(
                 )
 
 
-                if tokens_disponibles is not None:
+                if (
+                    tokens_disponibles is not None
+                    and not ajuste_por_creditos
+                    and tokens_disponibles
+                    < max_tokens_actual
+                    and tokens_disponibles
+                    >= MIN_OUTPUT_TOKENS
+                ):
 
-                    if (
-                        tokens_disponibles
-                        < max_tokens_actual
-                    ):
-
-                        nuevo_limite = min(
-
-                            max_tokens_actual,
-
-                            tokens_disponibles,
-
-                        )
-
-
-                        if (
-                            nuevo_limite
-                            >= MIN_OUTPUT_TOKENS
-                        ):
-
-                            print(
-                                "💰 Créditos insuficientes "
-                                "para el límite actual."
-                            )
-
-
-                            print(
-                                "🔄 Ajuste automático:"
-                            )
-
-
-                            print(
-                                f"   Solicitado: "
-                                f"{max_tokens_actual}"
-                            )
-
-
-                            print(
-                                f"   Disponible: "
-                                f"{tokens_disponibles}"
-                            )
-
-
-                            print(
-                                f"   Nuevo límite: "
-                                f"{nuevo_limite}"
-                            )
-
-
-                            # Evitar repetir infinitamente
-                            # el mismo límite.
-                            if (
-                                nuevo_limite
-                                != max_tokens_actual
-                            ):
-
-                                max_tokens_actual = (
-                                    nuevo_limite
-                                )
-
-                                ajuste_por_creditos = True
-
-                                continue
+                    print(
+                        "💰 Créditos insuficientes "
+                        "para el límite objetivo."
+                    )
 
 
                     print(
-                        "🛑 OpenRouter informa "
-                        "créditos insuficientes."
+                        "🔄 ÚNICO ajuste automático:"
                     )
+
+
+                    print(
+                        f"   Objetivo: "
+                        f"{max_tokens_actual}"
+                    )
+
+
+                    print(
+                        f"   Disponible: "
+                        f"{tokens_disponibles}"
+                    )
+
+
+                    max_tokens_actual = (
+                        tokens_disponibles
+                    )
+
+
+                    ajuste_por_creditos = True
+
+
+                    print(
+                        "➡️ Se realizará "
+                        "una sola nueva solicitud "
+                        f"con {max_tokens_actual} tokens."
+                    )
+
+
+                    continue
+
+
+                # ---------------------------------------------
+                # SEGUNDO 402
+                # ---------------------------------------------
+
+                print(
+                    "🛑 OpenRouter no permite "
+                    "otra adaptación de tokens."
+                )
 
 
                 raise ultimo_error
@@ -770,6 +868,11 @@ def generar_con_openrouter(
             # =================================================
             # ERRORES TEMPORALES
             # =================================================
+
+            texto_error = (
+                mensaje_error.upper()
+            )
+
 
             es_temporal = any(
 
@@ -819,7 +922,12 @@ def generar_con_openrouter(
 
         except requests.RequestException as error:
 
-            ultimo_error = error
+            ultimo_error = OpenRouterError(
+
+                "No fue posible conectar "
+                f"con OpenRouter: {error}",
+
+            )
 
 
             print(
@@ -835,12 +943,7 @@ def generar_con_openrouter(
 
             if intento >= max_retries:
 
-                raise RuntimeError(
-
-                    "No fue posible conectar "
-                    f"con OpenRouter: {error}"
-
-                ) from error
+                raise ultimo_error
 
 
             espera = (
@@ -864,7 +967,7 @@ def generar_con_openrouter(
         raise ultimo_error
 
 
-    raise RuntimeError(
+    raise OpenRouterError(
         "OpenRouter no pudo generar una respuesta."
     )
 
@@ -1037,12 +1140,9 @@ DRIVE_SCOPES = [
 
 
 drive_service = None
-
 drive_session = None
 
-
 DRIVE_ROOT_FOLDER = None
-
 DRIVE_SHARED_ID = None
 
 DRIVE_KNOWLEDGE_FOLDER = None
@@ -2122,10 +2222,6 @@ def descargar_archivo_drive(
             return False
 
 
-        # ====================================================
-        # VALIDACIÓN ESPECIAL DEL JSON MAESTRO
-        # ====================================================
-
         if (
             metadata.get("name")
             == "penaguillo.json"
@@ -2720,7 +2816,7 @@ app = FastAPI(
 
     title="Penaguillo IA",
 
-    version="5.7.0",
+    version="5.8.0",
 
     description=(
         "Backend del asistente inteligente Penaguillo"
@@ -2814,14 +2910,12 @@ EXTENSIONES_PDF = {
 class ChatMessage(BaseModel):
 
     role: str
-
     content: str
 
 
 class ChatRequest(BaseModel):
 
     message: str
-
     history: list[ChatMessage] = []
 
 
@@ -2836,7 +2930,7 @@ class EliminarRequest(BaseModel):
 
 
 # ============================================================
-# NORMALIZAR TEXTO PARA BÚSQUEDA
+# NORMALIZAR TEXTO
 # ============================================================
 
 def normalizar_texto(
@@ -2944,7 +3038,7 @@ def extraer_palabras_importantes(
 
 
 # ============================================================
-# CONSTRUIR CONSULTA DE RETRIEVAL CON CONTEXTO
+# CONSTRUIR CONSULTA DE RETRIEVAL
 # ============================================================
 
 def construir_consulta_retrieval(
@@ -2952,83 +3046,165 @@ def construir_consulta_retrieval(
     history: list[ChatMessage],
 ) -> str:
 
-    partes = []
-
-
-    # --------------------------------------------------------
-    # Tomar los últimos mensajes del usuario
-    # --------------------------------------------------------
-
-    if history:
-
-        historial_usuario = [
-
-            msg
-
-            for msg in history
-
-            if msg.role == "user"
-
-        ]
-
-
-        for msg in historial_usuario[
-            -MAX_MENSAJES_RETRIEVAL:
-        ]:
-
-            contenido = (
-                str(msg.content)
-                .strip()
-            )
-
-
-            if not contenido:
-
-                continue
-
-
-            partes.append(
-                contenido
-            )
-
-
-    # --------------------------------------------------------
-    # Agregar siempre la pregunta actual
-    # --------------------------------------------------------
-
     mensaje_actual = (
         str(mensaje)
         .strip()
     )
 
 
-    if mensaje_actual:
+    if not mensaje_actual:
+
+        return ""
+
+
+    # ========================================================
+    # IMPORTANTE
+    #
+    # La pregunta actual es la fuente principal.
+    #
+    # Solo agregamos las últimas 2 preguntas del usuario
+    # para resolver referencias como:
+    #
+    # "¿y cuál?"
+    # "¿y dónde?"
+    # "¿y esa máquina?"
+    #
+    # No concatenamos todo el historial.
+    # ========================================================
+
+    historial_usuario = []
+
+
+    if history:
+
+        historial_usuario = [
+
+            str(msg.content).strip()
+
+            for msg in history
+
+            if msg.role == "user"
+
+            and str(msg.content).strip()
+
+        ]
+
+
+    anteriores = historial_usuario[
+        -MAX_MENSAJES_RETRIEVAL:
+    ]
+
+
+    # Si la pregunta actual es suficientemente descriptiva,
+    # la búsqueda utiliza principalmente esa pregunta.
+
+    palabras_actuales = (
+        extraer_palabras_importantes(
+            mensaje_actual
+        )
+    )
+
+
+    partes = []
+
+
+    if palabras_actuales:
 
         partes.append(
             mensaje_actual
         )
 
 
-    # --------------------------------------------------------
-    # Construir consulta
-    # --------------------------------------------------------
+        # Las preguntas anteriores solamente aportan
+        # contexto adicional.
+
+        for anterior in anteriores:
+
+            if normalizar_texto(
+                anterior
+            ) == normalizar_texto(
+                mensaje_actual
+            ):
+
+                continue
+
+
+            partes.append(
+                anterior
+            )
+
+    else:
+
+        # Si la pregunta actual es algo como:
+        # "¿y cuál?"
+        #
+        # necesitamos el contexto anterior.
+
+        partes.extend(
+            anteriores
+        )
+
+        partes.append(
+            mensaje_actual
+        )
+
 
     consulta = " ".join(
         partes
     )
 
 
-    # --------------------------------------------------------
-    # Evitar consulta excesivamente grande
-    # --------------------------------------------------------
-
     if len(consulta) > MAX_CHARS_CONSULTA_RETRIEVAL:
 
-        consulta = (
-            consulta[
-                -MAX_CHARS_CONSULTA_RETRIEVAL:
-            ]
+        # Conservamos SIEMPRE la pregunta actual.
+
+        consulta_actual_normalizada = (
+            mensaje_actual
         )
+
+
+        espacio_disponible = (
+
+            MAX_CHARS_CONSULTA_RETRIEVAL
+
+            - len(consulta_actual_normalizada)
+
+            - 1
+
+        )
+
+
+        if espacio_disponible > 0:
+
+            contexto_anterior = " ".join(
+                anteriores
+            )
+
+
+            contexto_anterior = (
+                contexto_anterior[
+                    -espacio_disponible:
+                ]
+            )
+
+
+            consulta = (
+
+                contexto_anterior
+
+                + " "
+
+                + consulta_actual_normalizada
+
+            )
+
+        else:
+
+            consulta = (
+                consulta_actual_normalizada[
+                    -MAX_CHARS_CONSULTA_RETRIEVAL:
+                ]
+            )
 
 
     print(
@@ -3038,6 +3214,16 @@ def construir_consulta_retrieval(
 
     print(
         f"   {consulta}"
+    )
+
+
+    print(
+        "🎯 Pregunta actual priorizada:"
+    )
+
+
+    print(
+        f"   {mensaje_actual}"
     )
 
 
@@ -3051,11 +3237,21 @@ def construir_consulta_retrieval(
 def calcular_relevancia(
     pregunta: str,
     item: dict[str, Any],
+    pregunta_actual: str | None = None,
 ) -> float:
 
     palabras = (
         extraer_palabras_importantes(
             pregunta
+        )
+    )
+
+
+    palabras_actuales = (
+        extraer_palabras_importantes(
+            pregunta_actual
+            if pregunta_actual
+            else pregunta
         )
     )
 
@@ -3122,63 +3318,111 @@ def calcular_relevancia(
     puntuacion = 0.0
 
 
-    for palabra in palabras:
+    # ========================================================
+    # PALABRAS DE LA PREGUNTA ACTUAL
+    #
+    # Tienen más peso que el contexto histórico.
+    # ========================================================
 
-        # ----------------------------------------------
-        # Coincidencia exacta en título
-        # ----------------------------------------------
-
-        if palabra in titulo:
-
-            puntuacion += 10
-
-
-        # ----------------------------------------------
-        # Coincidencia en descripción
-        # ----------------------------------------------
-
-        if palabra in descripcion:
-
-            puntuacion += 5
-
-
-        # ----------------------------------------------
-        # Coincidencia en contenido
-        # ----------------------------------------------
-
-        cantidad = (
-            texto_completo.count(
-                palabra
-            )
-        )
-
-
-        puntuacion += min(
-
-            cantidad * 1.5,
-
-            8,
-
-        )
-
-
-        # ----------------------------------------------
-        # Coincidencia de palabra completa
-        # ----------------------------------------------
+    for palabra in palabras_actuales:
 
         patron = (
             rf"\b{re.escape(palabra)}\b"
         )
 
 
+        coincidencias_titulo = len(
+
+            re.findall(
+                patron,
+                titulo,
+            )
+
+        )
+
+
+        coincidencias_descripcion = len(
+
+            re.findall(
+                patron,
+                descripcion,
+            )
+
+        )
+
+
+        coincidencias_contenido = len(
+
+            re.findall(
+                patron,
+                contenido,
+            )
+
+        )
+
+
+        puntuacion += (
+            coincidencias_titulo * 18
+        )
+
+
+        puntuacion += (
+            coincidencias_descripcion * 8
+        )
+
+
+        puntuacion += min(
+
+            coincidencias_contenido * 2,
+
+            12,
+
+        )
+
+
+    # ========================================================
+    # CONTEXTO DE CONVERSACIÓN
+    # ========================================================
+
+    palabras_contexto = [
+
+        palabra
+
+        for palabra in palabras
+
+        if palabra not in palabras_actuales
+
+    ]
+
+
+    for palabra in palabras_contexto:
+
+        patron = (
+            rf"\b{re.escape(palabra)}\b"
+        )
+
+
+        if re.search(
+            patron,
+            titulo,
+        ):
+
+            puntuacion += 5
+
+
+        if re.search(
+            patron,
+            descripcion,
+        ):
+
+            puntuacion += 2
+
+
         coincidencias = len(
 
             re.findall(
-
                 patron,
-
                 texto_completo,
-
             )
 
         )
@@ -3186,81 +3430,82 @@ def calcular_relevancia(
 
         puntuacion += min(
 
-            coincidencias,
+            coincidencias * 0.75,
 
-            5,
+            4,
 
         )
 
 
-    # ----------------------------------------------------
-    # Bonus por coincidencia de varias palabras
-    # ----------------------------------------------------
+    # ========================================================
+    # BONUS DE VARIAS PALABRAS ACTUALES
+    # ========================================================
 
     palabras_en_texto = set(
         texto_completo.split()
     )
 
 
-    palabras_coincidentes = (
+    coincidencias_actuales = (
 
-        set(palabras)
+        set(palabras_actuales)
 
         & palabras_en_texto
 
     )
 
 
-    cantidad_coincidentes = (
-        len(
-            palabras_coincidentes
-        )
+    cantidad_actuales = len(
+        coincidencias_actuales
     )
 
 
-    if cantidad_coincidentes >= 2:
+    if cantidad_actuales >= 2:
 
         puntuacion += (
-            cantidad_coincidentes
-            * 3
+            cantidad_actuales * 5
         )
 
 
     if (
 
-        cantidad_coincidentes
-        == len(palabras)
+        palabras_actuales
 
-        and palabras
+        and
+
+        cantidad_actuales
+        == len(palabras_actuales)
 
     ):
 
-        puntuacion += 15
+        puntuacion += 20
 
 
     return puntuacion
 
 
 # ============================================================
-# CREAR CLAVE PARA DETECTAR DUPLICADOS
+# CREAR CLAVE REAL DE DUPLICADO
 # ============================================================
 
 def clave_unica_conocimiento(
     item: dict[str, Any],
 ) -> str:
 
-    item_id = str(
-        item.get(
-            "id",
-            "",
-        )
-    ).strip()
-
-
-    if item_id:
-
-        return f"id:{item_id}"
-
+    # ========================================================
+    # IMPORTANTE:
+    #
+    # NO usamos solamente el ID.
+    #
+    # Dos registros pueden tener:
+    #
+    # id=A
+    # id=B
+    #
+    # pero contener exactamente el mismo PDF.
+    #
+    # Por eso generamos una huella utilizando contenido.
+    # ========================================================
 
     titulo = normalizar_texto(
         str(
@@ -3292,11 +3537,38 @@ def clave_unica_conocimiento(
     )
 
 
-    return (
-        f"contenido:"
+    tipo = normalizar_texto(
+        str(
+            item.get(
+                "tipo",
+                "",
+            )
+        )
+    )
+
+
+    material = (
+
+        f"{tipo}|"
+
         f"{titulo}|"
+
         f"{contenido}|"
+
         f"{descripcion}"
+
+    )
+
+
+    huella = hashlib.sha256(
+        material.encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+    return (
+        f"hash:{huella}"
     )
 
 
@@ -3308,6 +3580,7 @@ def buscar_conocimiento_relevante(
     pregunta: str,
     conocimientos: list[dict[str, Any]],
     top_k: int = RELEVANCIA_TOP_K,
+    pregunta_actual: str | None = None,
 ) -> list[dict[str, Any]]:
 
     if not conocimientos:
@@ -3316,11 +3589,6 @@ def buscar_conocimiento_relevante(
 
 
     resultados = []
-
-
-    # ========================================================
-    # EVITAR DUPLICADOS DURANTE LA BÚSQUEDA
-    # ========================================================
 
     claves_vistas = set()
 
@@ -3346,8 +3614,13 @@ def buscar_conocimiento_relevante(
 
         puntuacion = (
             calcular_relevancia(
+
                 pregunta,
+
                 item,
+
+                pregunta_actual,
+
             )
         )
 
@@ -3418,6 +3691,14 @@ def buscar_conocimiento_relevante(
     )
 
 
+    if len(conocimientos) != len(claves_vistas):
+
+        print(
+            "♻️ Duplicados ignorados durante retrieval: "
+            f"{len(conocimientos) - len(claves_vistas)}"
+        )
+
+
     if resultados:
 
         for puntuacion, _, item in (
@@ -3446,18 +3727,24 @@ def buscar_conocimiento_relevante(
 
 
 # ============================================================
-# CONSTRUIR SOLO EL CONTEXTO RELEVANTE
+# CONSTRUIR CONTEXTO RELEVANTE
 # ============================================================
 
 def construir_contexto_relevante(
     pregunta: str,
     conocimientos: list[dict[str, Any]],
+    pregunta_actual: str | None = None,
 ) -> str:
 
     relevantes = (
         buscar_conocimiento_relevante(
+
             pregunta,
+
             conocimientos,
+
+            pregunta_actual=pregunta_actual,
+
         )
     )
 
@@ -3472,7 +3759,6 @@ def construir_contexto_relevante(
 
 
     bloques = []
-
 
     caracteres_actuales = 0
 
@@ -3997,7 +4283,7 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "5.7.0",
+        "version": "5.8.0",
 
         "provider": "OpenRouter",
 
@@ -4040,6 +4326,12 @@ def root():
         ),
 
         "automatic_token_adjustment": True,
+
+        "single_token_adjustment": True,
+
+        "duplicate_retrieval_filter": True,
+
+        "current_question_priority": True,
 
         "openrouter": (
             bool(OPENROUTER_API_KEY)
@@ -4107,7 +4399,7 @@ def chat(
 
 
         # ====================================================
-        # BUSCAR CONOCIMIENTO CON CONTEXTO
+        # BUSCAR CONOCIMIENTO
         # ====================================================
 
         consulta_retrieval = (
@@ -4127,6 +4419,8 @@ def chat(
                 consulta_retrieval,
 
                 conocimientos,
+
+                pregunta_actual=mensaje,
 
             )
         )
@@ -4158,6 +4452,10 @@ con la conversación y la pregunta del usuario.
 
 Debes tomar tú la decisión final sobre qué
 información utilizar para responder.
+
+La pregunta actual del usuario tiene prioridad
+sobre el contexto anterior utilizado para realizar
+la búsqueda.
 
 No asumas que todos los registros son relevantes.
 
@@ -4223,7 +4521,7 @@ normalmente.
 
 
         # ====================================================
-        # CONSTRUIR MENSAJES PARA OPENROUTER
+        # CONSTRUIR MENSAJES
         # ====================================================
 
         mensajes_api = [
@@ -4240,7 +4538,7 @@ normalmente.
 
 
         # ====================================================
-        # AGREGAR HISTORIAL RECIENTE
+        # HISTORIAL
         # ====================================================
 
         if data.history:
@@ -4307,7 +4605,7 @@ normalmente.
 
 
         # ====================================================
-        # AGREGAR MENSAJE ACTUAL
+        # MENSAJE ACTUAL
         # ====================================================
 
         mensajes_api.append(
@@ -4331,7 +4629,7 @@ normalmente.
 
 
         # ====================================================
-        # GENERAR RESPUESTA
+        # GENERAR
         # ====================================================
 
         respuesta = generar_con_openrouter(
@@ -4357,6 +4655,84 @@ normalmente.
             "response": contenido or "",
 
         }
+
+
+    except OpenRouterError as error:
+
+        print(
+            f"❌ Error OpenRouter en /chat: "
+            f"{error}"
+        )
+
+
+        if (
+            error.status_code == 429
+            and error.retry_after is not None
+        ):
+
+            raise HTTPException(
+
+                status_code=429,
+
+                headers={
+
+                    "Retry-After": str(
+                        error.retry_after
+                    )
+
+                },
+
+                detail=str(
+                    error
+                ),
+
+            )
+
+
+        if error.status_code == 429:
+
+            raise HTTPException(
+
+                status_code=429,
+
+                detail=str(
+                    error
+                ),
+
+            )
+
+
+        if error.status_code == 402:
+
+            raise HTTPException(
+
+                status_code=402,
+
+                detail=(
+
+                    "OpenRouter no tiene "
+                    "créditos suficientes para "
+                    "esta solicitud. "
+
+                    "Se mantiene el objetivo de "
+                    f"{MAX_OUTPUT_TOKENS} tokens y "
+                    "no se realizarán más reducciones "
+                    "automáticas."
+
+                ),
+
+            )
+
+
+        raise HTTPException(
+
+            status_code=502,
+
+            detail=str(
+                error
+            ),
+
+        )
 
 
     except RuntimeError as error:
@@ -5873,7 +6249,19 @@ def startup_event():
 
     print(
         "🤖 AJUSTE AUTOMÁTICO DE TOKENS: "
-        "ACTIVADO"
+        "UNA SOLA VEZ"
+    )
+
+
+    print(
+        "♻️ DEDUPLICACIÓN RETRIEVAL: "
+        "ACTIVADA"
+    )
+
+
+    print(
+        "🎯 PRIORIDAD PREGUNTA ACTUAL: "
+        "ACTIVADA"
     )
 
 
@@ -5883,16 +6271,16 @@ def startup_event():
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # GOOGLE DRIVE
-    # --------------------------------------------------------
+    # ========================================================
 
     inicializar_google_drive()
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # ESTADO FINAL
-    # --------------------------------------------------------
+    # ========================================================
 
     try:
 
