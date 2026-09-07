@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 5.3
+# VERSIÓN 5.4
 #
 # FUNCIONES:
 # - Chat con Penaguillo
@@ -17,32 +17,21 @@
 # - Backups opcionales después de cada cambio
 # - Escritura atómica
 #
-# CORRECCIÓN V5.3:
+# CORRECCIÓN V5.4:
 #
-# El penaguillo.json de Google Drive se descarga mediante
-# una sesión HTTP autenticada de Google.
-#
-# Esto evita el problema detectado:
-#
-# Drive:
-#     20491 bytes
-#
-# Descarga anterior:
-#     211 bytes
-#
-# Ahora se verifica:
-#
-#     Tamaño reportado por Drive
-#     Bytes reales recibidos
-#     JSON válido
-#     Lista de registros
-#
-# NUNCA se sobrescribe Drive con [] durante el arranque.
+# - El chat YA NO envía todo penaguillo.json a Gemini.
+# - Se realiza una búsqueda local por relevancia.
+# - Solo los registros relacionados con la pregunta se envían
+#   a Gemini.
+# - Gemini sigue tomando la decisión final de la respuesta.
+# - Se mantiene Google Drive como almacenamiento maestro.
+# - Se mantiene Vision para imágenes y PDF escaneados.
+# - Se eliminan parámetros de sampling incompatibles con
+#   Gemini 3.6 Flash, especialmente temperature.
 # ============================================================
 
 
 import base64
-import io
 import json
 import os
 import re
@@ -215,36 +204,177 @@ load_dotenv(
 
 
 # ============================================================
-# GOOGLE GEMINI
+# GEMINI
 # ============================================================
 
-# ============================================================
-# GEMINI — CONFIGURACIÓN
-# ============================================================
-# En Render debe existir una variable llamada GEMINI_API_KEY.
-# No usamos OPENROUTER_API_KEY como respaldo para evitar que una
-# clave de OpenRouter sea enviada accidentalmente al SDK de Gemini.
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv(
+    "GEMINI_API_KEY"
+)
 
 if not GEMINI_API_KEY:
-    print("⚠️ ADVERTENCIA: GEMINI_API_KEY no está configurada.")
+
+    print(
+        "⚠️ ADVERTENCIA: GEMINI_API_KEY "
+        "no está configurada."
+    )
+
 else:
-    print("🔑 GEMINI_API_KEY: configurada")
+
+    print(
+        "🔑 GEMINI_API_KEY: configurada"
+    )
+
 
 client = (
-    genai.Client(api_key=GEMINI_API_KEY)
+    genai.Client(
+        api_key=GEMINI_API_KEY
+    )
     if GEMINI_API_KEY
     else None
 )
 
-# Modelos actuales de Gemini API.
-# Se usa Gemini 3.6 Flash para chat, imágenes y PDF.
+
+# ============================================================
+# MODELOS GEMINI
+# ============================================================
+#
+# Gemini 3.6 Flash es estable y multimodal.
+#
+# IMPORTANTE:
+# No usamos temperature porque Gemini 3.x no debe recibir
+# parámetros de sampling como temperature.
+# ============================================================
+
 CHAT_MODEL = "gemini-3.6-flash"
+
 VISION_MODEL = "gemini-3.6-flash"
 
 
 # ============================================================
-# GEMINI — RETRIES PARA 503 / 429 / ERRORES TEMPORALES
+# CONFIGURACIÓN DEL RETRIEVAL LOCAL
+# ============================================================
+#
+# Estos valores controlan cuánto conocimiento se envía a Gemini.
+#
+# Antes:
+#
+#     TODO penaguillo.json
+#
+# Ahora:
+#
+#     TOP_K registros más relevantes.
+#
+# Además se limita el tamaño total para evitar enviar
+# documentos gigantescos.
+# ============================================================
+
+RELEVANCIA_TOP_K = 8
+
+MAX_KB_CONOCIMIENTO_CHAT = 80
+
+MAX_CHARS_CONOCIMIENTO_CHAT = (
+    MAX_KB_CONOCIMIENTO_CHAT * 1024
+)
+
+
+# ============================================================
+# STOPWORDS
+# ============================================================
+#
+# Palabras muy frecuentes que no ayudan demasiado a determinar
+# qué registro es relevante.
+# ============================================================
+
+STOPWORDS_ES = {
+
+    "a",
+    "al",
+    "algo",
+    "algunas",
+    "algunos",
+    "ante",
+    "antes",
+    "como",
+    "con",
+    "contra",
+    "cual",
+    "cuales",
+    "cuando",
+    "de",
+    "del",
+    "desde",
+    "donde",
+    "dos",
+    "el",
+    "ella",
+    "ellas",
+    "ello",
+    "ellos",
+    "en",
+    "entre",
+    "era",
+    "es",
+    "esa",
+    "esas",
+    "ese",
+    "eso",
+    "esos",
+    "esta",
+    "estas",
+    "este",
+    "esto",
+    "estos",
+    "fue",
+    "ha",
+    "hay",
+    "la",
+    "las",
+    "le",
+    "les",
+    "lo",
+    "los",
+    "más",
+    "me",
+    "mi",
+    "mis",
+    "muy",
+    "no",
+    "nos",
+    "o",
+    "para",
+    "pero",
+    "por",
+    "que",
+    "qué",
+    "se",
+    "sea",
+    "si",
+    "sí",
+    "sin",
+    "sobre",
+    "son",
+    "su",
+    "sus",
+    "también",
+    "te",
+    "tener",
+    "ti",
+    "tu",
+    "tus",
+    "un",
+    "una",
+    "unas",
+    "uno",
+    "unos",
+    "y",
+    "ya",
+    "yo",
+
+}
+
+
+# ============================================================
+# RETRIES GEMINI
 # ============================================================
 
 def generar_con_gemini(
@@ -254,51 +384,79 @@ def generar_con_gemini(
     config,
     max_retries: int = 3,
 ):
-    """
-    Ejecuta Gemini con reintentos automáticos para errores temporales.
-
-    Google recomienda exponential backoff para respuestas como 503
-    UNAVAILABLE y 429 RESOURCE_EXHAUSTED.
-    """
 
     if client is None:
+
         raise RuntimeError(
             "GEMINI_API_KEY no está configurada."
         )
 
+
     ultimo_error = None
 
-    for intento in range(1, max_retries + 1):
+
+    for intento in range(
+        1,
+        max_retries + 1,
+    ):
+
         try:
+
             inicio = time.time()
 
+
             print(
-                f"🤖 Gemini -> modelo={model}, "
+                f"🤖 Gemini -> "
+                f"modelo={model}, "
                 f"intento={intento}/{max_retries}"
             )
 
-            respuesta = client.models.generate_content(
-                model=model,
-                contents=contents,
-                config=config,
+
+            respuesta = (
+                client
+                .models
+                .generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config,
+                )
             )
 
-            duracion = time.time() - inicio
+
+            duracion = (
+                time.time()
+                - inicio
+            )
+
 
             print(
-                f"✅ Gemini respondió en {duracion:.2f}s"
+                f"✅ Gemini respondió "
+                f"en {duracion:.2f}s"
             )
+
 
             return respuesta
 
+
         except Exception as error:
+
             ultimo_error = error
-            mensaje_error = str(error)
-            texto_error = mensaje_error.upper()
+
+            mensaje_error = str(
+                error
+            )
+
+            texto_error = (
+                mensaje_error.upper()
+            )
+
 
             es_temporal = any(
+
                 codigo in texto_error
+
                 for codigo in (
+
                     "503",
                     "UNAVAILABLE",
                     "429",
@@ -309,25 +467,43 @@ def generar_con_gemini(
                     "BAD_GATEWAY",
                     "504",
                     "DEADLINE_EXCEEDED",
+
                 )
+
             )
 
+
             print(
-                f"⚠️ Gemini falló en intento {intento}: "
+                f"⚠️ Gemini falló "
+                f"en intento {intento}: "
                 f"{error}"
             )
 
-            if not es_temporal or intento >= max_retries:
+
+            if (
+                not es_temporal
+                or intento >= max_retries
+            ):
+
                 raise
 
-            espera = 2 ** intento
+
+            espera = (
+                2 ** intento
+            )
+
 
             print(
-                f"⏳ Error temporal. Reintentando en "
+                f"⏳ Error temporal. "
+                f"Reintentando en "
                 f"{espera}s..."
             )
 
-            time.sleep(espera)
+
+            time.sleep(
+                espera
+            )
+
 
     raise ultimo_error
 
@@ -354,7 +530,7 @@ GOOGLE_DRIVE_FOLDER_ID = os.getenv(
 
 
 # ============================================================
-# GOOGLE DRIVE — CONFIGURACIÓN
+# GOOGLE DRIVE
 # ============================================================
 
 DRIVE_SCOPES = [
@@ -398,10 +574,6 @@ def inicializar_google_drive():
     global DRIVE_IMAGES_FOLDER
     global DRIVE_BACKUPS_FOLDER
 
-
-    # --------------------------------------------------------
-    # Solo usar Drive en Render
-    # --------------------------------------------------------
 
     if os.getenv("RENDER") != "true":
 
@@ -463,10 +635,6 @@ def inicializar_google_drive():
 
     try:
 
-        # ----------------------------------------------------
-        # Corregir saltos de línea de la clave
-        # ----------------------------------------------------
-
         private_key = (
             GOOGLE_PRIVATE_KEY
             .replace(
@@ -475,10 +643,6 @@ def inicializar_google_drive():
             )
         )
 
-
-        # ----------------------------------------------------
-        # Credenciales
-        # ----------------------------------------------------
 
         credentials_info = {
 
@@ -537,10 +701,6 @@ def inicializar_google_drive():
         )
 
 
-        # ----------------------------------------------------
-        # Cliente Google Drive API
-        # ----------------------------------------------------
-
         drive_service = build(
 
             "drive",
@@ -554,29 +714,15 @@ def inicializar_google_drive():
         )
 
 
-        # ----------------------------------------------------
-        # Sesión HTTP autenticada
-        #
-        # ESTA ES LA CORRECCIÓN PRINCIPAL
-        # ----------------------------------------------------
-
         drive_session = AuthorizedSession(
             credentials
         )
 
 
-        # ----------------------------------------------------
-        # Carpeta raíz
-        # ----------------------------------------------------
-
         DRIVE_ROOT_FOLDER = (
             GOOGLE_DRIVE_FOLDER_ID
         )
 
-
-        # ----------------------------------------------------
-        # VALIDAR CARPETA RAÍZ
-        # ----------------------------------------------------
 
         info_carpeta = (
             drive_service
@@ -656,10 +802,6 @@ def inicializar_google_drive():
             )
 
 
-        # ----------------------------------------------------
-        # Crear / encontrar estructura
-        # ----------------------------------------------------
-
         DRIVE_KNOWLEDGE_FOLDER = (
             obtener_o_crear_carpeta(
                 "conocimiento",
@@ -711,10 +853,6 @@ def inicializar_google_drive():
         )
 
 
-        # ----------------------------------------------------
-        # DESCARGAR MAESTRO
-        # ----------------------------------------------------
-
         sincronizar_conocimiento_desde_drive()
 
 
@@ -725,7 +863,8 @@ def inicializar_google_drive():
         drive_session = None
 
         print(
-            "❌ Error inicializando Google Drive:"
+            "❌ Error inicializando "
+            "Google Drive:"
         )
 
         print(error)
@@ -834,77 +973,26 @@ def buscar_archivo_drive(
             "🔎 Búsqueda Drive:"
         )
 
+
         print(
             f"   Nombre: {nombre}"
         )
+
 
         print(
             f"   Carpeta: {folder_id}"
         )
 
+
         print(
             f"   Solo JSON: {solo_json}"
         )
+
 
         print(
             "   Resultados encontrados: "
             f"{len(archivos)}"
         )
-
-
-        for indice, archivo in enumerate(
-
-            archivos,
-
-            start=1,
-
-        ):
-
-            print(
-                f"   ───────── Archivo {indice}"
-            )
-
-            print(
-                f"   🆔 ID: "
-                f"{archivo.get('id')}"
-            )
-
-            print(
-                f"   📄 Nombre: "
-                f"{archivo.get('name')}"
-            )
-
-            print(
-                f"   📦 MIME: "
-                f"{archivo.get('mimeType')}"
-            )
-
-            print(
-                f"   📏 Tamaño Drive: "
-                f"{archivo.get('size', 'N/D')} bytes"
-            )
-
-            print(
-                f"   📅 Modificado: "
-                f"{archivo.get('modifiedTime', 'N/D')}"
-            )
-
-            print(
-                f"   📁 Padres: "
-                f"{archivo.get('parents', [])}"
-            )
-
-            if archivo.get(
-                "shortcutDetails"
-            ):
-
-                print(
-                    "   ⚠️ SHORTCUT DETECTADO:"
-                )
-
-                print(
-                    f"   {archivo.get('shortcutDetails')}"
-                )
 
 
         if archivos:
@@ -944,29 +1032,28 @@ def buscar_archivo_drive(
                 "🎯 Archivo seleccionado:"
             )
 
+
             print(
                 f"   ID = "
                 f"{archivo.get('id')}"
             )
+
 
             print(
                 f"   Nombre = "
                 f"{archivo.get('name')}"
             )
 
+
             print(
                 f"   MIME = "
                 f"{archivo.get('mimeType')}"
             )
 
+
             print(
                 f"   Tamaño = "
                 f"{archivo.get('size', 'N/D')} bytes"
-            )
-
-            print(
-                f"   Modificado = "
-                f"{archivo.get('modifiedTime', 'N/D')}"
             )
 
 
@@ -991,97 +1078,6 @@ def buscar_archivo_drive(
         print(error)
 
         return None
-
-
-# ============================================================
-# GOOGLE DRIVE — LISTAR ARCHIVOS
-# ============================================================
-
-def listar_archivos_drive(
-    folder_id: str,
-):
-
-    if not drive_service:
-
-        return []
-
-
-    query = (
-
-        f"'{folder_id}' in parents"
-
-        " and trashed = false"
-
-    )
-
-
-    try:
-
-        parametros = {
-
-            "q": query,
-
-            "spaces": "drive",
-
-            "includeItemsFromAllDrives": True,
-
-            "supportsAllDrives": True,
-
-            "fields": (
-                "files("
-                "id,"
-                "name,"
-                "mimeType,"
-                "size,"
-                "modifiedTime,"
-                "parents"
-                ")"
-            ),
-
-            "pageSize": 1000,
-
-            "orderBy": (
-                "modifiedTime desc"
-            ),
-
-        }
-
-
-        if DRIVE_SHARED_ID:
-
-            parametros["corpora"] = "drive"
-
-            parametros["driveId"] = (
-                DRIVE_SHARED_ID
-            )
-
-
-        resultado = (
-            drive_service
-            .files()
-            .list(
-                **parametros
-            )
-            .execute()
-        )
-
-
-        return resultado.get(
-            "files",
-            [],
-        )
-
-
-    except Exception as error:
-
-        print(
-            "❌ Error listando archivos "
-            "de Drive:"
-        )
-
-        print(error)
-
-        return []
 
 
 # ============================================================
@@ -1111,27 +1107,11 @@ def obtener_o_crear_carpeta(
         ):
 
             print(
-                f"📁 Carpeta existente encontrada: "
+                f"📁 Carpeta existente: "
                 f"{nombre}"
             )
 
             return existente["id"]
-
-
-        print(
-            "⚠️ Existe un elemento llamado "
-            f"{nombre}, pero no es una carpeta."
-        )
-
-
-        print(
-            f"   MIME encontrado: {mime_type}"
-        )
-
-
-        print(
-            "⚠️ Se intentará crear la carpeta."
-        )
 
 
     metadata = {
@@ -1274,11 +1254,6 @@ def subir_archivo_drive(
 
 
         print(
-            f"   📦 MIME: {mime_type}"
-        )
-
-
-        print(
             f"   📏 Tamaño local: "
             f"{tamaño_local} bytes"
         )
@@ -1295,17 +1270,7 @@ def subir_archivo_drive(
         )
 
 
-        # ----------------------------------------------------
-        # ACTUALIZAR
-        # ----------------------------------------------------
-
         if existente:
-
-            print(
-                "🔄 Actualizando archivo existente "
-                "en Drive."
-            )
-
 
             archivo = (
                 drive_service
@@ -1338,36 +1303,8 @@ def subir_archivo_drive(
             )
 
 
-            print(
-                f"   🆔 ID: "
-                f"{archivo.get('id')}"
-            )
-
-
-            print(
-                f"   📦 MIME: "
-                f"{archivo.get('mimeType')}"
-            )
-
-
-            print(
-                f"   📏 Tamaño: "
-                f"{archivo.get('size', 'N/D')} bytes"
-            )
-
-
-            print(
-                f"   📅 Modificado: "
-                f"{archivo.get('modifiedTime', 'N/D')}"
-            )
-
-
             return archivo["id"]
 
-
-        # ----------------------------------------------------
-        # CREAR
-        # ----------------------------------------------------
 
         metadata = {
 
@@ -1413,31 +1350,14 @@ def subir_archivo_drive(
         )
 
 
-        print(
-            f"   🆔 ID: "
-            f"{archivo.get('id')}"
-        )
-
-
-        print(
-            f"   📦 MIME: "
-            f"{archivo.get('mimeType')}"
-        )
-
-
-        print(
-            f"   📏 Tamaño: "
-            f"{archivo.get('size', 'N/D')} bytes"
-        )
-
-
         return archivo["id"]
 
 
     except Exception as error:
 
         print(
-            "❌ Error subiendo archivo a Drive:"
+            "❌ Error subiendo archivo "
+            "a Drive:"
         )
 
         print(error)
@@ -1447,18 +1367,6 @@ def subir_archivo_drive(
 
 # ============================================================
 # GOOGLE DRIVE — DESCARGAR
-# ============================================================
-#
-# CORRECCIÓN PRINCIPAL:
-#
-# Ya NO usamos MediaIoBaseDownload.
-#
-# Usamos AuthorizedSession para hacer directamente:
-#
-# GET https://www.googleapis.com/drive/v3/files/{ID}
-# ?alt=media
-#
-# con las credenciales de la cuenta de servicio.
 # ============================================================
 
 def descargar_archivo_drive(
@@ -1474,18 +1382,14 @@ def descargar_archivo_drive(
     if not drive_session:
 
         print(
-            "❌ No existe sesión HTTP autenticada "
-            "de Google Drive."
+            "❌ No existe sesión HTTP "
+            "autenticada."
         )
 
         return False
 
 
     try:
-
-        # ----------------------------------------------------
-        # METADATOS
-        # ----------------------------------------------------
 
         metadata = (
             drive_service
@@ -1512,50 +1416,27 @@ def descargar_archivo_drive(
 
 
         print(
-            "📋 Metadatos del archivo "
-            "que se va a descargar:"
+            "📋 Archivo Drive:"
         )
 
 
         print(
-            f"   🆔 ID: "
-            f"{metadata.get('id')}"
-        )
-
-
-        print(
-            f"   📄 Nombre: "
+            f"   Nombre: "
             f"{metadata.get('name')}"
         )
 
 
         print(
-            f"   📦 MIME: "
+            f"   MIME: "
             f"{metadata.get('mimeType')}"
         )
 
 
         print(
-            f"   📏 Tamaño reportado por Drive: "
+            f"   Tamaño Drive: "
             f"{metadata.get('size', 'N/D')} bytes"
         )
 
-
-        print(
-            f"   📅 Modificado: "
-            f"{metadata.get('modifiedTime', 'N/D')}"
-        )
-
-
-        print(
-            f"   📁 Padres: "
-            f"{metadata.get('parents', [])}"
-        )
-
-
-        # ----------------------------------------------------
-        # SHORTCUT
-        # ----------------------------------------------------
 
         if metadata.get(
             "mimeType"
@@ -1567,19 +1448,8 @@ def descargar_archivo_drive(
                 "🛑 El archivo es un shortcut."
             )
 
-
-            print(
-                f"   Detalles: "
-                f"{metadata.get('shortcutDetails')}"
-            )
-
-
             return False
 
-
-        # ----------------------------------------------------
-        # JSON MAESTRO
-        # ----------------------------------------------------
 
         if (
             metadata.get("name")
@@ -1591,28 +1461,12 @@ def descargar_archivo_drive(
             ) != "application/json":
 
                 print(
-                    "🛑 BLOQUEADO:"
-                )
-
-
-                print(
                     "🛑 penaguillo.json no tiene "
                     "MIME application/json."
                 )
 
-
-                print(
-                    f"   MIME encontrado: "
-                    f"{metadata.get('mimeType')}"
-                )
-
-
                 return False
 
-
-        # ----------------------------------------------------
-        # URL DE DESCARGA
-        # ----------------------------------------------------
 
         download_url = (
 
@@ -1622,16 +1476,6 @@ def descargar_archivo_drive(
 
         )
 
-
-        print(
-            "🌐 Descargando mediante "
-            "sesión autenticada de Google..."
-        )
-
-
-        # ----------------------------------------------------
-        # PETICIÓN HTTP AUTENTICADA
-        # ----------------------------------------------------
 
         response = drive_session.get(
 
@@ -1651,52 +1495,28 @@ def descargar_archivo_drive(
 
 
         print(
-            "🌐 HTTP status descarga: "
+            "🌐 HTTP status: "
             f"{response.status_code}"
         )
 
 
-        # ----------------------------------------------------
-        # ERROR HTTP
-        # ----------------------------------------------------
-
         if response.status_code != 200:
-
-            print(
-                "🛑 Google Drive no devolvió "
-                "HTTP 200."
-            )
-
-
-            print(
-                "🛑 Respuesta:"
-            )
-
 
             print(
                 response.text[:1000]
             )
 
-
             return False
 
-
-        # ----------------------------------------------------
-        # CONTENIDO REAL
-        # ----------------------------------------------------
 
         datos = response.content
 
 
         print(
-            "📏 Bytes realmente descargados: "
+            "📏 Bytes descargados: "
             f"{len(datos)}"
         )
 
-
-        # ----------------------------------------------------
-        # COMPARAR TAMAÑOS
-        # ----------------------------------------------------
 
         tamaño_drive = metadata.get(
             "size"
@@ -1707,44 +1527,30 @@ def descargar_archivo_drive(
 
             try:
 
-                tamaño_drive_int = int(
+                if int(
                     tamaño_drive
-                )
-
-
-                if tamaño_drive_int != len(datos):
-
-                    print(
-                        "⚠️ ADVERTENCIA:"
-                    )
-
-
-                    print(
-                        "⚠️ El tamaño reportado "
-                        "por Drive no coincide "
-                        "con los bytes descargados."
-                    )
-
-
-                    print(
-                        f"   Drive: "
-                        f"{tamaño_drive_int} bytes"
-                    )
-
-
-                    print(
-                        f"   Descargado: "
-                        f"{len(datos)} bytes"
-                    )
-
-
-                else:
+                ) == len(datos):
 
                     print(
                         "✅ Tamaño descargado "
                         "coincide con Drive."
                     )
 
+                else:
+
+                    print(
+                        "⚠️ Tamaños diferentes:"
+                    )
+
+                    print(
+                        f"   Drive: "
+                        f"{tamaño_drive}"
+                    )
+
+                    print(
+                        f"   Local: "
+                        f"{len(datos)}"
+                    )
 
             except (
                 TypeError,
@@ -1754,10 +1560,6 @@ def descargar_archivo_drive(
                 pass
 
 
-        # ----------------------------------------------------
-        # ARCHIVO VACÍO
-        # ----------------------------------------------------
-
         if len(datos) == 0:
 
             print(
@@ -1765,12 +1567,11 @@ def descargar_archivo_drive(
                 "un archivo vacío."
             )
 
-
             return False
 
 
         # ====================================================
-        # VALIDAR PENAGUILLO.JSON ANTES DE GUARDAR
+        # VALIDACIÓN ESPECIAL DEL JSON MAESTRO
         # ====================================================
 
         if (
@@ -1792,114 +1593,74 @@ def descargar_archivo_drive(
 
 
                 if not isinstance(
-
                     json_data,
-
                     list,
-
                 ):
 
                     print(
-                        "🛑 El penaguillo.json "
-                        "descargado no contiene "
-                        "una lista en la raíz."
+                        "🛑 El JSON maestro "
+                        "no contiene una lista."
                     )
-
 
                     return False
 
 
                 if not all(
-
                     isinstance(
                         item,
                         dict,
                     )
-
                     for item in json_data
-
                 ):
 
                     print(
-                        "🛑 El penaguillo.json "
-                        "descargado contiene "
-                        "registros inválidos."
+                        "🛑 El JSON maestro "
+                        "contiene registros inválidos."
                     )
-
 
                     return False
 
 
                 print(
-                    "✅ JSON descargado "
-                    "y validado correctamente."
+                    "✅ JSON maestro descargado "
+                    "y validado."
                 )
 
 
                 print(
-                    "📚 Registros encontrados: "
+                    "📚 Registros: "
                     f"{len(json_data)}"
                 )
 
 
-            except UnicodeDecodeError as error:
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+            ) as error:
 
                 print(
-                    "🛑 El JSON descargado "
-                    "no está en UTF-8."
+                    "🛑 JSON maestro inválido:"
                 )
-
 
                 print(error)
 
-
                 return False
 
-
-            except json.JSONDecodeError as error:
-
-                print(
-                    "🛑 El penaguillo.json "
-                    "descargado contiene "
-                    "JSON inválido."
-                )
-
-
-                print(error)
-
-
-                return False
-
-
-        # ----------------------------------------------------
-        # CREAR CARPETA DESTINO
-        # ----------------------------------------------------
 
         destino.parent.mkdir(
-
             parents=True,
-
             exist_ok=True,
-
         )
 
-
-        # ----------------------------------------------------
-        # ESCRITURA ATÓMICA
-        # ----------------------------------------------------
 
         temporal_destino = (
 
             destino.parent
 
             / (
-
                 f".{destino.name}."
-
                 f"{generar_id()}"
-
                 ".tmp"
-
             )
 
         )
@@ -1919,9 +1680,7 @@ def descargar_archivo_drive(
                     datos
                 )
 
-
                 archivo.flush()
-
 
                 os.fsync(
                     archivo.fileno()
@@ -1929,11 +1688,8 @@ def descargar_archivo_drive(
 
 
             os.replace(
-
                 temporal_destino,
-
                 destino,
-
             )
 
 
@@ -1942,22 +1698,14 @@ def descargar_archivo_drive(
             if temporal_destino.exists():
 
                 try:
-
                     temporal_destino.unlink()
-
                 except OSError:
-
                     pass
 
 
         print(
-
             "⬇️ Archivo descargado: "
-
-            f"{destino.name} "
-
-            f"({len(datos)} bytes)"
-
+            f"{destino.name}"
         )
 
 
@@ -1971,15 +1719,13 @@ def descargar_archivo_drive(
             "desde Drive:"
         )
 
-
         print(error)
-
 
         return False
 
 
 # ============================================================
-# VALIDAR JSON DE CONOCIMIENTO
+# VALIDAR JSON
 # ============================================================
 
 def validar_json_conocimiento(
@@ -1987,11 +1733,6 @@ def validar_json_conocimiento(
 ) -> tuple[bool, list[dict[str, Any]]]:
 
     if not ruta.exists():
-
-        print(
-            f"❌ Validación: no existe {ruta}"
-        )
-
 
         return False, []
 
@@ -2001,21 +1742,7 @@ def validar_json_conocimiento(
         tamaño = ruta.stat().st_size
 
 
-        print(
-
-            f"🔍 Validando {ruta.name}: "
-
-            f"{tamaño} bytes"
-
-        )
-
-
         if tamaño == 0:
-
-            print(
-                "❌ Validación: archivo vacío."
-            )
-
 
             return False, []
 
@@ -2036,117 +1763,54 @@ def validar_json_conocimiento(
 
 
         if not isinstance(
-
             data,
-
             list,
-
         ):
-
-            print(
-
-                "❌ Validación: la raíz del JSON "
-
-                "no es una lista."
-
-            )
-
 
             return False, []
 
 
         if not all(
-
-            isinstance(item, dict)
-
+            isinstance(
+                item,
+                dict,
+            )
             for item in data
-
         ):
 
-            print(
-
-                "❌ Validación: "
-
-                "algún registro no es un objeto."
-
-            )
-
-
             return False, []
-
-
-        print(
-
-            "✅ JSON válido: "
-
-            f"{len(data)} registros."
-
-        )
 
 
         return True, data
 
 
-    except json.JSONDecodeError as error:
-
-        print(
-
-            "❌ JSON inválido: "
-
-            f"{error}"
-
-        )
-
-
-        return False, []
-
-
     except Exception as error:
 
         print(
-
-            "❌ Error validando JSON: "
-
+            f"❌ Error validando JSON: "
             f"{error}"
-
         )
-
 
         return False, []
 
 
 # ============================================================
-# GOOGLE DRIVE — SINCRONIZAR CONOCIMIENTO DESDE DRIVE
+# DRIVE — SINCRONIZAR DESDE DRIVE
 # ============================================================
 
 def sincronizar_conocimiento_desde_drive():
 
     if not drive_service:
 
-        print(
-            "⚠️ Google Drive no está disponible."
-        )
-
-
         return
 
 
     if not DRIVE_KNOWLEDGE_FOLDER:
 
-        print(
-            "⚠️ No existe carpeta de conocimiento "
-            "en Drive."
-        )
-
-
         return
 
 
     try:
-
-        # ----------------------------------------------------
-        # BUSCAR EXCLUSIVAMENTE JSON
-        # ----------------------------------------------------
 
         archivo_drive = (
             buscar_archivo_drive(
@@ -2161,60 +1825,11 @@ def sincronizar_conocimiento_desde_drive():
         )
 
 
-        # ====================================================
-        # JSON EXISTE EN DRIVE
-        # ====================================================
-
         if archivo_drive:
 
             print(
                 "☁️ penaguillo.json encontrado "
                 "en Google Drive."
-            )
-
-
-            print(
-
-                "🆔 ID maestro Drive: "
-
-                f"{archivo_drive.get('id')}"
-
-            )
-
-
-            print(
-
-                "📦 MIME maestro Drive: "
-
-                f"{archivo_drive.get('mimeType')}"
-
-            )
-
-
-            print(
-
-                "📏 Tamaño reportado Drive: "
-
-                f"{archivo_drive.get('size', 'N/D')} bytes"
-
-            )
-
-
-            print(
-
-                "📅 Última modificación Drive: "
-
-                f"{archivo_drive.get('modifiedTime', 'N/D')}"
-
-            )
-
-
-            print(
-
-                "📁 Carpeta padre: "
-
-                f"{archivo_drive.get('parents', [])}"
-
             )
 
 
@@ -2230,17 +1845,10 @@ def sincronizar_conocimiento_desde_drive():
             if temporal.exists():
 
                 try:
-
                     temporal.unlink()
-
                 except OSError:
-
                     pass
 
-
-            # ------------------------------------------------
-            # DESCARGA
-            # ------------------------------------------------
 
             descargado = (
                 descargar_archivo_drive(
@@ -2256,23 +1864,12 @@ def sincronizar_conocimiento_desde_drive():
             if not descargado:
 
                 print(
-                    "❌ No fue posible descargar "
-                    "penaguillo.json."
-                )
-
-
-                print(
                     "🛡️ El conocimiento local "
                     "NO será reemplazado."
                 )
 
-
                 return
 
-
-            # ------------------------------------------------
-            # VALIDAR
-            # ------------------------------------------------
 
             valido, data = (
                 validar_json_conocimiento(
@@ -2288,13 +1885,9 @@ def sincronizar_conocimiento_desde_drive():
                     CONOCIMIENTO_DIR
 
                     / (
-
                         f"penaguillo_"
-
                         f"{generar_id()}"
-
                         ".tmp"
-
                     )
 
                 )
@@ -2327,11 +1920,8 @@ def sincronizar_conocimiento_desde_drive():
 
                         archivo.flush()
 
-
                         os.fsync(
-
                             archivo.fileno()
-
                         )
 
 
@@ -2351,11 +1941,8 @@ def sincronizar_conocimiento_desde_drive():
 
 
                     print(
-
                         "📚 Registros cargados: "
-
                         f"{len(data)}"
-
                     )
 
 
@@ -2364,76 +1951,42 @@ def sincronizar_conocimiento_desde_drive():
                     if archivo_temporal.exists():
 
                         try:
-
                             archivo_temporal.unlink()
-
                         except OSError:
-
                             pass
 
 
                     if temporal.exists():
 
                         try:
-
                             temporal.unlink()
-
                         except OSError:
-
                             pass
 
 
                 return
 
 
-            # ------------------------------------------------
-            # INVÁLIDO
-            # ------------------------------------------------
-
-            print(
-                "🛑 ATENCIÓN:"
-            )
-
-
             print(
                 "🛑 penaguillo.json de Drive "
-                "está vacío o inválido."
-            )
-
-
-            print(
-                "🛡️ El conocimiento local "
-                "NO será reemplazado."
-            )
-
-
-            print(
-                "🛑 NO se sobrescribirá Drive."
-            )
-
-
-            print(
-                "🛑 NO se creará un JSON vacío."
+                "está inválido."
             )
 
 
             if temporal.exists():
 
                 try:
-
                     temporal.unlink()
-
                 except OSError:
-
                     pass
 
 
             return
 
 
-        # ====================================================
+        # ----------------------------------------------------
         # NO EXISTE EN DRIVE
-        # ====================================================
+        # ----------------------------------------------------
 
         print(
             "ℹ️ No existe penaguillo.json "
@@ -2441,53 +1994,24 @@ def sincronizar_conocimiento_desde_drive():
         )
 
 
-        # ----------------------------------------------------
-        # Buscar local
-        # ----------------------------------------------------
-
         if ARCHIVO_CONOCIMIENTO.exists():
 
-            valido, data = (
+            valido, _ = (
                 validar_json_conocimiento(
-
                     ARCHIVO_CONOCIMIENTO
-
                 )
             )
 
 
             if valido:
 
-                print(
-                    "☁️ Existe conocimiento local válido."
-                )
-
-
-                print(
-                    "☁️ Subiendo conocimiento local "
-                    "a Google Drive..."
-                )
-
-
                 sincronizar_conocimiento_a_drive()
-
 
                 return
 
 
-        # ----------------------------------------------------
-        # Nada existe
-        # ----------------------------------------------------
-
         print(
-            "ℹ️ No existe conocimiento válido "
-            "ni en Drive ni localmente."
-        )
-
-
-        print(
-            "ℹ️ Penaguillo iniciará "
-            "con 0 conocimientos."
+            "ℹ️ No existe conocimiento válido."
         )
 
 
@@ -2498,46 +2022,24 @@ def sincronizar_conocimiento_desde_drive():
             "conocimiento desde Drive:"
         )
 
-
         print(error)
 
 
 # ============================================================
-# GOOGLE DRIVE — SUBIR CONOCIMIENTO
+# DRIVE — SUBIR CONOCIMIENTO
 # ============================================================
 
 def sincronizar_conocimiento_a_drive():
 
     if not drive_service:
-
-        print(
-            "⚠️ No se sincroniza conocimiento: "
-            "Google Drive no disponible."
-        )
-
-
         return
 
 
     if not DRIVE_KNOWLEDGE_FOLDER:
-
-        print(
-            "⚠️ No se sincroniza conocimiento: "
-            "carpeta Drive no disponible."
-        )
-
-
         return
 
 
     if not ARCHIVO_CONOCIMIENTO.exists():
-
-        print(
-            "⚠️ No se sincroniza conocimiento: "
-            "penaguillo.json no existe."
-        )
-
-
         return
 
 
@@ -2552,26 +2054,19 @@ def sincronizar_conocimiento_a_drive():
 
         print(
             "🛑 BLOQUEADO: "
-            "no se sube penaguillo.json "
-            "porque es inválido o está vacío."
+            "no se sube un JSON inválido."
         )
-
 
         return
 
 
     print(
-
         "☁️ Sincronizando "
-
-        f"{len(data)} registros "
-
-        "a Google Drive..."
-
+        f"{len(data)} registros a Drive..."
     )
 
 
-    resultado = subir_archivo_drive(
+    subir_archivo_drive(
 
         ARCHIVO_CONOCIMIENTO,
 
@@ -2582,16 +2077,8 @@ def sincronizar_conocimiento_a_drive():
     )
 
 
-    if resultado:
-
-        print(
-            "✅ penaguillo.json "
-            "actualizado correctamente en Drive."
-        )
-
-
 # ============================================================
-# GOOGLE DRIVE — SUBIR BACKUP
+# DRIVE — BACKUP
 # ============================================================
 
 def sincronizar_backup_a_drive(
@@ -2599,12 +2086,10 @@ def sincronizar_backup_a_drive(
 ):
 
     if not drive_service:
-
         return
 
 
     if not DRIVE_BACKUPS_FOLDER:
-
         return
 
 
@@ -2620,7 +2105,7 @@ def sincronizar_backup_a_drive(
 
 
 # ============================================================
-# GOOGLE DRIVE — SUBIR PDF
+# DRIVE — PDF
 # ============================================================
 
 def sincronizar_pdf_a_drive(
@@ -2628,12 +2113,10 @@ def sincronizar_pdf_a_drive(
 ):
 
     if not drive_service:
-
         return
 
 
     if not DRIVE_PDF_FOLDER:
-
         return
 
 
@@ -2649,7 +2132,7 @@ def sincronizar_pdf_a_drive(
 
 
 # ============================================================
-# GOOGLE DRIVE — SUBIR IMAGEN
+# DRIVE — IMAGEN
 # ============================================================
 
 def sincronizar_imagen_a_drive(
@@ -2657,12 +2140,10 @@ def sincronizar_imagen_a_drive(
 ):
 
     if not drive_service:
-
         return
 
 
     if not DRIVE_IMAGES_FOLDER:
-
         return
 
 
@@ -2685,7 +2166,7 @@ app = FastAPI(
 
     title="Penaguillo IA",
 
-    version="5.3.0",
+    version="5.4.0",
 
     description=(
         "Backend del asistente inteligente Penaguillo"
@@ -2758,11 +2239,8 @@ MAX_IMAGE_SIZE = (
 EXTENSIONES_IMAGEN = {
 
     ".jpg",
-
     ".jpeg",
-
     ".png",
-
     ".webp",
 
 }
@@ -2842,6 +2320,562 @@ def nombre_seguro(
 
 
 # ============================================================
+# NORMALIZAR TEXTO PARA BÚSQUEDA
+# ============================================================
+
+def normalizar_texto(
+    texto: str,
+) -> str:
+
+    if not texto:
+
+        return ""
+
+
+    texto = str(
+        texto
+    ).lower()
+
+
+    reemplazos = {
+
+        "á": "a",
+        "é": "e",
+        "í": "i",
+        "ó": "o",
+        "ú": "u",
+        "ü": "u",
+        "ñ": "n",
+
+    }
+
+
+    for original, nuevo in reemplazos.items():
+
+        texto = texto.replace(
+            original,
+            nuevo,
+        )
+
+
+    texto = re.sub(
+
+        r"[^a-z0-9\s]",
+
+        " ",
+
+        texto,
+
+    )
+
+
+    texto = re.sub(
+
+        r"\s+",
+
+        " ",
+
+        texto,
+
+    )
+
+
+    return texto.strip()
+
+
+# ============================================================
+# EXTRAER PALABRAS IMPORTANTES
+# ============================================================
+
+def extraer_palabras_importantes(
+    texto: str,
+) -> list[str]:
+
+    texto_normalizado = (
+        normalizar_texto(texto)
+    )
+
+
+    palabras = (
+        texto_normalizado
+        .split()
+    )
+
+
+    resultado = []
+
+
+    for palabra in palabras:
+
+        if len(palabra) < 3:
+
+            continue
+
+
+        if palabra in STOPWORDS_ES:
+
+            continue
+
+
+        if palabra not in resultado:
+
+            resultado.append(
+                palabra
+            )
+
+
+    return resultado
+
+
+# ============================================================
+# RELEVANCIA DE UN REGISTRO
+# ============================================================
+
+def calcular_relevancia(
+    pregunta: str,
+    item: dict[str, Any],
+) -> float:
+
+    palabras = (
+        extraer_palabras_importantes(
+            pregunta
+        )
+    )
+
+
+    if not palabras:
+
+        return 0.0
+
+
+    titulo = normalizar_texto(
+        str(
+            item.get(
+                "titulo",
+                "",
+            )
+        )
+    )
+
+
+    contenido = normalizar_texto(
+        str(
+            item.get(
+                "contenido",
+                "",
+            )
+        )
+    )
+
+
+    descripcion = normalizar_texto(
+        str(
+            item.get(
+                "descripcion",
+                "",
+            )
+        )
+    )
+
+
+    tipo = normalizar_texto(
+        str(
+            item.get(
+                "tipo",
+                "",
+            )
+        )
+    )
+
+
+    texto_completo = " ".join(
+
+        [
+            titulo,
+            contenido,
+            descripcion,
+            tipo,
+        ]
+
+    )
+
+
+    puntuacion = 0.0
+
+
+    for palabra in palabras:
+
+        # ----------------------------------------------
+        # Coincidencia exacta en título
+        # ----------------------------------------------
+
+        if palabra in titulo:
+
+            puntuacion += 10
+
+
+        # ----------------------------------------------
+        # Coincidencia en descripción
+        # ----------------------------------------------
+
+        if palabra in descripcion:
+
+            puntuacion += 5
+
+
+        # ----------------------------------------------
+        # Coincidencia en contenido
+        # ----------------------------------------------
+
+        cantidad = (
+            texto_completo.count(
+                palabra
+            )
+        )
+
+
+        puntuacion += min(
+
+            cantidad * 1.5,
+
+            8,
+
+        )
+
+
+        # ----------------------------------------------
+        # Coincidencia de palabra completa
+        # ----------------------------------------------
+
+        patron = (
+            rf"\b{re.escape(palabra)}\b"
+        )
+
+
+        coincidencias = len(
+
+            re.findall(
+
+                patron,
+
+                texto_completo,
+
+            )
+
+        )
+
+
+        puntuacion += min(
+
+            coincidencias,
+
+            5,
+
+        )
+
+
+    # ----------------------------------------------------
+    # Bonus por coincidencia de varias palabras
+    # ----------------------------------------------------
+
+    palabras_en_texto = set(
+        texto_completo.split()
+    )
+
+
+    palabras_coincidentes = (
+
+        set(palabras)
+
+        & palabras_en_texto
+
+    )
+
+
+    cantidad_coincidentes = (
+        len(
+            palabras_coincidentes
+        )
+    )
+
+
+    if cantidad_coincidentes >= 2:
+
+        puntuacion += (
+            cantidad_coincidentes
+            * 3
+        )
+
+
+    if (
+        cantidad_coincidentes
+        == len(palabras)
+        and palabras
+    ):
+
+        puntuacion += 15
+
+
+    return puntuacion
+
+
+# ============================================================
+# BUSCAR CONOCIMIENTO RELEVANTE
+# ============================================================
+
+def buscar_conocimiento_relevante(
+    pregunta: str,
+    conocimientos: list[dict[str, Any]],
+    top_k: int = RELEVANCIA_TOP_K,
+) -> list[dict[str, Any]]:
+
+    if not conocimientos:
+
+        return []
+
+
+    resultados = []
+
+
+    for indice, item in enumerate(
+        conocimientos
+    ):
+
+        puntuacion = (
+            calcular_relevancia(
+                pregunta,
+                item,
+            )
+        )
+
+
+        if puntuacion > 0:
+
+            resultados.append(
+
+                (
+                    puntuacion,
+                    indice,
+                    item,
+                )
+
+            )
+
+
+    resultados.sort(
+
+        key=lambda elemento: (
+
+            elemento[0],
+
+            -elemento[1],
+
+        ),
+
+        reverse=True,
+
+    )
+
+
+    seleccionados = [
+
+        item
+
+        for _, _, item
+
+        in resultados[:top_k]
+
+    ]
+
+
+    print(
+        "🔎 Búsqueda de conocimiento:"
+    )
+
+
+    print(
+        f"   Registros totales: "
+        f"{len(conocimientos)}"
+    )
+
+
+    print(
+        f"   Registros relevantes: "
+        f"{len(seleccionados)}"
+    )
+
+
+    if resultados:
+
+        for puntuacion, _, item in (
+            resultados[:top_k]
+        ):
+
+            print(
+
+                "   📌 "
+
+                f"{item.get('titulo', '')} "
+
+                f"(score={puntuacion:.1f})"
+
+            )
+
+
+    else:
+
+        print(
+            "   ℹ️ No se encontraron "
+            "coincidencias relevantes."
+        )
+
+
+    return seleccionados
+
+
+# ============================================================
+# CONSTRUIR SOLO EL CONTEXTO RELEVANTE
+# ============================================================
+
+def construir_contexto_relevante(
+    pregunta: str,
+    conocimientos: list[dict[str, Any]],
+) -> str:
+
+    relevantes = (
+        buscar_conocimiento_relevante(
+            pregunta,
+            conocimientos,
+        )
+    )
+
+
+    if not relevantes:
+
+        return (
+            "No se encontraron registros "
+            "específicos de la base de conocimiento "
+            "relacionados con esta pregunta."
+        )
+
+
+    bloques = []
+
+
+    caracteres_actuales = 0
+
+
+    for indice, item in enumerate(
+        relevantes,
+        start=1,
+    ):
+
+        tipo = item.get(
+            "tipo",
+            "desconocido",
+        )
+
+
+        titulo = item.get(
+            "titulo",
+            "",
+        )
+
+
+        contenido = item.get(
+            "contenido",
+            "",
+        )
+
+
+        descripcion = item.get(
+            "descripcion",
+            "",
+        )
+
+
+        bloque = f"""
+REGISTRO RELEVANTE {indice}
+
+ID:
+{item.get("id", "")}
+
+TIPO:
+{tipo}
+
+TÍTULO:
+{titulo}
+
+CONTENIDO:
+{contenido}
+
+DESCRIPCIÓN:
+{descripcion}
+""".strip()
+
+
+        nuevo_total = (
+
+            caracteres_actuales
+
+            + len(bloque)
+
+        )
+
+
+        if (
+            nuevo_total
+            > MAX_CHARS_CONOCIMIENTO_CHAT
+        ):
+
+            restante = (
+
+                MAX_CHARS_CONOCIMIENTO_CHAT
+
+                - caracteres_actuales
+
+            )
+
+
+            if restante > 500:
+
+                bloque_recortado = (
+                    bloque[:restante]
+                    + "\n[CONTEXTO RECORTADO]"
+                )
+
+
+                bloques.append(
+                    bloque_recortado
+                )
+
+
+            break
+
+
+        bloques.append(
+            bloque
+        )
+
+
+        caracteres_actuales = (
+            nuevo_total
+        )
+
+
+    contexto = (
+
+        "\n\n"
+        "==============================\n\n"
+    ).join(
+        bloques
+    )
+
+
+    return contexto
+
+
+# ============================================================
 # SYSTEM PROMPT
 # ============================================================
 
@@ -2896,6 +2930,11 @@ def cargar_system_prompt() -> str:
         ) from error
 
 
+SYSTEM_PROMPT_BASE = (
+    cargar_system_prompt()
+)
+
+
 # ============================================================
 # CARGAR CONOCIMIENTO
 # ============================================================
@@ -2905,9 +2944,9 @@ def cargar_conocimiento() -> list[dict[str, Any]]:
     if not ARCHIVO_CONOCIMIENTO.exists():
 
         print(
-            "ℹ️ penaguillo.json no existe localmente."
+            "ℹ️ penaguillo.json "
+            "no existe localmente."
         )
-
 
         return []
 
@@ -2950,11 +2989,8 @@ def cargar_conocimiento() -> list[dict[str, Any]]:
 
 
     if not isinstance(
-
         data,
-
         list,
-
     ):
 
         raise RuntimeError(
@@ -2967,7 +3003,10 @@ def cargar_conocimiento() -> list[dict[str, Any]]:
 
     if not all(
 
-        isinstance(item, dict)
+        isinstance(
+            item,
+            dict,
+        )
 
         for item in data
 
@@ -2976,17 +3015,14 @@ def cargar_conocimiento() -> list[dict[str, Any]]:
         raise RuntimeError(
 
             "penaguillo.json contiene "
-            "registros que no son objetos."
+            "registros inválidos."
 
         )
 
 
     print(
-
         "📚 Conocimiento local cargado: "
-
         f"{len(data)} registros"
-
     )
 
 
@@ -3015,13 +3051,6 @@ def crear_backup() -> str | None:
 
         if not valido:
 
-            print(
-                "⚠️ No se crea backup porque "
-                "el conocimiento actual "
-                "no contiene información válida."
-            )
-
-
             return None
 
 
@@ -3030,9 +3059,7 @@ def crear_backup() -> str | None:
             datetime.now()
 
             .strftime(
-
                 "%Y%m%d_%H%M%S_%f"
-
             )
 
         )
@@ -3083,11 +3110,8 @@ def crear_backup() -> str | None:
 
                 archivo.flush()
 
-
                 os.fsync(
-
                     archivo.fileno()
-
                 )
 
 
@@ -3101,20 +3125,13 @@ def crear_backup() -> str | None:
 
 
             print(
-
                 "🛡️ Backup creado: "
-
-                f"{backup_path.name} "
-
-                f"({len(data)} registros)"
-
+                f"{backup_path.name}"
             )
 
 
             sincronizar_backup_a_drive(
-
                 backup_path
-
             )
 
 
@@ -3128,11 +3145,8 @@ def crear_backup() -> str | None:
             if archivo_temporal.exists():
 
                 try:
-
                     archivo_temporal.unlink()
-
                 except OSError:
-
                     pass
 
 
@@ -3157,18 +3171,14 @@ def guardar_conocimiento(
 ) -> None:
 
     if not isinstance(
-
         conocimientos,
-
         list,
-
     ):
 
         raise RuntimeError(
-
             "El conocimiento debe ser una lista."
-
         )
+
 
     archivo_temporal = (
 
@@ -3206,11 +3216,8 @@ def guardar_conocimiento(
 
             archivo.flush()
 
-
             os.fsync(
-
                 archivo.fileno()
-
             )
 
 
@@ -3224,26 +3231,15 @@ def guardar_conocimiento(
 
 
         print(
-
             "💾 Conocimiento guardado. "
-
             "Total registros: "
-
             f"{len(conocimientos)}"
-
         )
 
 
-        # ----------------------------------------------------
-        # GOOGLE DRIVE
-        # ----------------------------------------------------
-        # Sincronizar SIEMPRE, incluso cuando el conocimiento
-        # queda vacío. De esta forma Drive también recibe [].
-        # ----------------------------------------------------
-
         sincronizar_conocimiento_a_drive()
 
-        # No crear backups vacíos.
+
         if len(conocimientos) > 0:
 
             crear_backup()
@@ -3254,11 +3250,8 @@ def guardar_conocimiento(
         if archivo_temporal.exists():
 
             try:
-
                 archivo_temporal.unlink()
-
             except OSError:
-
                 pass
 
 
@@ -3268,125 +3261,6 @@ def guardar_conocimiento(
             f"penaguillo.json: {error}"
 
         ) from error
-
-
-# ============================================================
-# CONSTRUIR CONOCIMIENTO
-# ============================================================
-
-def construir_conocimiento() -> str:
-
-    conocimientos = (
-        cargar_conocimiento()
-    )
-
-
-    if not conocimientos:
-
-        return (
-
-            "Actualmente no hay conocimiento "
-            "adicional registrado."
-
-        )
-
-
-    bloques = []
-
-
-    for indice, item in enumerate(
-
-        conocimientos,
-
-        start=1,
-
-    ):
-
-        tipo = item.get(
-
-            "tipo",
-
-            "desconocido",
-
-        )
-
-
-        titulo = item.get(
-
-            "titulo",
-
-            "",
-
-        )
-
-
-        contenido = item.get(
-
-            "contenido",
-
-            "",
-
-        )
-
-
-        descripcion = item.get(
-
-            "descripcion",
-
-            "",
-
-        )
-
-
-        texto = f"""
-
-REGISTRO {indice}
-
-ID:
-{item.get("id", "")}
-
-TIPO:
-{tipo}
-
-TÍTULO:
-{titulo}
-
-CONTENIDO:
-{contenido}
-
-DESCRIPCIÓN VISUAL:
-{descripcion}
-
-"""
-
-
-        bloques.append(
-
-            texto.strip()
-
-        )
-
-
-    return (
-
-        "\n\n==============================\n\n"
-
-        .join(
-
-            bloques
-
-        )
-
-    )
-
-
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
-
-SYSTEM_PROMPT_BASE = (
-    cargar_system_prompt()
-)
 
 
 # ============================================================
@@ -3407,7 +3281,7 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "5.3.0",
+        "version": "5.4.0",
 
         "chat_model": CHAT_MODEL,
 
@@ -3415,6 +3289,16 @@ def root():
 
         "conocimientos": len(
             conocimientos
+        ),
+
+        "retrieval": True,
+
+        "retrieval_top_k": (
+            RELEVANCIA_TOP_K
+        ),
+
+        "max_context_chars": (
+            MAX_CHARS_CONOCIMIENTO_CHAT
         ),
 
         "google_drive": (
@@ -3440,78 +3324,233 @@ def root():
 def chat(
     data: ChatRequest,
 ):
+
     mensaje = data.message.strip()
 
+
     if not mensaje:
+
         raise HTTPException(
+
             status_code=400,
-            detail="El mensaje no puede estar vacío.",
+
+            detail=(
+                "El mensaje no puede estar vacío."
+            ),
+
         )
 
-    try:
-        conocimiento = construir_conocimiento()
-    except RuntimeError as error:
-        raise HTTPException(status_code=500, detail=str(error))
-
-    system_prompt = (
-        SYSTEM_PROMPT_BASE
-        + "\n\n"
-        + "==============================\n"
-        + "BASE DE CONOCIMIENTO DE PENAGUILLO\n"
-        + "==============================\n"
-        + conocimiento
-    )
 
     if client is None:
+
         raise HTTPException(
+
             status_code=500,
-            detail="GEMINI_API_KEY no está configurada.",
+
+            detail=(
+                "GEMINI_API_KEY "
+                "no está configurada."
+            ),
+
         )
+
 
     try:
-        respuesta = generar_con_gemini(
-            model=CHAT_MODEL,
-            contents=mensaje,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                temperature=0.2,
-            ),
+
+        conocimientos = (
+            cargar_conocimiento()
         )
 
-        contenido = extraer_contenido_respuesta(respuesta)
+
+        # ====================================================
+        # IMPORTANTE:
+        #
+        # YA NO construimos TODO el JSON.
+        #
+        # Primero buscamos los registros relevantes.
+        # ====================================================
+
+        conocimiento_relevante = (
+            construir_contexto_relevante(
+
+                mensaje,
+
+                conocimientos,
+
+            )
+        )
+
+
+        system_prompt = (
+
+            SYSTEM_PROMPT_BASE
+
+            + "\n\n"
+
+            + "==============================\n"
+
+            + "INSTRUCCIONES SOBRE LA BASE "
+              "DE CONOCIMIENTO\n"
+
+            + "==============================\n"
+
+            + """
+
+La información que aparece a continuación
+es solamente el subconjunto de registros
+que el sistema local considera relacionados
+con la pregunta del usuario.
+
+Debes tomar tú la decisión final sobre qué
+información utilizar para responder.
+
+No asumas que todos los registros son relevantes.
+
+Si la información proporcionada no permite
+responder con seguridad, dilo claramente.
+
+No inventes información.
+
+Si la pregunta no necesita conocimiento
+específico de Penaguillo, puedes responder
+normalmente utilizando tus capacidades.
+
+"""
+
+            + "\n\n"
+
+            + "==============================\n"
+
+            + "CONOCIMIENTO RELEVANTE\n"
+
+            + "==============================\n"
+
+            + conocimiento_relevante
+
+        )
+
+
+        print(
+            "📤 Enviando pregunta a Gemini."
+        )
+
+
+        print(
+            "📚 Contexto seleccionado: "
+            f"{len(conocimiento_relevante)} caracteres"
+        )
+
+
+        respuesta = generar_con_gemini(
+
+            model=CHAT_MODEL,
+
+            contents=mensaje,
+
+            config=types.GenerateContentConfig(
+
+                system_instruction=system_prompt,
+
+            ),
+
+        )
+
+
+        contenido = (
+            extraer_contenido_respuesta(
+                respuesta
+            )
+        )
+
 
         return {
+
             "ok": True,
+
             "response": contenido or "",
+
         }
 
-    except Exception as error:
-        print(f"❌ Error en /chat: {error}")
 
-        texto_error = str(error).upper()
+    except RuntimeError as error:
 
-        if "503" in texto_error or "UNAVAILABLE" in texto_error:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Gemini está temporalmente saturado. "
-                    "Penaguillo reintentó automáticamente y "
-                    "no pudo completar la consulta. Intenta de nuevo."
-                ),
-            )
+        print(
+            f"❌ Error en /chat: {error}"
+        )
 
-        if "429" in texto_error or "RESOURCE_EXHAUSTED" in texto_error:
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    "Se alcanzó temporalmente el límite de Gemini. "
-                    "Intenta nuevamente en unos segundos."
-                ),
-            )
 
         raise HTTPException(
+
             status_code=500,
-            detail=f"Error consultando Penaguillo: {error}",
+
+            detail=str(error),
+
+        )
+
+
+    except Exception as error:
+
+        print(
+            f"❌ Error en /chat: {error}"
+        )
+
+
+        texto_error = (
+            str(error).upper()
+        )
+
+
+        if (
+            "503" in texto_error
+            or "UNAVAILABLE" in texto_error
+        ):
+
+            raise HTTPException(
+
+                status_code=503,
+
+                detail=(
+
+                    "Gemini está temporalmente "
+                    "saturado. Penaguillo reintentó "
+                    "automáticamente y no pudo "
+                    "completar la consulta."
+
+                ),
+
+            )
+
+
+        if (
+            "429" in texto_error
+            or "RESOURCE_EXHAUSTED"
+            in texto_error
+        ):
+
+            raise HTTPException(
+
+                status_code=429,
+
+                detail=(
+
+                    "Se alcanzó temporalmente "
+                    "el límite de Gemini. "
+                    "Intenta nuevamente."
+
+                ),
+
+            )
+
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail=(
+                "Error consultando Penaguillo: "
+                f"{error}"
+            ),
+
         )
 
 
@@ -3578,9 +3617,7 @@ def ensenar(
 
 
         guardar_conocimiento(
-
             conocimientos
-
         )
 
 
@@ -3614,34 +3651,25 @@ def ensenar(
 
 
 # ============================================================
-# IMAGEN — BASE64
+# IMAGEN BASE64
 # ============================================================
 
 def imagen_a_base64(
-
     ruta: Path,
-
 ) -> str:
 
     with open(
-
         ruta,
-
         "rb",
-
     ) as archivo:
 
         contenido = archivo.read()
 
 
     return base64.b64encode(
-
         contenido
-
     ).decode(
-
         "utf-8"
-
     )
 
 
@@ -3650,9 +3678,7 @@ def imagen_a_base64(
 # ============================================================
 
 def mime_imagen(
-
     ruta: Path,
-
 ) -> str:
 
     extension = (
@@ -3684,56 +3710,134 @@ def mime_imagen(
 
 
 # ============================================================
-# EXTRAER CONTENIDO GEMINI
+# EXTRAER RESPUESTA GEMINI
 # ============================================================
 
 def extraer_contenido_respuesta(
     respuesta,
 ) -> str:
-    if respuesta is None:
-        raise RuntimeError("El proveedor de IA no devolvió respuesta.")
 
-    contenido = getattr(respuesta, "text", None)
-    if isinstance(contenido, str) and contenido.strip():
+    if respuesta is None:
+
+        raise RuntimeError(
+            "El proveedor de IA "
+            "no devolvió respuesta."
+        )
+
+
+    contenido = getattr(
+        respuesta,
+        "text",
+        None,
+    )
+
+
+    if (
+        isinstance(
+            contenido,
+            str,
+        )
+        and contenido.strip()
+    ):
+
         return contenido.strip()
 
-    partes = []
-    for candidate in getattr(respuesta, "candidates", None) or []:
-        content = getattr(candidate, "content", None)
-        for part in getattr(content, "parts", None) or []:
-            texto = getattr(part, "text", None)
-            if texto:
-                partes.append(str(texto))
 
-    resultado = "\n".join(partes).strip()
+    partes = []
+
+
+    for candidate in (
+        getattr(
+            respuesta,
+            "candidates",
+            None,
+        )
+        or []
+    ):
+
+        content = getattr(
+            candidate,
+            "content",
+            None,
+        )
+
+
+        for part in (
+            getattr(
+                content,
+                "parts",
+                None,
+            )
+            or []
+        ):
+
+            texto = getattr(
+                part,
+                "text",
+                None,
+            )
+
+
+            if texto:
+
+                partes.append(
+                    str(texto)
+                )
+
+
+    resultado = (
+        "\n".join(
+            partes
+        )
+        .strip()
+    )
+
+
     if resultado:
+
         return resultado
 
-    raise RuntimeError("El proveedor de IA no devolvió contenido de texto.")
+
+    raise RuntimeError(
+        "El proveedor de IA "
+        "no devolvió contenido de texto."
+    )
 
 
 # ============================================================
-# VISION
+# VISION — IMAGEN
 # ============================================================
 
 def analizar_imagen_con_vision(
     ruta: Path,
     contexto: str = "",
 ) -> str:
+
     if client is None:
-        raise RuntimeError("GEMINI_API_KEY no está configurada.")
+
+        raise RuntimeError(
+            "GEMINI_API_KEY "
+            "no está configurada."
+        )
+
 
     imagen_bytes = ruta.read_bytes()
-    mime = mime_imagen(ruta)
+
+    mime = mime_imagen(
+        ruta
+    )
+
 
     prompt = f"""
-Analiza cuidadosamente esta imagen para alimentar la base de
-conocimiento de Penaguillo.
 
-Tu respuesta debe ser útil para una empresa de maquinaria agrícola
-y de procesamiento de café.
+Analiza cuidadosamente esta imagen para alimentar
+la base de conocimiento de Penaguillo.
+
+Tu respuesta debe ser útil para una empresa de
+maquinaria agrícola y procesamiento de café.
 
 Identifica cuando sea posible:
+
 - Qué aparece en la imagen.
 - Equipos o máquinas.
 - Nombre o referencia visible.
@@ -3745,38 +3849,70 @@ Identifica cuando sea posible:
 - Tablas.
 - Características técnicas visibles.
 - Procesos.
-- Personas o contexto únicamente si aporta información útil.
-- Cualquier información relevante para Penagos.
+- Información relevante para Penagos.
 
-Si hay texto en la imagen, transcríbelo de forma clara.
+Si hay texto en la imagen,
+transcríbelo claramente.
+
 NO inventes información que no puedas observar.
 
 Contexto proporcionado por el usuario:
+
 {contexto}
 
 Devuelve una descripción estructurada y detallada.
+
 """
 
+
     try:
+
         respuesta = generar_con_gemini(
+
             model=VISION_MODEL,
+
             contents=[
+
                 types.Part.from_bytes(
+
                     data=imagen_bytes,
+
                     mime_type=mime,
+
                 ),
+
                 prompt,
+
             ],
+
             config=types.GenerateContentConfig(
-                temperature=0.1,
+
                 max_output_tokens=8000,
+
             ),
+
         )
-        return extraer_contenido_respuesta(respuesta)
+
+
+        return (
+            extraer_contenido_respuesta(
+                respuesta
+            )
+        )
+
+
     except Exception as error:
-        print(f"❌ Error Gemini Vision: {error}")
+
+        print(
+            f"❌ Error Gemini Vision: {error}"
+        )
+
+
         raise RuntimeError(
-            f"No fue posible analizar la imagen: {error}"
+
+            "No fue posible analizar "
+            f"la imagen: {error}"
+
         )
 
 
@@ -3838,11 +3974,7 @@ async def ensenar_imagen(
             status_code=400,
 
             detail=(
-
-                "La imagen supera "
-
-                "15 MB."
-
+                "La imagen supera 15 MB."
             ),
 
         )
@@ -3877,27 +4009,19 @@ async def ensenar_imagen(
         ) as archivo:
 
             archivo.write(
-
                 contenido
-
             )
 
 
         descripcion = (
-
             analizar_imagen_con_vision(
-
                 ruta
-
             )
-
         )
 
 
         conocimientos = (
-
             cargar_conocimiento()
-
         )
 
 
@@ -3914,9 +4038,7 @@ async def ensenar_imagen(
             "descripcion": descripcion,
 
             "archivo": (
-
                 f"/archivos/imagenes/{nombre}"
-
             ),
 
             "nombre_archivo": nombre_original,
@@ -3927,23 +4049,17 @@ async def ensenar_imagen(
 
 
         conocimientos.append(
-
             nuevo
-
         )
 
 
         guardar_conocimiento(
-
             conocimientos
-
         )
 
 
         sincronizar_imagen_a_drive(
-
             ruta
-
         )
 
 
@@ -3952,7 +4068,6 @@ async def ensenar_imagen(
             "ok": True,
 
             "mensaje": (
-
                 "Imagen aprendida "
                 "correctamente."
             ),
@@ -3960,9 +4075,7 @@ async def ensenar_imagen(
             "conocimiento": nuevo,
 
             "total": len(
-
                 conocimientos
-
             ),
 
         }
@@ -3973,11 +4086,8 @@ async def ensenar_imagen(
         if ruta.exists():
 
             try:
-
                 ruta.unlink()
-
             except OSError:
-
                 pass
 
 
@@ -3993,20 +4103,16 @@ async def ensenar_imagen(
     except Exception as error:
 
         print(
-
-            f"❌ Error /ensenar-imagen: {error}"
-
+            f"❌ Error /ensenar-imagen: "
+            f"{error}"
         )
 
 
         if ruta.exists():
 
             try:
-
                 ruta.unlink()
-
             except OSError:
-
                 pass
 
 
@@ -4015,32 +4121,24 @@ async def ensenar_imagen(
             status_code=500,
 
             detail=(
-
                 "Error procesando imagen: "
-
                 f"{error}"
-
             ),
 
         )
 
 
 # ============================================================
-# PDF — CONVERTIR PÁGINA A BASE64
+# PDF — CONVERTIR PÁGINA A IMAGEN
 # ============================================================
 
 def pdf_a_imagen_base64(
-
     pagina: fitz.Page,
-
 ) -> str:
 
     matriz = fitz.Matrix(
-
         1.5,
-
         1.5,
-
     )
 
 
@@ -4054,20 +4152,14 @@ def pdf_a_imagen_base64(
 
 
     imagen_bytes = (
-
         pixmap.tobytes("png")
-
     )
 
 
     return base64.b64encode(
-
         imagen_bytes
-
     ).decode(
-
         "utf-8"
-
     )
 
 
@@ -4079,19 +4171,38 @@ def analizar_pagina_pdf_con_vision(
     pagina: fitz.Page,
     numero_pagina: int,
 ) -> str:
-    if client is None:
-        raise RuntimeError("GEMINI_API_KEY no está configurada.")
 
-    imagen_base64 = pdf_a_imagen_base64(pagina)
-    imagen_bytes = base64.b64decode(imagen_base64)
+    if client is None:
+
+        raise RuntimeError(
+            "GEMINI_API_KEY "
+            "no está configurada."
+        )
+
+
+    imagen_base64 = (
+        pdf_a_imagen_base64(
+            pagina
+        )
+    )
+
+
+    imagen_bytes = (
+        base64.b64decode(
+            imagen_base64
+        )
+    )
+
 
     prompt = f"""
-Analiza esta página de un PDF para alimentar la base de conocimiento
-de Penaguillo.
+
+Analiza esta página de un PDF para alimentar
+la base de conocimiento de Penaguillo.
 
 Es la página {numero_pagina}.
 
 Extrae cuidadosamente:
+
 - Todo texto legible.
 - Títulos.
 - Subtítulos.
@@ -4103,32 +4214,63 @@ Extrae cuidadosamente:
 - Procesos.
 - Datos importantes.
 - Información comercial.
-- Información relacionada con maquinaria agrícola, café o Penagos.
+- Información relacionada con maquinaria agrícola,
+  café o Penagos.
 
-Si existe una tabla, intenta conservar su estructura.
+Si existe una tabla,
+intenta conservar su estructura.
+
 No inventes información.
-Devuelve todo lo útil de esta página en texto estructurado.
+
+Devuelve todo lo útil de esta página
+en texto estructurado.
+
 """
 
+
     try:
+
         respuesta = generar_con_gemini(
+
             model=VISION_MODEL,
+
             contents=[
+
                 types.Part.from_bytes(
+
                     data=imagen_bytes,
+
                     mime_type="image/png",
+
                 ),
+
                 prompt,
+
             ],
+
             config=types.GenerateContentConfig(
-                temperature=0.1,
+
                 max_output_tokens=8000,
+
             ),
+
         )
-        return extraer_contenido_respuesta(respuesta)
+
+
+        return (
+            extraer_contenido_respuesta(
+                respuesta
+            )
+        )
+
+
     except Exception as error:
+
         raise RuntimeError(
-            f"Error analizando página {numero_pagina}: {error}"
+
+            f"Error analizando página "
+            f"{numero_pagina}: {error}"
+
         )
 
 
@@ -4137,9 +4279,7 @@ Devuelve todo lo útil de esta página en texto estructurado.
 # ============================================================
 
 def extraer_texto_pdf(
-
     documento: fitz.Document,
-
 ) -> str:
 
     paginas = []
@@ -4159,16 +4299,12 @@ def extraer_texto_pdf(
         if texto.strip():
 
             paginas.append(
-
                 texto.strip()
-
             )
 
 
     return "\n\n".join(
-
         paginas
-
     )
 
 
@@ -4210,9 +4346,7 @@ async def ensenar_pdf(
             status_code=400,
 
             detail=(
-
                 "El archivo debe ser un PDF."
-
             ),
 
         )
@@ -4228,11 +4362,8 @@ async def ensenar_pdf(
             status_code=400,
 
             detail=(
-
                 "El PDF supera "
-
                 "el límite de 50 MB."
-
             ),
 
         )
@@ -4248,11 +4379,8 @@ async def ensenar_pdf(
 
 
     ruta = (
-
         PDF_DIR
-
         / nombre
-
     )
 
 
@@ -4270,34 +4398,24 @@ async def ensenar_pdf(
         ) as archivo:
 
             archivo.write(
-
                 contenido
-
             )
 
 
         documento = fitz.open(
-
             str(ruta)
-
         )
 
 
         numero_paginas = (
-
             documento.page_count
-
         )
 
 
         texto_extraido = (
-
             extraer_texto_pdf(
-
                 documento
-
             )
-
         )
 
 
@@ -4328,9 +4446,7 @@ async def ensenar_pdf(
         if not es_escaneado:
 
             contenido_final = (
-
                 texto_extraido
-
             )
 
 
@@ -4375,15 +4491,17 @@ async def ensenar_pdf(
 
                     paginas_vision.append(
 
-                        f"""
+                        (
 
-==============================
-PÁGINA {indice}
-==============================
+                            "==============================\n"
 
-{texto_pagina}
+                            f"PÁGINA {indice}\n"
 
-""".strip()
+                            "==============================\n\n"
+
+                            f"{texto_pagina}"
+
+                        )
 
                     )
 
@@ -4391,9 +4509,7 @@ PÁGINA {indice}
             contenido_final = (
 
                 "\n\n".join(
-
                     paginas_vision
-
                 )
 
             )
@@ -4415,9 +4531,7 @@ PÁGINA {indice}
 
 
         conocimientos = (
-
             cargar_conocimiento()
-
         )
 
 
@@ -4432,21 +4546,19 @@ PÁGINA {indice}
             "contenido": contenido_final,
 
             "descripcion": (
-
                 "Documento PDF procesado "
                 "por Penaguillo."
-
             ),
 
             "archivo": (
-
                 f"/archivos/pdf/{nombre}"
-
             ),
 
             "nombre_archivo": nombre_original,
 
-            "numero_paginas": numero_paginas,
+            "numero_paginas": (
+                numero_paginas
+            ),
 
             "metodo": (
 
@@ -4464,23 +4576,17 @@ PÁGINA {indice}
 
 
         conocimientos.append(
-
             nuevo
-
         )
 
 
         guardar_conocimiento(
-
             conocimientos
-
         )
 
 
         sincronizar_pdf_a_drive(
-
             ruta
-
         )
 
 
@@ -4489,21 +4595,19 @@ PÁGINA {indice}
             "ok": True,
 
             "mensaje": (
-
                 "PDF aprendido "
                 "correctamente."
-
             ),
 
             "conocimiento": nuevo,
 
             "total": len(
-
                 conocimientos
-
             ),
 
-            "numero_paginas": numero_paginas,
+            "numero_paginas": (
+                numero_paginas
+            ),
 
             "metodo": (
 
@@ -4523,22 +4627,16 @@ PÁGINA {indice}
         if documento is not None:
 
             try:
-
                 documento.close()
-
             except Exception:
-
                 pass
 
 
         if ruta.exists():
 
             try:
-
                 ruta.unlink()
-
             except OSError:
-
                 pass
 
 
@@ -4556,29 +4654,22 @@ PÁGINA {indice}
         if documento is not None:
 
             try:
-
                 documento.close()
-
             except Exception:
-
                 pass
 
 
         if ruta.exists():
 
             try:
-
                 ruta.unlink()
-
             except OSError:
-
                 pass
 
 
         print(
-
-            f"❌ Error /ensenar-pdf: {error}"
-
+            f"❌ Error /ensenar-pdf: "
+            f"{error}"
         )
 
 
@@ -4587,11 +4678,8 @@ PÁGINA {indice}
             status_code=500,
 
             detail=(
-
                 "Error procesando PDF: "
-
                 f"{error}"
-
             ),
 
         )
@@ -4607,9 +4695,7 @@ def obtener_conocimiento():
     try:
 
         conocimientos = (
-
             cargar_conocimiento()
-
         )
 
 
@@ -4618,12 +4704,12 @@ def obtener_conocimiento():
             "ok": True,
 
             "total": len(
-
                 conocimientos
-
             ),
 
-            "conocimientos": conocimientos,
+            "conocimientos": (
+                conocimientos
+            ),
 
         }
 
@@ -4653,9 +4739,7 @@ def eliminar_conocimiento(
     try:
 
         conocimientos = (
-
             cargar_conocimiento()
-
         )
 
 
@@ -4665,19 +4749,12 @@ def eliminar_conocimiento(
         for item in conocimientos:
 
             if str(
-
                 item.get(
-
                     "id",
-
                     "",
-
                 )
-
             ) == str(
-
                 data.id
-
             ):
 
                 encontrado = item
@@ -4692,11 +4769,8 @@ def eliminar_conocimiento(
                 status_code=404,
 
                 detail=(
-
                     "No se encontró "
-
                     "ese conocimiento."
-
                 ),
 
             )
@@ -4709,49 +4783,28 @@ def eliminar_conocimiento(
             for item in conocimientos
 
             if str(
-
                 item.get(
-
                     "id",
-
                     "",
-
                 )
-
             )
 
             != str(
-
                 data.id
-
             )
 
         ]
 
-
-        # ----------------------------------------------------
-        # Guardar SIEMPRE el resultado.
-        # Si se elimina el último conocimiento, el resultado es
-        # [] y guardar_conocimiento() también sincroniza Drive.
-        # ----------------------------------------------------
 
         guardar_conocimiento(
             nuevos_conocimientos
         )
 
 
-        # ----------------------------------------------------
-        # Eliminar archivo local asociado
-        # ----------------------------------------------------
-
         archivo_relativo = (
-
             encontrado.get(
-
                 "archivo"
-
             )
-
         )
 
 
@@ -4762,13 +4815,9 @@ def eliminar_conocimiento(
                 archivo_relativo
 
                 .replace(
-
                     "/archivos/",
-
                     "",
-
                     1,
-
                 )
 
                 .lstrip("/")
@@ -4779,7 +4828,6 @@ def eliminar_conocimiento(
             ruta_archivo = (
 
                 ARCHIVOS_DIR
-
                 / archivo_relativo
 
             )
@@ -4788,19 +4836,13 @@ def eliminar_conocimiento(
             if ruta_archivo.exists():
 
                 try:
-
                     ruta_archivo.unlink()
-
                 except OSError as error:
 
                     print(
-
                         "⚠️ No se pudo "
-
                         "eliminar archivo: "
-
                         f"{error}"
-
                     )
 
 
@@ -4809,19 +4851,14 @@ def eliminar_conocimiento(
             "ok": True,
 
             "mensaje": (
-
                 "Conocimiento eliminado "
-
                 "correctamente."
-
             ),
 
             "eliminado": encontrado,
 
             "total": len(
-
                 nuevos_conocimientos
-
             ),
 
         }
@@ -4844,7 +4881,7 @@ def eliminar_conocimiento(
 
 
 # ============================================================
-# BACKUPS LOCALES
+# BACKUPS
 # ============================================================
 
 @app.get("/backups")
@@ -4853,13 +4890,10 @@ def listar_backups():
     archivos = sorted(
 
         BACKUP_DIR.glob(
-
             "penaguillo_*.json"
-
         ),
 
         key=lambda archivo:
-
             archivo.stat().st_mtime,
 
         reverse=True,
@@ -4872,9 +4906,7 @@ def listar_backups():
         "ok": True,
 
         "total": len(
-
             archivos
-
         ),
 
         "backups": [
@@ -4883,11 +4915,13 @@ def listar_backups():
 
                 "nombre": archivo.name,
 
-                "fecha": datetime.fromtimestamp(
-
-                    archivo.stat().st_mtime
-
-                ).isoformat(),
+                "fecha": (
+                    datetime
+                    .fromtimestamp(
+                        archivo.stat().st_mtime
+                    )
+                    .isoformat()
+                ),
 
             }
 
@@ -4927,6 +4961,30 @@ def startup_event():
     )
 
 
+    print(
+        "🤖 CHAT_MODEL: "
+        f"{CHAT_MODEL}"
+    )
+
+
+    print(
+        "👁️ VISION_MODEL: "
+        f"{VISION_MODEL}"
+    )
+
+
+    print(
+        "🔎 RETRIEVAL TOP K: "
+        f"{RELEVANCIA_TOP_K}"
+    )
+
+
+    print(
+        "📦 MAX CONTEXT: "
+        f"{MAX_KB_CONOCIMIENTO_CHAT} KB"
+    )
+
+
     # --------------------------------------------------------
     # GOOGLE DRIVE
     # --------------------------------------------------------
@@ -4941,29 +4999,21 @@ def startup_event():
     try:
 
         conocimientos = (
-
             cargar_conocimiento()
-
         )
 
 
         print(
-
             "📚 Conocimientos disponibles: "
-
             f"{len(conocimientos)}"
-
         )
 
 
     except Exception as error:
 
         print(
-
             "⚠️ No se pudo cargar "
-
             f"el conocimiento: {error}"
-
         )
 
 
