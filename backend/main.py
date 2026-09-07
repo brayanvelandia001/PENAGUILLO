@@ -1,11 +1,11 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 5.9
+# VERSIÓN 6.0 (MIGRADO A GEMINI NATIVO)
 #
 # PROVEEDOR DE IA:
-# - OpenRouter
-# - Modelo configurable mediante OPENROUTER_MODEL
+# - Google Gemini
+# - Modelo configurable mediante GEMINI_MODEL
 #
 # FUNCIONES:
 # - Chat con Penaguillo (CON HISTORIAL)
@@ -14,8 +14,8 @@
 # - Enseñar imágenes
 # - Enseñar PDF
 # - PDF con texto seleccionable -> PyMuPDF
-# - PDF escaneado -> OpenRouter Vision
-# - Imágenes -> OpenRouter Vision
+# - PDF escaneado -> Gemini Vision
+# - Imágenes -> Gemini Vision
 # - Persistencia local
 # - Google Drive como almacenamiento permanente en Render
 # - penaguillo.json como FUENTE MAESTRA de conocimiento
@@ -24,12 +24,11 @@
 # - Búsqueda local por relevancia
 # - Deduplicación inteligente durante retrieval
 #
-# CORRECCIONES V5.9:
-# - Se limpian espacios invisibles corruptos.
-# - Modelo por defecto: google/gemini-2.5-flash
+# CORRECCIONES V6.0:
+# - Se migró la generación de OpenRouter a Google Gemini API.
+# - Se limpiaron espacios invisibles corruptos.
+# - Modelo por defecto: gemini-2.5-flash
 # - MAX_TOKENS fijo en 3000 (Sin adaptación automática).
-# - MAX_KB_CONOCIMIENTO_CHAT ajustado a 25.
-# - Eliminada la lógica de reducción automática de tokens.
 # - Corrección: Si la pregunta actual no tiene palabras clave
 #   (ej. "hola"), se utiliza el contexto completo.
 # ============================================================
@@ -200,34 +199,30 @@ load_dotenv(
 
 
 # ============================================================
-# OPENROUTER
+# GEMINI NATIVO
 # ============================================================
 
-OPENROUTER_API_KEY = os.getenv(
-    "OPENROUTER_API_KEY"
+GEMINI_API_KEY = os.getenv(
+    "GEMINI_API_KEY"
 )
 
-OPENROUTER_MODEL = os.getenv(
-    "OPENROUTER_MODEL",
-    "google/gemini-2.5-flash",
-)
-
-OPENROUTER_URL = (
-    "https://openrouter.ai/api/v1/chat/completions"
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-2.5-flash",
 )
 
 
-if not OPENROUTER_API_KEY:
+if not GEMINI_API_KEY:
 
     print(
         "⚠️ ADVERTENCIA: "
-        "OPENROUTER_API_KEY no está configurada."
+        "GEMINI_API_KEY no está configurada."
     )
 
 else:
 
     print(
-        "🔑 OPENROUTER_API_KEY: configurada"
+        "🔑 GEMINI_API_KEY: configurada"
     )
 
 
@@ -235,8 +230,8 @@ else:
 # MODELOS
 # ============================================================
 
-CHAT_MODEL = OPENROUTER_MODEL
-VISION_MODEL = OPENROUTER_MODEL
+CHAT_MODEL = GEMINI_MODEL
+VISION_MODEL = GEMINI_MODEL
 
 
 # ============================================================
@@ -294,10 +289,10 @@ STOPWORDS_ES = {
 
 
 # ============================================================
-# ERROR CONTROLADO DE OPENROUTER
+# ERROR CONTROLADO DE GEMINI
 # ============================================================
 
-class OpenRouterError(RuntimeError):
+class GeminiError(RuntimeError):
 
     def __init__(
         self,
@@ -315,7 +310,7 @@ class OpenRouterError(RuntimeError):
 
 
 # ============================================================
-# OPENROUTER — EXTRAER RETRY-AFTER
+# GEMINI — EXTRAER RETRY-AFTER
 # ============================================================
 
 def extraer_retry_after(
@@ -346,79 +341,136 @@ def extraer_retry_after(
 
             pass
 
-    patrones = [
-
-        r'"Retry-After"\s*:\s*"(\d+)"',
-
-        r'"retry-after"\s*:\s*"(\d+)"',
-
-        r"Retry-After[\"']?\s*:\s*[\"']?(\d+)",
-
-    ]
-
-    for patron in patrones:
-
-        coincidencia = re.search(
-            patron,
-            mensaje_error,
-            flags=re.IGNORECASE,
-        )
-
-        if coincidencia:
-
-            try:
-
-                segundos = int(
-                    coincidencia.group(1)
-                )
-
-                if segundos >= 0:
-
-                    return segundos
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-
-                pass
 
     return None
 
 
 # ============================================================
-# OPENROUTER — GENERAR RESPUESTA
+# GEMINI — GENERAR RESPUESTA
 # ============================================================
 
-def generar_con_openrouter(
+def generar_con_gemini(
     *,
     model: str,
     messages: list,
     max_retries: int = 3,
 ):
 
-    if not OPENROUTER_API_KEY:
+    if not GEMINI_API_KEY:
 
-        raise OpenRouterError(
-            "OPENROUTER_API_KEY no está configurada."
+        raise GeminiError(
+            "GEMINI_API_KEY no está configurada."
         )
+
+
+    # URL Nativa de Google Gemini
+    url = (
+        "https://generativelanguage.googleapis.com"
+        f"/v1beta/models/{model}:generateContent"
+        f"?key={GEMINI_API_KEY}"
+    )
 
 
     headers = {
 
-        "Authorization":
-            f"Bearer {OPENROUTER_API_KEY}",
-
-        "Content-Type":
-            "application/json",
-
-        "HTTP-Referer":
-            "https://penaguillo-1.onrender.com",
-
-        "X-Title":
-            "Penaguillo IA",
+        "Content-Type": "application/json",
 
     }
+
+
+    system_instruction = None
+
+    gemini_contents = []
+
+
+    # Convertir el formato estándar al formato de Gemini
+    for msg in messages:
+
+        role = msg.get("role")
+
+        content = msg.get("content")
+
+
+        if role == "system":
+
+            system_instruction = {
+                "parts": [
+                    {
+                        "text": content
+                    }
+                ]
+            }
+
+            continue
+
+
+        gemini_role = "model" if role == "assistant" else "user"
+
+        parts = []
+
+
+        if isinstance(content, str):
+
+            parts.append(
+                {
+                    "text": content
+                }
+            )
+
+        elif isinstance(content, list):
+
+            for item in content:
+
+                if item.get("type") == "text":
+
+                    parts.append(
+                        {
+                            "text": item.get("text")
+                        }
+                    )
+
+                elif item.get("type") == "image_url":
+
+                    url_img = item["image_url"]["url"]
+
+                    header, b64_data = url_img.split(",", 1)
+
+                    mime_type = header.split(":")[1].split(";")[0]
+
+
+                    parts.append(
+                        {
+                            "inlineData": {
+                                "mimeType": mime_type,
+                                "data": b64_data
+                            }
+                        }
+                    )
+
+
+        gemini_contents.append(
+            {
+                "role": gemini_role,
+                "parts": parts,
+            }
+        )
+
+
+    payload = {
+
+        "contents": gemini_contents,
+
+        "generationConfig": {
+            "maxOutputTokens": MAX_OUTPUT_TOKENS,
+            "temperature": 0.3,
+        }
+
+    }
+
+
+    if system_instruction:
+
+        payload["systemInstruction"] = system_instruction
 
 
     ultimo_error = None
@@ -434,19 +486,8 @@ def generar_con_openrouter(
             inicio = time.time()
 
 
-            payload = {
-
-                "model": model,
-
-                "messages": messages,
-
-                "max_tokens": MAX_OUTPUT_TOKENS,
-
-            }
-
-
             print(
-                f"🤖 OpenRouter -> "
+                f"🤖 Gemini -> "
                 f"modelo={model}, "
                 f"intento={intento}/{max_retries}, "
                 f"max_tokens={MAX_OUTPUT_TOKENS}"
@@ -455,7 +496,7 @@ def generar_con_openrouter(
 
             respuesta = requests.post(
 
-                OPENROUTER_URL,
+                url,
 
                 headers=headers,
 
@@ -473,13 +514,13 @@ def generar_con_openrouter(
 
 
             print(
-                f"🌐 OpenRouter HTTP: "
+                f"🌐 Gemini HTTP: "
                 f"{respuesta.status_code}"
             )
 
 
             print(
-                f"⏱️ OpenRouter respondió "
+                f"⏱️ Gemini respondió "
                 f"en {duracion:.2f}s"
             )
 
@@ -492,8 +533,8 @@ def generar_con_openrouter(
 
                 except ValueError as error:
 
-                    raise OpenRouterError(
-                        "OpenRouter devolvió "
+                    raise GeminiError(
+                        "Gemini devolvió "
                         "una respuesta que no es JSON.",
                         status_code=200,
                     ) from error
@@ -506,9 +547,9 @@ def generar_con_openrouter(
             )
 
 
-            ultimo_error = OpenRouterError(
+            ultimo_error = GeminiError(
 
-                "OpenRouter HTTP "
+                "Gemini HTTP "
                 f"{respuesta.status_code}: "
                 f"{mensaje_error}",
 
@@ -518,7 +559,7 @@ def generar_con_openrouter(
 
 
             print(
-                "⚠️ OpenRouter falló:"
+                "⚠️ Gemini falló:"
             )
 
 
@@ -527,44 +568,13 @@ def generar_con_openrouter(
             )
 
 
-            if respuesta.status_code in (402, 400, 404):
-
-                texto_error_lower = mensaje_error.lower()
-
-                if "in_flight_budget_exhausted" in texto_error_lower or "current in-flight requests" in texto_error_lower:
-                    retry_after = extraer_retry_after(respuesta, mensaje_error)
-                    raise OpenRouterError(
-                        "OpenRouter está esperando que finalicen solicitudes anteriores.",
-                        status_code=429,
-                        retry_after=retry_after,
-                    )
+            if respuesta.status_code in (400, 403, 404):
 
                 raise ultimo_error
 
 
-            texto_error = (
-                mensaje_error.upper()
-            )
-
-
-            es_temporal = any(
-
-                codigo in texto_error
-
-                for codigo in (
-
-                    "429",
-                    "500",
-                    "502",
-                    "503",
-                    "504",
-                    "TIMEOUT",
-                    "UNAVAILABLE",
-                    "RATE LIMIT",
-                    "RESOURCE_EXHAUSTED",
-
-                )
-
+            es_temporal = respuesta.status_code in (
+                429, 500, 502, 503, 504
             )
 
 
@@ -595,17 +605,17 @@ def generar_con_openrouter(
 
         except requests.RequestException as error:
 
-            ultimo_error = OpenRouterError(
+            ultimo_error = GeminiError(
 
                 "No fue posible conectar "
-                f"con OpenRouter: {error}",
+                f"con Gemini: {error}",
 
             )
 
 
             print(
                 "⚠️ Error de conexión "
-                "con OpenRouter:"
+                "con Gemini:"
             )
 
 
@@ -640,142 +650,88 @@ def generar_con_openrouter(
         raise ultimo_error
 
 
-    raise OpenRouterError(
-        "OpenRouter no pudo generar una respuesta."
+    raise GeminiError(
+        "Gemini no pudo generar una respuesta."
     )
 
 
 # ============================================================
-# OPENROUTER — EXTRAER CONTENIDO
+# GEMINI — EXTRAER CONTENIDO
 # ============================================================
 
-def extraer_contenido_openrouter(
+def extraer_contenido_gemini(
     respuesta: dict,
 ) -> str:
 
     if not respuesta:
 
         raise RuntimeError(
-            "OpenRouter no devolvió respuesta."
+            "Gemini no devolvió respuesta."
         )
 
 
-    choices = respuesta.get(
-        "choices",
+    if "error" in respuesta:
+
+        error_data = respuesta["error"]
+
+        raise RuntimeError(
+            "Gemini devolvió un error: "
+            f"{error_data}"
+        )
+
+
+    candidatos = respuesta.get(
+        "candidates",
         [],
     )
 
 
-    if not choices:
-
-        error_data = respuesta.get(
-            "error"
-        )
-
-
-        if error_data:
-
-            raise RuntimeError(
-                "OpenRouter devolvió un error: "
-                f"{error_data}"
-            )
-
+    if not candidatos:
 
         raise RuntimeError(
-            "OpenRouter no devolvió ninguna opción."
+            "Gemini no devolvió ningún candidato."
         )
 
 
-    primer_choice = choices[0]
+    primer_candidato = candidatos[0]
 
 
-    if not isinstance(
-        primer_choice,
-        dict,
-    ):
-
-        raise RuntimeError(
-            "Respuesta inválida de OpenRouter."
-        )
-
-
-    mensaje = primer_choice.get(
-        "message",
+    contenido = primer_candidato.get(
+        "content",
         {},
     )
 
 
-    if not isinstance(
-        mensaje,
-        dict,
-    ):
-
-        raise RuntimeError(
-            "OpenRouter devolvió "
-            "un mensaje inválido."
-        )
-
-
-    contenido = mensaje.get(
-        "content"
+    partes = contenido.get(
+        "parts",
+        [],
     )
 
 
-    if isinstance(
-        contenido,
-        str,
-    ):
-
-        if contenido.strip():
-
-            return contenido.strip()
+    texto_final = []
 
 
-    if isinstance(
-        contenido,
-        list,
-    ):
+    for parte in partes:
 
-        partes = []
+        if "text" in parte:
 
-
-        for parte in contenido:
-
-            if not isinstance(
-                parte,
-                dict,
-            ):
-
-                continue
-
-
-            texto = parte.get(
-                "text"
+            texto_final.append(
+                parte["text"]
             )
 
 
-            if texto:
-
-                partes.append(
-                    str(texto)
-                )
+    resultado = "\n".join(
+        texto_final
+    ).strip()
 
 
-        resultado = (
-            "\n".join(
-                partes
-            )
-            .strip()
-        )
+    if resultado:
 
-
-        if resultado:
-
-            return resultado
+        return resultado
 
 
     raise RuntimeError(
-        "OpenRouter no devolvió "
+        "Gemini no devolvió "
         "contenido de texto."
     )
 
@@ -2489,7 +2445,7 @@ app = FastAPI(
 
     title="Penaguillo IA",
 
-    version="5.8.0",
+    version="6.0.0",
 
     description=(
         "Backend del asistente inteligente Penaguillo"
@@ -3961,9 +3917,9 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "5.9.0",
+        "version": "6.0.0",
 
-        "provider": "OpenRouter",
+        "provider": "Google Gemini Native",
 
         "chat_model": CHAT_MODEL,
 
@@ -4003,8 +3959,8 @@ def root():
 
         "current_question_priority": True,
 
-        "openrouter": (
-            bool(OPENROUTER_API_KEY)
+        "gemini_api": (
+            bool(GEMINI_API_KEY)
         ),
 
         "google_drive": (
@@ -4047,14 +4003,14 @@ def chat(
         )
 
 
-    if not OPENROUTER_API_KEY:
+    if not GEMINI_API_KEY:
 
         raise HTTPException(
 
             status_code=500,
 
             detail=(
-                "OPENROUTER_API_KEY "
+                "GEMINI_API_KEY "
                 "no está configurada."
             ),
 
@@ -4180,7 +4136,7 @@ normalmente.
 
 
         print(
-            "📤 Enviando pregunta a OpenRouter."
+            "📤 Enviando pregunta a Gemini."
         )
 
 
@@ -4228,7 +4184,7 @@ normalmente.
 
             print(
                 "💬 Historial enviado a "
-                "OpenRouter: "
+                "Gemini: "
                 f"{len(historial_reciente)} mensajes"
             )
 
@@ -4293,7 +4249,7 @@ normalmente.
 
         print(
             "💬 Mensajes totales enviados "
-            "a OpenRouter: "
+            "a Gemini: "
             f"{len(mensajes_api)}"
         )
 
@@ -4302,7 +4258,7 @@ normalmente.
         # GENERAR
         # ====================================================
 
-        respuesta = generar_con_openrouter(
+        respuesta = generar_con_gemini(
 
             model=CHAT_MODEL,
 
@@ -4312,7 +4268,7 @@ normalmente.
 
 
         contenido = (
-            extraer_contenido_openrouter(
+            extraer_contenido_gemini(
                 respuesta
             )
         )
@@ -4327,10 +4283,10 @@ normalmente.
         }
 
 
-    except OpenRouterError as error:
+    except GeminiError as error:
 
         print(
-            f"❌ Error OpenRouter en /chat: "
+            f"❌ Error Gemini en /chat: "
             f"{error}"
         )
 
@@ -4367,28 +4323,6 @@ normalmente.
 
                 detail=str(
                     error
-                ),
-
-            )
-
-
-        if error.status_code == 402:
-
-            raise HTTPException(
-
-                status_code=402,
-
-                detail=(
-
-                    "OpenRouter no tiene "
-                    "créditos suficientes para "
-                    "esta solicitud. "
-
-                    "Se mantiene el objetivo de "
-                    f"{MAX_OUTPUT_TOKENS} tokens y "
-                    "no se realizarán más reducciones "
-                    "automáticas."
-
                 ),
 
             )
@@ -4449,7 +4383,7 @@ normalmente.
 
                 detail=(
 
-                    "OpenRouter alcanzó "
+                    "Gemini alcanzó "
                     "un límite temporal. "
                     "Intenta nuevamente."
 
@@ -4661,11 +4595,11 @@ def analizar_imagen_con_vision(
     contexto: str = "",
 ) -> str:
 
-    if not OPENROUTER_API_KEY:
+    if not GEMINI_API_KEY:
 
         raise RuntimeError(
 
-            "OPENROUTER_API_KEY "
+            "GEMINI_API_KEY "
             "no está configurada."
 
         )
@@ -4727,7 +4661,7 @@ Devuelve una descripción estructurada y detallada.
 
     try:
 
-        respuesta = generar_con_openrouter(
+        respuesta = generar_con_gemini(
 
             model=VISION_MODEL,
 
@@ -4771,7 +4705,7 @@ Devuelve una descripción estructurada y detallada.
 
 
         return (
-            extraer_contenido_openrouter(
+            extraer_contenido_gemini(
                 respuesta
             )
         )
@@ -4780,7 +4714,7 @@ Devuelve una descripción estructurada y detallada.
     except Exception as error:
 
         print(
-            f"❌ Error OpenRouter Vision: "
+            f"❌ Error Gemini Vision: "
             f"{error}"
         )
 
@@ -5036,7 +4970,7 @@ def pdf_a_imagen_bytes(
 
 
 # ============================================================
-# PDF — VISION CON OPENROUTER
+# PDF — VISION CON GEMINI
 # ============================================================
 
 def analizar_pagina_pdf_con_vision(
@@ -5044,11 +4978,11 @@ def analizar_pagina_pdf_con_vision(
     numero_pagina: int,
 ) -> str:
 
-    if not OPENROUTER_API_KEY:
+    if not GEMINI_API_KEY:
 
         raise RuntimeError(
 
-            "OPENROUTER_API_KEY "
+            "GEMINI_API_KEY "
             "no está configurada."
 
         )
@@ -5106,7 +5040,7 @@ en texto estructurado.
 
     try:
 
-        respuesta = generar_con_openrouter(
+        respuesta = generar_con_gemini(
 
             model=VISION_MODEL,
 
@@ -5150,7 +5084,7 @@ en texto estructurado.
 
 
         return (
-            extraer_contenido_openrouter(
+            extraer_contenido_gemini(
                 respuesta
             )
         )
@@ -5871,7 +5805,7 @@ def startup_event():
 
     print(
         "🤖 PROVEEDOR IA: "
-        "OpenRouter"
+        "Gemini Nativo"
     )
 
 
@@ -5894,7 +5828,7 @@ def startup_event():
 
 
     print(
-        "💬 MAX HISTORIAL OPENROUTER: "
+        "💬 MAX HISTORIAL GEMINI: "
         f"{MAX_MENSAJES_HISTORIAL} mensajes"
     )
 
@@ -5930,8 +5864,8 @@ def startup_event():
 
 
     print(
-        "🔑 OPENROUTER: "
-        f"{'CONFIGURADO' if OPENROUTER_API_KEY else 'NO CONFIGURADO'}"
+        "🔑 GEMINI_API: "
+        f"{'CONFIGURADO' if GEMINI_API_KEY else 'NO CONFIGURADO'}"
     )
 
 
