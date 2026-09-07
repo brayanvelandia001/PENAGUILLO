@@ -3699,6 +3699,7 @@ normalmente utilizando tus capacidades.
         )
 
 
+       try:
         # Construir la lista de mensajes con el historial
         mensajes_api = [
             {
@@ -3706,30 +3707,26 @@ normalmente utilizando tus capacidades.
                 "content": system_prompt,
             }
         ]
-        
-   # Agregar solamente el historial reciente
-    if data.history:
-        historial_reciente = data.history[-10:]
 
-        for msg in historial_reciente:
-            mensajes_api.append({
-                "role": msg.role,
-                "content": msg.content
-            })
-                
+        # Agregar solamente el historial reciente
+        if data.history:
+            historial_reciente = data.history[-10:]
+
+            for msg in historial_reciente:
+                mensajes_api.append({
+                    "role": msg.role,
+                    "content": msg.content
+                })
+
         # Agregar el mensaje actual del usuario
         mensajes_api.append({
             "role": "user",
             "content": mensaje,
         })
 
-
         respuesta = generar_con_openrouter(
-
             model=CHAT_MODEL,
-
             messages=mensajes_api,
-
         )
 
 
