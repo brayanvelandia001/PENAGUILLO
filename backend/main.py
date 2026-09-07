@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 5.5
+# VERSIÓN 5.6
 #
 # PROVEEDOR DE IA:
 # - OpenRouter
@@ -9,6 +9,7 @@
 #
 # FUNCIONES:
 # - Chat con Penaguillo (CON HISTORIAL)
+# - Chat con búsqueda contextual
 # - Enseñar texto
 # - Enseñar imágenes
 # - Enseñar PDF
@@ -22,12 +23,15 @@
 # - Escritura atómica
 # - Búsqueda local por relevancia
 #
-# CORRECCIÓN V5.5:
+# CORRECCIONES V5.6:
 #
-# - Se reemplazó Gemini directo por OpenRouter.
-# - El chat utiliza OpenRouter y maneja historial de conversación.
-# - Las imágenes utilizan OpenRouter multimodal.
-# - Los PDF escaneados utilizan OpenRouter multimodal.
+# - El chat conserva los últimos 10 mensajes como historial.
+# - La búsqueda de conocimiento utiliza contexto de los
+#   últimos mensajes del usuario.
+# - La pregunta actual siempre participa en la búsqueda.
+# - Se mantiene OpenRouter + Gemini 2.5 Flash.
+# - No se modifica la lógica de Google Drive.
+# - No se modifica enseñar texto / imagen / PDF.
 # ============================================================
 
 import base64
@@ -261,6 +265,41 @@ MAX_KB_CONOCIMIENTO_CHAT = 80
 MAX_CHARS_CONOCIMIENTO_CHAT = (
     MAX_KB_CONOCIMIENTO_CHAT * 1024
 )
+
+
+# ============================================================
+# CONFIGURACIÓN DEL HISTORIAL
+# ============================================================
+
+# Cantidad máxima de mensajes enviados al modelo.
+#
+# Esto evita enviar una conversación completa cuando
+# la conversación crece demasiado.
+#
+# 10 mensajes = aproximadamente 5 intercambios.
+#
+# La aplicación puede conservar más mensajes localmente,
+# pero solamente estos se envían a OpenRouter.
+# ============================================================
+
+MAX_MENSAJES_HISTORIAL = 10
+
+
+# ============================================================
+# CONFIGURACIÓN DE BÚSQUEDA CONTEXTUAL
+# ============================================================
+
+# Cantidad de mensajes anteriores del usuario utilizados
+# para construir la consulta de búsqueda.
+#
+# Se utilizan menos mensajes para retrieval que para el
+# historial enviado al modelo porque la búsqueda solamente
+# necesita contexto suficiente para identificar el tema.
+# ============================================================
+
+MAX_MENSAJES_RETRIEVAL = 6
+
+MAX_CHARS_CONSULTA_RETRIEVAL = 4000
 
 
 # ============================================================
@@ -1689,6 +1728,7 @@ def descargar_archivo_drive(
                 supportsAllDrives=True,
 
             )
+
             .execute()
         )
 
@@ -2450,7 +2490,7 @@ app = FastAPI(
 
     title="Penaguillo IA",
 
-    version="5.5.0",
+    version="5.6.0",
 
     description=(
         "Backend del asistente inteligente Penaguillo"
@@ -2542,16 +2582,16 @@ EXTENSIONES_PDF = {
 # ============================================================
 
 class ChatMessage(BaseModel):
-    
+
     role: str
-    
+
     content: str
 
 
 class ChatRequest(BaseModel):
 
     message: str
-    
+
     history: list[ChatMessage] = []
 
 
@@ -2674,6 +2714,107 @@ def extraer_palabras_importantes(
 
 
 # ============================================================
+# CONSTRUIR CONSULTA DE RETRIEVAL CON CONTEXTO
+# ============================================================
+
+def construir_consulta_retrieval(
+    mensaje: str,
+    history: list[ChatMessage],
+) -> str:
+
+    partes = []
+
+
+    # --------------------------------------------------------
+    # Tomar los últimos mensajes del usuario
+    # --------------------------------------------------------
+
+    if history:
+
+        historial_usuario = [
+
+            msg
+
+            for msg in history
+
+            if msg.role == "user"
+
+        ]
+
+
+        for msg in historial_usuario[
+            -MAX_MENSAJES_RETRIEVAL:
+        ]:
+
+            contenido = (
+                str(msg.content)
+                .strip()
+            )
+
+
+            if not contenido:
+
+                continue
+
+
+            partes.append(
+                contenido
+            )
+
+
+    # --------------------------------------------------------
+    # Agregar siempre la pregunta actual
+    # --------------------------------------------------------
+
+    mensaje_actual = (
+        str(mensaje)
+        .strip()
+    )
+
+
+    if mensaje_actual:
+
+        partes.append(
+            mensaje_actual
+        )
+
+
+    # --------------------------------------------------------
+    # Construir consulta
+    # --------------------------------------------------------
+
+    consulta = " ".join(
+        partes
+    )
+
+
+    # --------------------------------------------------------
+    # Evitar consulta excesivamente grande
+    # --------------------------------------------------------
+
+    if len(consulta) > MAX_CHARS_CONSULTA_RETRIEVAL:
+
+        consulta = (
+            consulta[
+                -MAX_CHARS_CONSULTA_RETRIEVAL:
+            ]
+        )
+
+
+    print(
+        "🧠 Consulta de búsqueda contextual:"
+    )
+
+
+    print(
+        f"   {consulta}"
+    )
+
+
+    return consulta
+
+
+# ============================================================
 # RELEVANCIA DE UN REGISTRO
 # ============================================================
 
@@ -2737,10 +2878,12 @@ def calcular_relevancia(
     texto_completo = " ".join(
 
         [
+
             titulo,
             contenido,
             descripcion,
             tipo,
+
         ]
 
     )
@@ -2903,9 +3046,13 @@ def buscar_conocimiento_relevante(
             resultados.append(
 
                 (
+
                     puntuacion,
+
                     indice,
+
                     item,
+
                 )
 
             )
@@ -3533,7 +3680,7 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "5.5.0",
+        "version": "5.6.0",
 
         "provider": "OpenRouter",
 
@@ -3554,6 +3701,16 @@ def root():
         "max_context_chars": (
             MAX_CHARS_CONOCIMIENTO_CHAT
         ),
+
+        "max_history_messages": (
+            MAX_MENSAJES_HISTORIAL
+        ),
+
+        "max_retrieval_messages": (
+            MAX_MENSAJES_RETRIEVAL
+        ),
+
+        "max_output_tokens": 3000,
 
         "openrouter": (
             bool(OPENROUTER_API_KEY)
@@ -3621,13 +3778,51 @@ def chat(
 
 
         # ====================================================
-        # BUSCAR SOLO CONOCIMIENTO RELEVANTE
+        # BUSCAR CONOCIMIENTO CON CONTEXTO
         # ====================================================
+        #
+        # ANTES:
+        #
+        # construir_contexto_relevante(
+        #     mensaje,
+        #     conocimientos,
+        # )
+        #
+        # AHORA:
+        #
+        # Se utilizan los últimos mensajes del usuario
+        # junto con la pregunta actual.
+        #
+        # Esto permite resolver conversaciones como:
+        #
+        # Usuario:
+        # ¿Qué hace Penagos?
+        #
+        # Usuario:
+        # ¿Dónde queda?
+        #
+        # Usuario:
+        # ¿Cuál es el teléfono?
+        #
+        # La búsqueda no recibe únicamente
+        # "¿Cuál es el teléfono?"
+        # ====================================================
+
+        consulta_retrieval = (
+            construir_consulta_retrieval(
+
+                mensaje,
+
+                data.history,
+
+            )
+        )
+
 
         conocimiento_relevante = (
             construir_contexto_relevante(
 
-                mensaje,
+                consulta_retrieval,
 
                 conocimientos,
 
@@ -3657,7 +3852,7 @@ def chat(
 La información que aparece a continuación
 es solamente el subconjunto de registros
 que el sistema local considera relacionados
-con la pregunta del usuario.
+con la conversación y la pregunta del usuario.
 
 Debes tomar tú la decisión final sobre qué
 información utilizar para responder.
@@ -3672,6 +3867,32 @@ No inventes información.
 Si la pregunta no necesita conocimiento
 específico de Penaguillo, puedes responder
 normalmente utilizando tus capacidades.
+
+Utiliza también el historial de conversación
+proporcionado por el sistema para comprender
+referencias, pronombres y preguntas de seguimiento.
+
+Si el usuario dice cosas como:
+
+- "esa máquina"
+- "el casino"
+- "ese teléfono"
+- "allí"
+- "ellos"
+- "esa empresa"
+- "¿y cuál?"
+- "¿y dónde?"
+- "¿y el número?"
+
+debes intentar identificar a qué se refiere
+utilizando el contexto de la conversación.
+
+No obligues al usuario a repetir información
+que ya proporcionó anteriormente.
+
+Si el contexto de conversación permite saber
+a qué se refiere, continúa la conversación
+normalmente.
 
 """
 
@@ -3699,28 +3920,138 @@ normalmente utilizando tus capacidades.
         )
 
 
-        # Construir la lista de mensajes con el historial
-        mensajes_api = [
-            {
-                "role": "system",
-                "content": system_prompt,
-            }
-        ]
-        
-        # Agregar historial si existe
-        if data.history:
-            for msg in data.history:
-                mensajes_api.append({
-                    "role": msg.role,
-                    "content": msg.content
-                })
-                
-        # Agregar el mensaje actual del usuario
-        mensajes_api.append({
-            "role": "user",
-            "content": mensaje,
-        })
+        # ====================================================
+        # CONSTRUIR MENSAJES PARA OPENROUTER
+        # ====================================================
 
+        mensajes_api = [
+
+            {
+
+                "role": "system",
+
+                "content": system_prompt,
+
+            }
+
+        ]
+
+
+        # ====================================================
+        # AGREGAR HISTORIAL RECIENTE
+        # ====================================================
+        #
+        # Se conservan todos los mensajes en el frontend,
+        # pero solamente se envían los últimos 10 a la IA.
+        #
+        # Esto evita que el consumo de tokens crezca
+        # indefinidamente durante conversaciones largas.
+        # ====================================================
+
+        if data.history:
+
+            historial_reciente = (
+                data.history[
+                    -MAX_MENSAJES_HISTORIAL:
+                ]
+            )
+
+
+            print(
+                "💬 Historial recibido: "
+                f"{len(data.history)} mensajes"
+            )
+
+
+            print(
+                "💬 Historial enviado a "
+                "OpenRouter: "
+                f"{len(historial_reciente)} mensajes"
+            )
+
+
+            for msg in historial_reciente:
+
+                contenido_historial = (
+
+                    str(
+                        msg.content
+                    )
+
+                    .strip()
+
+                )
+
+
+                if not contenido_historial:
+
+                    continue
+
+
+                # --------------------------------------------
+                # Validar roles permitidos
+                # --------------------------------------------
+
+                if msg.role not in (
+                    "user",
+                    "assistant",
+                ):
+
+                    continue
+
+
+                mensajes_api.append(
+
+                    {
+
+                        "role": msg.role,
+
+                        "content": (
+                            contenido_historial
+                        ),
+
+                    }
+
+                )
+
+
+        # ====================================================
+        # AGREGAR MENSAJE ACTUAL
+        # ====================================================
+        #
+        # Importante:
+        #
+        # El mensaje actual NO se agrega al historial
+        # previamente enviado.
+        #
+        # Se agrega solamente aquí.
+        #
+        # Así evitamos duplicarlo.
+        # ====================================================
+
+        mensajes_api.append(
+
+            {
+
+                "role": "user",
+
+                "content": mensaje,
+
+            }
+
+        )
+
+
+        print(
+            "💬 Mensajes totales enviados "
+            "a OpenRouter: "
+            f"{len(mensajes_api)}"
+        )
+
+
+        # ====================================================
+        # GENERAR RESPUESTA
+        # ====================================================
 
         respuesta = generar_con_openrouter(
 
@@ -3776,9 +4107,13 @@ normalmente utilizando tus capacidades.
 
 
         if (
+
             "429" in texto_error
+
             or "RATE LIMIT" in texto_error
+
             or "RESOURCE_EXHAUSTED" in texto_error
+
         ):
 
             raise HTTPException(
@@ -3797,8 +4132,11 @@ normalmente utilizando tus capacidades.
 
 
         if (
+
             "503" in texto_error
+
             or "UNAVAILABLE" in texto_error
+
         ):
 
             raise HTTPException(
@@ -5229,8 +5567,26 @@ def startup_event():
 
 
     print(
+        "💬 MAX HISTORIAL OPENROUTER: "
+        f"{MAX_MENSAJES_HISTORIAL} mensajes"
+    )
+
+
+    print(
+        "🧠 MAX HISTORIAL RETRIEVAL: "
+        f"{MAX_MENSAJES_RETRIEVAL} mensajes"
+    )
+
+
+    print(
         "📦 MAX CONTEXT: "
         f"{MAX_KB_CONOCIMIENTO_CHAT} KB"
+    )
+
+
+    print(
+        "🤖 MAX OUTPUT TOKENS: "
+        "3000"
     )
 
 
@@ -5267,8 +5623,10 @@ def startup_event():
     except Exception as error:
 
         print(
+
             "⚠️ No se pudo cargar "
             f"el conocimiento: {error}"
+
         )
 
 
