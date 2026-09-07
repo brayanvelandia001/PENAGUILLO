@@ -240,8 +240,9 @@ client = (
     else None
 )
 
-CHAT_MODEL = "gemini-2.5-flash"
-VISION_MODEL = "gemini-2.5-flash"
+CHAT_MODEL = "gemini-3.6-flash"
+
+VISION_MODEL = "gemini-3.6-flash"
 
 
 # ============================================================
