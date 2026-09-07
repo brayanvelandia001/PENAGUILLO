@@ -396,7 +396,7 @@ def generar_con_openrouter(
 
         "messages": messages,
 
-        "max_tokens": 4000,
+        "max_tokens": 3000,
 
     }
 
