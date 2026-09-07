@@ -237,10 +237,10 @@ client = (
     else None
 )
 
-# Modelos estables actualmente disponibles en Gemini API.
-# Gemini 2.5 Flash es adecuado para chat, imágenes y PDF.
-CHAT_MODEL = "gemini-2.5-flash"
-VISION_MODEL = "gemini-2.5-flash"
+# Modelos actuales de Gemini API.
+# Se usa Gemini 3.6 Flash para chat, imágenes y PDF.
+CHAT_MODEL = "gemini-3.6-flash"
+VISION_MODEL = "gemini-3.6-flash"
 
 
 # ============================================================
