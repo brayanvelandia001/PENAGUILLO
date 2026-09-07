@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 5.5
+# VERSIÓN 5.6
 #
 # PROVEEDOR DE IA:
 # - OpenRouter
@@ -9,6 +9,7 @@
 #
 # FUNCIONES:
 # - Chat con Penaguillo
+# - Historial de conversación por conversation_id
 # - Enseñar texto
 # - Enseñar imágenes
 # - Enseñar PDF
@@ -22,14 +23,19 @@
 # - Escritura atómica
 # - Búsqueda local por relevancia
 #
-# CORRECCIÓN V5.5:
+# CORRECCIÓN V5.6:
 #
-# - Se reemplazó Gemini directo por OpenRouter.
-# - El chat utiliza OpenRouter.
-# - Las imágenes utilizan OpenRouter multimodal.
-# - Los PDF escaneados utilizan OpenRouter multimodal.
-# - El frontend NO necesita cambios.
-# - /chat mantiene el mismo formato de respuesta.
+# - Se mantiene OpenRouter.
+# - Se mantiene Gemini mediante OpenRouter.
+# - Se agrega historial de conversación.
+# - Cada conversación utiliza un conversation_id independiente.
+# - Se conservan hasta 20 mensajes por conversación.
+# - Se agrega /chat/nuevo.
+# - Se agrega DELETE /chat/{conversation_id}.
+# - El frontend puede seguir enviando solamente "message".
+# - Si no existe conversation_id, el backend genera uno.
+# - /chat mantiene "response" y agrega "conversation_id".
+# - El conocimiento sigue separado del historial.
 # ============================================================
 
 
@@ -244,8 +250,6 @@ else:
 #
 # OPENROUTER_MODEL=google/gemini-2.5-flash
 #
-# Si posteriormente quieres cambiar de modelo,
-# solamente modificas OPENROUTER_MODEL en Render.
 # ============================================================
 
 CHAT_MODEL = OPENROUTER_MODEL
@@ -264,6 +268,49 @@ MAX_KB_CONOCIMIENTO_CHAT = 80
 MAX_CHARS_CONOCIMIENTO_CHAT = (
     MAX_KB_CONOCIMIENTO_CHAT * 1024
 )
+
+
+# ============================================================
+# CONFIGURACIÓN DEL HISTORIAL
+# ============================================================
+#
+# El historial se mantiene en memoria.
+#
+# Esto permite que una conversación tenga continuidad:
+#
+# Usuario:
+#   ¿Qué máquinas tiene Penagos?
+#
+# Penaguillo:
+#   ...
+#
+# Usuario:
+#   ¿Y cuál pesa más?
+#
+# Penaguillo:
+#   Entiende que "cuál" se refiere a las máquinas
+#   mencionadas anteriormente.
+#
+# IMPORTANTE:
+#
+# Este historial NO se guarda en penaguillo.json.
+#
+# penaguillo.json:
+#   conocimiento permanente
+#
+# conversation_history:
+#   contexto temporal de las conversaciones
+#
+# Si Render reinicia el servidor, las conversaciones
+# activas se pierden.
+# ============================================================
+
+MAX_HISTORIAL_MENSAJES = 20
+
+conversation_history: dict[
+    str,
+    list[dict[str, str]]
+] = {}
 
 
 # ============================================================
@@ -732,6 +779,73 @@ def extraer_contenido_openrouter(
         "OpenRouter no devolvió "
         "contenido de texto."
     )
+
+
+# ============================================================
+# CONVERSACIONES — UTILIDADES
+# ============================================================
+
+def generar_conversation_id() -> str:
+
+    return uuid.uuid4().hex
+
+
+def obtener_historial_conversacion(
+    conversation_id: str,
+) -> list[dict[str, str]]:
+
+    return conversation_history.get(
+        conversation_id,
+        [],
+    )
+
+
+def guardar_mensaje_conversacion(
+    conversation_id: str,
+    role: str,
+    content: str,
+) -> None:
+
+    if conversation_id not in conversation_history:
+
+        conversation_history[
+            conversation_id
+        ] = []
+
+
+    conversation_history[
+        conversation_id
+    ].append({
+
+        "role": role,
+
+        "content": content,
+
+    })
+
+
+    # Mantener únicamente los últimos mensajes.
+    conversation_history[
+        conversation_id
+    ] = conversation_history[
+        conversation_id
+    ][-MAX_HISTORIAL_MENSAJES:]
+
+
+def eliminar_conversacion(
+    conversation_id: str,
+) -> bool:
+
+    if conversation_id in conversation_history:
+
+        del conversation_history[
+            conversation_id
+        ]
+
+        return True
+
+
+    return False
 
 
 # ============================================================
@@ -2453,7 +2567,7 @@ app = FastAPI(
 
     title="Penaguillo IA",
 
-    version="5.5.0",
+    version="5.6.0",
 
     description=(
         "Backend del asistente inteligente Penaguillo"
@@ -2547,6 +2661,8 @@ EXTENSIONES_PDF = {
 class ChatRequest(BaseModel):
 
     message: str
+
+    conversation_id: str | None = None
 
 
 class EnsenarRequest(BaseModel):
@@ -3527,7 +3643,7 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "5.5.0",
+        "version": "5.6.0",
 
         "provider": "OpenRouter",
 
@@ -3549,6 +3665,14 @@ def root():
             MAX_CHARS_CONOCIMIENTO_CHAT
         ),
 
+        "max_historial_mensajes": (
+            MAX_HISTORIAL_MENSAJES
+        ),
+
+        "conversaciones_activas": (
+            len(conversation_history)
+        ),
+
         "openrouter": (
             bool(OPENROUTER_API_KEY)
         ),
@@ -3564,6 +3688,98 @@ def root():
         "shared_drive": (
             DRIVE_SHARED_ID is not None
         ),
+
+    }
+
+
+# ============================================================
+# NUEVA CONVERSACIÓN
+# ============================================================
+
+@app.post("/chat/nuevo")
+def nueva_conversacion():
+
+    conversation_id = (
+        generar_conversation_id()
+    )
+
+
+    conversation_history[
+        conversation_id
+    ] = []
+
+
+    print(
+        "🆕 Nueva conversación creada:"
+    )
+
+
+    print(
+        f"   ID: {conversation_id}"
+    )
+
+
+    return {
+
+        "ok": True,
+
+        "conversation_id":
+            conversation_id,
+
+    }
+
+
+# ============================================================
+# ELIMINAR CONVERSACIÓN
+# ============================================================
+
+@app.delete("/chat/{conversation_id}")
+def borrar_conversacion(
+
+    conversation_id: str,
+
+):
+
+    eliminado = eliminar_conversacion(
+        conversation_id
+    )
+
+
+    if not eliminado:
+
+        raise HTTPException(
+
+            status_code=404,
+
+            detail=(
+                "No se encontró "
+                "la conversación."
+            ),
+
+        )
+
+
+    print(
+        "🗑️ Conversación eliminada:"
+    )
+
+
+    print(
+        f"   ID: {conversation_id}"
+    )
+
+
+    return {
+
+        "ok": True,
+
+        "mensaje": (
+            "Conversación eliminada "
+            "correctamente."
+        ),
+
+        "conversation_id":
+            conversation_id,
 
     }
 
@@ -3609,9 +3825,97 @@ def chat(
 
     try:
 
+        # ====================================================
+        # IDENTIFICAR CONVERSACIÓN
+        # ====================================================
+
+        conversation_id = (
+            data.conversation_id
+            or generar_conversation_id()
+        )
+
+
+        historial = (
+            obtener_historial_conversacion(
+                conversation_id
+            )
+        )
+
+
+        print(
+            "💬 Conversación:"
+        )
+
+
+        print(
+            f"   ID: {conversation_id}"
+        )
+
+
+        print(
+            "   Historial: "
+            f"{len(historial)} mensajes"
+        )
+
+
+        # ====================================================
+        # CARGAR CONOCIMIENTO
+        # ====================================================
+
         conocimientos = (
             cargar_conocimiento()
         )
+
+
+        # ====================================================
+        # MEJORAR RETRIEVAL UTILIZANDO EL HISTORIAL
+        # ====================================================
+        #
+        # Esto es importante para preguntas como:
+        #
+        # Usuario:
+        #   Háblame de la máquina X
+        #
+        # Usuario:
+        #   ¿Cuánto pesa?
+        #
+        # El retrieval recibe también parte de la
+        # conversación anterior para poder localizar
+        # información relacionada con la máquina X.
+        #
+        # ====================================================
+
+        consulta_retrieval = mensaje
+
+
+        if historial:
+
+            ultimos_usuario = [
+
+                item["content"]
+
+                for item in historial
+
+                if item.get("role") == "user"
+
+            ][-3:]
+
+
+            consulta_retrieval = (
+
+                "\n".join(
+
+                    ultimos_usuario
+
+                    + [
+
+                        mensaje
+
+                    ]
+
+                )
+
+            )
 
 
         # ====================================================
@@ -3621,7 +3925,7 @@ def chat(
         conocimiento_relevante = (
             construir_contexto_relevante(
 
-                mensaje,
+                consulta_retrieval,
 
                 conocimientos,
 
@@ -3667,6 +3971,67 @@ Si la pregunta no necesita conocimiento
 específico de Penaguillo, puedes responder
 normalmente utilizando tus capacidades.
 
+==============================
+CONTINUIDAD DE LA CONVERSACIÓN
+==============================
+
+Debes mantener continuidad con los mensajes
+anteriores de esta conversación.
+
+Los mensajes anteriores se proporcionan
+como mensajes reales de usuario y asistente.
+
+Cuando el usuario utilice expresiones como:
+
+- "eso"
+- "esa máquina"
+- "ese equipo"
+- "la anterior"
+- "el anterior"
+- "esa"
+- "ese"
+- "ellos"
+- "ellas"
+- "¿y cuánto pesa?"
+- "¿y cuánto cuesta?"
+- "¿y para qué sirve?"
+- "¿y cuál es mejor?"
+- "¿cuál de los dos?"
+- "¿cuál de esas?"
+- "¿y esa máquina?"
+
+debes utilizar el contexto anterior para
+determinar correctamente a qué se refiere.
+
+No trates cada mensaje como una pregunta
+completamente independiente.
+
+Si existe una referencia ambigua, utiliza
+el contexto de la conversación para resolverla.
+
+No inventes una referencia que no esté
+respaldada por la conversación o por el
+conocimiento proporcionado.
+
+==============================
+REGLAS DEL CONOCIMIENTO
+==============================
+
+La base de conocimiento puede contener
+información de productos, máquinas,
+documentos, imágenes, PDFs y conocimiento
+introducido manualmente.
+
+Utiliza la información relevante cuando
+corresponda.
+
+Si la base de conocimiento no contiene
+la información solicitada, dilo claramente.
+
+No inventes especificaciones técnicas,
+precios, pesos, capacidades, referencias
+o características de productos.
+
 """
 
             + "\n\n"
@@ -3682,8 +4047,53 @@ normalmente utilizando tus capacidades.
         )
 
 
+        # ====================================================
+        # CONSTRUIR MENSAJES PARA OPENROUTER
+        # ====================================================
+
+        messages = [
+
+            {
+
+                "role": "system",
+
+                "content": system_prompt,
+
+            }
+
+        ]
+
+
+        # ----------------------------------------------------
+        # AGREGAR HISTORIAL ANTERIOR
+        # ----------------------------------------------------
+
+        messages.extend(
+            historial
+        )
+
+
+        # ----------------------------------------------------
+        # AGREGAR MENSAJE ACTUAL
+        # ----------------------------------------------------
+
+        messages.append({
+
+            "role": "user",
+
+            "content": mensaje,
+
+        })
+
+
         print(
             "📤 Enviando pregunta a OpenRouter."
+        )
+
+
+        print(
+            "📨 Mensajes enviados: "
+            f"{len(messages)}"
         )
 
 
@@ -3693,29 +4103,15 @@ normalmente utilizando tus capacidades.
         )
 
 
+        # ====================================================
+        # LLAMAR A OPENROUTER
+        # ====================================================
+
         respuesta = generar_con_openrouter(
 
             model=CHAT_MODEL,
 
-            messages=[
-
-                {
-
-                    "role": "system",
-
-                    "content": system_prompt,
-
-                },
-
-                {
-
-                    "role": "user",
-
-                    "content": mensaje,
-
-                },
-
-            ],
+            messages=messages,
 
         )
 
@@ -3727,11 +4123,71 @@ normalmente utilizando tus capacidades.
         )
 
 
+        # ====================================================
+        # GUARDAR HISTORIAL
+        # ====================================================
+        #
+        # Solamente guardamos los mensajes después de recibir
+        # una respuesta correcta de OpenRouter.
+        #
+        # Si OpenRouter falla, la pregunta no se almacena
+        # como una conversación completada.
+        #
+        # ====================================================
+
+        guardar_mensaje_conversacion(
+
+            conversation_id,
+
+            "user",
+
+            mensaje,
+
+        )
+
+
+        guardar_mensaje_conversacion(
+
+            conversation_id,
+
+            "assistant",
+
+            contenido,
+
+        )
+
+
+        historial_actual = (
+            obtener_historial_conversacion(
+                conversation_id
+            )
+        )
+
+
+        print(
+            "💾 Mensaje guardado "
+            "en conversación."
+        )
+
+
+        print(
+            "📚 Historial actual: "
+            f"{len(historial_actual)} mensajes"
+        )
+
+
+        # ====================================================
+        # RESPUESTA
+        # ====================================================
+
         return {
 
             "ok": True,
 
             "response": contenido or "",
+
+            "conversation_id":
+                conversation_id,
 
         }
 
@@ -3765,9 +4221,14 @@ normalmente utilizando tus capacidades.
 
 
         if (
+
             "429" in texto_error
+
             or "RATE LIMIT" in texto_error
-            or "RESOURCE_EXHAUSTED" in texto_error
+
+            or "RESOURCE_EXHAUSTED"
+            in texto_error
+
         ):
 
             raise HTTPException(
@@ -3786,8 +4247,12 @@ normalmente utilizando tus capacidades.
 
 
         if (
+
             "503" in texto_error
-            or "UNAVAILABLE" in texto_error
+
+            or "UNAVAILABLE"
+            in texto_error
+
         ):
 
             raise HTTPException(
@@ -3812,6 +4277,7 @@ normalmente utilizando tus capacidades.
             detail=(
 
                 "Error consultando Penaguillo: "
+
                 f"{error}"
 
             ),
@@ -5224,6 +5690,12 @@ def startup_event():
 
 
     print(
+        "💬 MAX HISTORIAL: "
+        f"{MAX_HISTORIAL_MENSAJES} mensajes"
+    )
+
+
+    print(
         "🔑 OPENROUTER: "
         f"{'CONFIGURADO' if OPENROUTER_API_KEY else 'NO CONFIGURADO'}"
     )
@@ -5259,6 +5731,12 @@ def startup_event():
             "⚠️ No se pudo cargar "
             f"el conocimiento: {error}"
         )
+
+
+    print(
+        "💬 Conversaciones activas: "
+        f"{len(conversation_history)}"
+    )
 
 
     print(
