@@ -3707,7 +3707,7 @@ normalmente utilizando tus capacidades.
             }
         ]
         
-    # Agregar solamente el historial reciente
+   # Agregar solamente el historial reciente
     if data.history:
         historial_reciente = data.history[-10:]
 
