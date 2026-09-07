@@ -209,7 +209,7 @@ OPENROUTER_API_KEY = os.getenv(
 
 OPENROUTER_MODEL = os.getenv(
     "OPENROUTER_MODEL",
-    "google/gemini-2.0-flash-lite-preview-02-05:free",
+    "google/gemini-2.5-flash",
 )
 
 OPENROUTER_URL = (
@@ -396,7 +396,7 @@ def generar_con_openrouter(
 
         "messages": messages,
 
-        "max_tokens": 8000,
+        "max_tokens": 4000,
 
     }
 
