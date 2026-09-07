@@ -1,7 +1,11 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 5.4
+# VERSIÓN 5.5
+#
+# PROVEEDOR DE IA:
+# - OpenRouter
+# - Modelo configurable mediante OPENROUTER_MODEL
 #
 # FUNCIONES:
 # - Chat con Penaguillo
@@ -9,25 +13,23 @@
 # - Enseñar imágenes
 # - Enseñar PDF
 # - PDF con texto seleccionable -> PyMuPDF
-# - PDF escaneado -> Gemini Vision
-# - Imágenes -> Gemini Vision
+# - PDF escaneado -> OpenRouter Vision
+# - Imágenes -> OpenRouter Vision
 # - Persistencia local
 # - Google Drive como almacenamiento permanente en Render
 # - penaguillo.json como FUENTE MAESTRA de conocimiento
 # - Backups opcionales después de cada cambio
 # - Escritura atómica
+# - Búsqueda local por relevancia
 #
-# CORRECCIÓN V5.4:
+# CORRECCIÓN V5.5:
 #
-# - El chat YA NO envía todo penaguillo.json a Gemini.
-# - Se realiza una búsqueda local por relevancia.
-# - Solo los registros relacionados con la pregunta se envían
-#   a Gemini.
-# - Gemini sigue tomando la decisión final de la respuesta.
-# - Se mantiene Google Drive como almacenamiento maestro.
-# - Se mantiene Vision para imágenes y PDF escaneados.
-# - Se eliminan parámetros de sampling incompatibles con
-#   Gemini 3.6 Flash, especialmente temperature.
+# - Se reemplazó Gemini directo por OpenRouter.
+# - El chat utiliza OpenRouter.
+# - Las imágenes utilizan OpenRouter multimodal.
+# - Los PDF escaneados utilizan OpenRouter multimodal.
+# - El frontend NO necesita cambios.
+# - /chat mantiene el mismo formato de respuesta.
 # ============================================================
 
 
@@ -43,8 +45,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
 import fitz
+import requests
 
 from dotenv import load_dotenv
 
@@ -58,9 +60,6 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 
 from fastapi.staticfiles import StaticFiles
-
-from google import genai
-from google.genai import types
 
 from pydantic import BaseModel
 
@@ -204,68 +203,58 @@ load_dotenv(
 
 
 # ============================================================
-# GEMINI
+# OPENROUTER
 # ============================================================
 
-GEMINI_API_KEY = os.getenv(
-    "GEMINI_API_KEY"
+OPENROUTER_API_KEY = os.getenv(
+    "OPENROUTER_API_KEY"
 )
 
-if not GEMINI_API_KEY:
+OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "google/gemini-2.5-flash",
+)
+
+OPENROUTER_URL = (
+    "https://openrouter.ai/api/v1/chat/completions"
+)
+
+
+if not OPENROUTER_API_KEY:
 
     print(
-        "⚠️ ADVERTENCIA: GEMINI_API_KEY "
-        "no está configurada."
+        "⚠️ ADVERTENCIA: "
+        "OPENROUTER_API_KEY no está configurada."
     )
 
 else:
 
     print(
-        "🔑 GEMINI_API_KEY: configurada"
+        "🔑 OPENROUTER_API_KEY: configurada"
     )
 
 
-client = (
-    genai.Client(
-        api_key=GEMINI_API_KEY
-    )
-    if GEMINI_API_KEY
-    else None
-)
-
-
 # ============================================================
-# MODELOS GEMINI
+# MODELOS
 # ============================================================
 #
-# Gemini 3.6 Flash es estable y multimodal.
+# Chat y Vision utilizan el mismo modelo configurable.
 #
-# IMPORTANTE:
-# No usamos temperature porque Gemini 3.x no debe recibir
-# parámetros de sampling como temperature.
+# Ejemplo:
+#
+# OPENROUTER_MODEL=google/gemini-2.5-flash
+#
+# Si posteriormente quieres cambiar de modelo,
+# solamente modificas OPENROUTER_MODEL en Render.
 # ============================================================
 
-CHAT_MODEL = "gemini-3.6-flash"
+CHAT_MODEL = OPENROUTER_MODEL
 
-VISION_MODEL = "gemini-3.6-flash"
+VISION_MODEL = OPENROUTER_MODEL
 
 
 # ============================================================
 # CONFIGURACIÓN DEL RETRIEVAL LOCAL
-# ============================================================
-#
-# Estos valores controlan cuánto conocimiento se envía a Gemini.
-#
-# Antes:
-#
-#     TODO penaguillo.json
-#
-# Ahora:
-#
-#     TOP_K registros más relevantes.
-#
-# Además se limita el tamaño total para evitar enviar
-# documentos gigantescos.
 # ============================================================
 
 RELEVANCIA_TOP_K = 8
@@ -279,10 +268,6 @@ MAX_CHARS_CONOCIMIENTO_CHAT = (
 
 # ============================================================
 # STOPWORDS
-# ============================================================
-#
-# Palabras muy frecuentes que no ayudan demasiado a determinar
-# qué registro es relevante.
 # ============================================================
 
 STOPWORDS_ES = {
@@ -374,22 +359,49 @@ STOPWORDS_ES = {
 
 
 # ============================================================
-# RETRIES GEMINI
+# OPENROUTER — GENERAR RESPUESTA
 # ============================================================
 
-def generar_con_gemini(
+def generar_con_openrouter(
     *,
     model: str,
-    contents,
-    config,
+    messages: list,
     max_retries: int = 3,
 ):
 
-    if client is None:
+    if not OPENROUTER_API_KEY:
 
         raise RuntimeError(
-            "GEMINI_API_KEY no está configurada."
+            "OPENROUTER_API_KEY no está configurada."
         )
+
+
+    headers = {
+
+        "Authorization":
+            f"Bearer {OPENROUTER_API_KEY}",
+
+        "Content-Type":
+            "application/json",
+
+        "HTTP-Referer":
+            "https://penaguillo-1.onrender.com",
+
+        "X-Title":
+            "Penaguillo IA",
+
+    }
+
+
+    payload = {
+
+        "model": model,
+
+        "messages": messages,
+
+        "max_tokens": 8000,
+
+    }
 
 
     ultimo_error = None
@@ -406,20 +418,22 @@ def generar_con_gemini(
 
 
             print(
-                f"🤖 Gemini -> "
+                f"🤖 OpenRouter -> "
                 f"modelo={model}, "
                 f"intento={intento}/{max_retries}"
             )
 
 
-            respuesta = (
-                client
-                .models
-                .generate_content(
-                    model=model,
-                    contents=contents,
-                    config=config,
-                )
+            respuesta = requests.post(
+
+                OPENROUTER_URL,
+
+                headers=headers,
+
+                json=payload,
+
+                timeout=120,
+
             )
 
 
@@ -430,21 +444,47 @@ def generar_con_gemini(
 
 
             print(
-                f"✅ Gemini respondió "
+                f"🌐 OpenRouter HTTP: "
+                f"{respuesta.status_code}"
+            )
+
+
+            print(
+                f"⏱️ OpenRouter respondió "
                 f"en {duracion:.2f}s"
             )
 
 
-            return respuesta
+            if respuesta.status_code == 200:
+
+                try:
+
+                    datos = respuesta.json()
+
+                except ValueError as error:
+
+                    raise RuntimeError(
+                        "OpenRouter devolvió "
+                        "una respuesta que no es JSON."
+                    ) from error
 
 
-        except Exception as error:
+                return datos
 
-            ultimo_error = error
 
-            mensaje_error = str(
-                error
+            mensaje_error = (
+                respuesta.text[:3000]
             )
+
+
+            ultimo_error = RuntimeError(
+
+                "OpenRouter HTTP "
+                f"{respuesta.status_code}: "
+                f"{mensaje_error}"
+
+            )
+
 
             texto_error = (
                 mensaje_error.upper()
@@ -457,16 +497,15 @@ def generar_con_gemini(
 
                 for codigo in (
 
-                    "503",
-                    "UNAVAILABLE",
                     "429",
-                    "RESOURCE_EXHAUSTED",
                     "500",
-                    "INTERNAL",
                     "502",
-                    "BAD_GATEWAY",
+                    "503",
                     "504",
-                    "DEADLINE_EXCEEDED",
+                    "TIMEOUT",
+                    "UNAVAILABLE",
+                    "RATE LIMIT",
+                    "RESOURCE_EXHAUSTED",
 
                 )
 
@@ -474,9 +513,12 @@ def generar_con_gemini(
 
 
             print(
-                f"⚠️ Gemini falló "
-                f"en intento {intento}: "
-                f"{error}"
+                "⚠️ OpenRouter falló:"
+            )
+
+
+            print(
+                mensaje_error
             )
 
 
@@ -485,7 +527,7 @@ def generar_con_gemini(
                 or intento >= max_retries
             ):
 
-                raise
+                raise ultimo_error
 
 
             espera = (
@@ -505,7 +547,191 @@ def generar_con_gemini(
             )
 
 
-    raise ultimo_error
+        except requests.RequestException as error:
+
+            ultimo_error = error
+
+
+            print(
+                "⚠️ Error de conexión "
+                "con OpenRouter:"
+            )
+
+
+            print(
+                error
+            )
+
+
+            if intento >= max_retries:
+
+                raise RuntimeError(
+
+                    "No fue posible conectar "
+                    f"con OpenRouter: {error}"
+
+                ) from error
+
+
+            espera = (
+                2 ** intento
+            )
+
+
+            print(
+                f"⏳ Reintentando en "
+                f"{espera}s..."
+            )
+
+
+            time.sleep(
+                espera
+            )
+
+
+    if ultimo_error:
+
+        raise ultimo_error
+
+
+    raise RuntimeError(
+        "OpenRouter no pudo generar una respuesta."
+    )
+
+
+# ============================================================
+# OPENROUTER — EXTRAER CONTENIDO
+# ============================================================
+
+def extraer_contenido_openrouter(
+    respuesta: dict,
+) -> str:
+
+    if not respuesta:
+
+        raise RuntimeError(
+            "OpenRouter no devolvió respuesta."
+        )
+
+
+    choices = respuesta.get(
+        "choices",
+        [],
+    )
+
+
+    if not choices:
+
+        error_data = respuesta.get(
+            "error"
+        )
+
+
+        if error_data:
+
+            raise RuntimeError(
+                "OpenRouter devolvió un error: "
+                f"{error_data}"
+            )
+
+
+        raise RuntimeError(
+            "OpenRouter no devolvió ninguna opción."
+        )
+
+
+    primer_choice = choices[0]
+
+
+    if not isinstance(
+        primer_choice,
+        dict,
+    ):
+
+        raise RuntimeError(
+            "Respuesta inválida de OpenRouter."
+        )
+
+
+    mensaje = primer_choice.get(
+        "message",
+        {},
+    )
+
+
+    if not isinstance(
+        mensaje,
+        dict,
+    ):
+
+        raise RuntimeError(
+            "OpenRouter devolvió "
+            "un mensaje inválido."
+        )
+
+
+    contenido = mensaje.get(
+        "content"
+    )
+
+
+    if isinstance(
+        contenido,
+        str,
+    ):
+
+        if contenido.strip():
+
+            return contenido.strip()
+
+
+    if isinstance(
+        contenido,
+        list,
+    ):
+
+        partes = []
+
+
+        for parte in contenido:
+
+            if not isinstance(
+                parte,
+                dict,
+            ):
+
+                continue
+
+
+            texto = parte.get(
+                "text"
+            )
+
+
+            if texto:
+
+                partes.append(
+                    str(texto)
+                )
+
+
+        resultado = (
+            "\n".join(
+                partes
+            )
+            .strip()
+        )
+
+
+        if resultado:
+
+            return resultado
+
+
+    raise RuntimeError(
+        "OpenRouter no devolvió "
+        "contenido de texto."
+    )
 
 
 # ============================================================
@@ -554,6 +780,345 @@ DRIVE_FILES_FOLDER = None
 DRIVE_PDF_FOLDER = None
 DRIVE_IMAGES_FOLDER = None
 DRIVE_BACKUPS_FOLDER = None
+
+
+# ============================================================
+# UTILIDADES
+# ============================================================
+
+def ahora_iso() -> str:
+
+    return datetime.now().isoformat()
+
+
+def generar_id() -> str:
+
+    return str(
+        uuid.uuid4()
+    )
+
+
+def nombre_seguro(
+    nombre: str,
+) -> str:
+
+    nombre = Path(
+        nombre
+    ).name
+
+
+    nombre = re.sub(
+
+        r"[^a-zA-Z0-9._-]",
+
+        "_",
+
+        nombre,
+
+    )
+
+
+    return (
+
+        nombre
+
+        or
+
+        f"archivo_{generar_id()}"
+
+    )
+
+
+# ============================================================
+# GOOGLE DRIVE — BUSCAR ARCHIVO
+# ============================================================
+
+def buscar_archivo_drive(
+    nombre: str,
+    folder_id: str,
+    solo_json: bool = False,
+):
+
+    if not drive_service:
+
+        return None
+
+
+    nombre_escapado = (
+        nombre.replace(
+            "'",
+            "\\'",
+        )
+    )
+
+
+    query = (
+
+        f"name = '{nombre_escapado}'"
+
+        f" and '{folder_id}' in parents"
+
+        " and trashed = false"
+
+    )
+
+
+    if solo_json:
+
+        query += (
+            " and mimeType = 'application/json'"
+        )
+
+
+    try:
+
+        parametros = {
+
+            "q": query,
+
+            "spaces": "drive",
+
+            "includeItemsFromAllDrives": True,
+
+            "supportsAllDrives": True,
+
+            "fields": (
+                "files("
+                "id,"
+                "name,"
+                "mimeType,"
+                "size,"
+                "modifiedTime,"
+                "parents,"
+                "shortcutDetails"
+                ")"
+            ),
+
+            "pageSize": 100,
+
+            "orderBy": (
+                "modifiedTime desc"
+            ),
+
+        }
+
+
+        if DRIVE_SHARED_ID:
+
+            parametros["corpora"] = "drive"
+
+            parametros["driveId"] = (
+                DRIVE_SHARED_ID
+            )
+
+
+        resultado = (
+            drive_service
+            .files()
+            .list(
+                **parametros
+            )
+            .execute()
+        )
+
+
+        archivos = resultado.get(
+            "files",
+            [],
+        )
+
+
+        print(
+            "🔎 Búsqueda Drive:"
+        )
+
+
+        print(
+            f"   Nombre: {nombre}"
+        )
+
+
+        print(
+            f"   Carpeta: {folder_id}"
+        )
+
+
+        print(
+            f"   Solo JSON: {solo_json}"
+        )
+
+
+        print(
+            "   Resultados encontrados: "
+            f"{len(archivos)}"
+        )
+
+
+        if archivos:
+
+            archivo = archivos[0]
+
+
+            if archivo.get(
+                "mimeType"
+            ) == (
+                "application/vnd.google-apps.shortcut"
+            ):
+
+                print(
+                    "🛑 El archivo encontrado "
+                    "es un shortcut."
+                )
+
+                return None
+
+
+            if solo_json:
+
+                if archivo.get(
+                    "mimeType"
+                ) != "application/json":
+
+                    print(
+                        "🛑 El archivo encontrado "
+                        "no es application/json."
+                    )
+
+                    return None
+
+
+            print(
+                "🎯 Archivo seleccionado:"
+            )
+
+
+            print(
+                f"   ID = "
+                f"{archivo.get('id')}"
+            )
+
+
+            print(
+                f"   Nombre = "
+                f"{archivo.get('name')}"
+            )
+
+
+            print(
+                f"   MIME = "
+                f"{archivo.get('mimeType')}"
+            )
+
+
+            print(
+                f"   Tamaño = "
+                f"{archivo.get('size', 'N/D')} bytes"
+            )
+
+
+            return archivo
+
+
+        print(
+            "ℹ️ No se encontró el archivo."
+        )
+
+
+        return None
+
+
+    except Exception as error:
+
+        print(
+            "❌ Error buscando archivo "
+            "en Drive:"
+        )
+
+
+        print(
+            error
+        )
+
+
+        return None
+
+
+# ============================================================
+# GOOGLE DRIVE — CREAR CARPETA
+# ============================================================
+
+def obtener_o_crear_carpeta(
+    nombre: str,
+    parent_id: str,
+):
+
+    existente = buscar_archivo_drive(
+        nombre,
+        parent_id,
+    )
+
+
+    if existente:
+
+        mime_type = existente.get(
+            "mimeType"
+        )
+
+
+        if mime_type == (
+            "application/vnd.google-apps.folder"
+        ):
+
+            print(
+                f"📁 Carpeta existente: "
+                f"{nombre}"
+            )
+
+            return existente["id"]
+
+
+    metadata = {
+
+        "name": nombre,
+
+        "mimeType": (
+            "application/vnd.google-apps.folder"
+        ),
+
+        "parents": [
+            parent_id
+        ],
+
+    }
+
+
+    archivo = (
+        drive_service
+        .files()
+        .create(
+
+            body=metadata,
+
+            fields=(
+                "id,"
+                "name,"
+                "mimeType,"
+                "parents"
+            ),
+
+            supportsAllDrives=True,
+
+        )
+        .execute()
+    )
+
+
+    print(
+        f"📁 Carpeta Drive creada: {nombre}"
+    )
+
+
+    return archivo["id"]
 
 
 # ============================================================
@@ -867,295 +1432,9 @@ def inicializar_google_drive():
             "Google Drive:"
         )
 
-        print(error)
-
-
-# ============================================================
-# GOOGLE DRIVE — BUSCAR ARCHIVO
-# ============================================================
-
-def buscar_archivo_drive(
-    nombre: str,
-    folder_id: str,
-    solo_json: bool = False,
-):
-
-    if not drive_service:
-
-        return None
-
-
-    nombre_escapado = (
-        nombre.replace(
-            "'",
-            "\\'",
-        )
-    )
-
-
-    query = (
-
-        f"name = '{nombre_escapado}'"
-
-        f" and '{folder_id}' in parents"
-
-        " and trashed = false"
-
-    )
-
-
-    if solo_json:
-
-        query += (
-            " and mimeType = 'application/json'"
-        )
-
-
-    try:
-
-        parametros = {
-
-            "q": query,
-
-            "spaces": "drive",
-
-            "includeItemsFromAllDrives": True,
-
-            "supportsAllDrives": True,
-
-            "fields": (
-                "files("
-                "id,"
-                "name,"
-                "mimeType,"
-                "size,"
-                "modifiedTime,"
-                "parents,"
-                "shortcutDetails"
-                ")"
-            ),
-
-            "pageSize": 100,
-
-            "orderBy": (
-                "modifiedTime desc"
-            ),
-
-        }
-
-
-        if DRIVE_SHARED_ID:
-
-            parametros["corpora"] = "drive"
-
-            parametros["driveId"] = (
-                DRIVE_SHARED_ID
-            )
-
-
-        resultado = (
-            drive_service
-            .files()
-            .list(
-                **parametros
-            )
-            .execute()
-        )
-
-
-        archivos = resultado.get(
-            "files",
-            [],
-        )
-
-
         print(
-            "🔎 Búsqueda Drive:"
+            error
         )
-
-
-        print(
-            f"   Nombre: {nombre}"
-        )
-
-
-        print(
-            f"   Carpeta: {folder_id}"
-        )
-
-
-        print(
-            f"   Solo JSON: {solo_json}"
-        )
-
-
-        print(
-            "   Resultados encontrados: "
-            f"{len(archivos)}"
-        )
-
-
-        if archivos:
-
-            archivo = archivos[0]
-
-
-            if archivo.get(
-                "mimeType"
-            ) == (
-                "application/vnd.google-apps.shortcut"
-            ):
-
-                print(
-                    "🛑 El archivo encontrado "
-                    "es un shortcut."
-                )
-
-                return None
-
-
-            if solo_json:
-
-                if archivo.get(
-                    "mimeType"
-                ) != "application/json":
-
-                    print(
-                        "🛑 El archivo encontrado "
-                        "no es application/json."
-                    )
-
-                    return None
-
-
-            print(
-                "🎯 Archivo seleccionado:"
-            )
-
-
-            print(
-                f"   ID = "
-                f"{archivo.get('id')}"
-            )
-
-
-            print(
-                f"   Nombre = "
-                f"{archivo.get('name')}"
-            )
-
-
-            print(
-                f"   MIME = "
-                f"{archivo.get('mimeType')}"
-            )
-
-
-            print(
-                f"   Tamaño = "
-                f"{archivo.get('size', 'N/D')} bytes"
-            )
-
-
-            return archivo
-
-
-        print(
-            "ℹ️ No se encontró el archivo."
-        )
-
-
-        return None
-
-
-    except Exception as error:
-
-        print(
-            "❌ Error buscando archivo "
-            "en Drive:"
-        )
-
-        print(error)
-
-        return None
-
-
-# ============================================================
-# GOOGLE DRIVE — CREAR CARPETA
-# ============================================================
-
-def obtener_o_crear_carpeta(
-    nombre: str,
-    parent_id: str,
-):
-
-    existente = buscar_archivo_drive(
-        nombre,
-        parent_id,
-    )
-
-
-    if existente:
-
-        mime_type = existente.get(
-            "mimeType"
-        )
-
-
-        if mime_type == (
-            "application/vnd.google-apps.folder"
-        ):
-
-            print(
-                f"📁 Carpeta existente: "
-                f"{nombre}"
-            )
-
-            return existente["id"]
-
-
-    metadata = {
-
-        "name": nombre,
-
-        "mimeType": (
-            "application/vnd.google-apps.folder"
-        ),
-
-        "parents": [
-            parent_id
-        ],
-
-    }
-
-
-    archivo = (
-        drive_service
-        .files()
-        .create(
-
-            body=metadata,
-
-            fields=(
-                "id,"
-                "name,"
-                "mimeType,"
-                "parents"
-            ),
-
-            supportsAllDrives=True,
-
-        )
-        .execute()
-    )
-
-
-    print(
-        f"📁 Carpeta Drive creada: {nombre}"
-    )
-
-
-    return archivo["id"]
 
 
 # ============================================================
@@ -1360,7 +1639,9 @@ def subir_archivo_drive(
             "a Drive:"
         )
 
-        print(error)
+        print(
+            error
+        )
 
         return None
 
@@ -1642,7 +1923,9 @@ def descargar_archivo_drive(
                     "🛑 JSON maestro inválido:"
                 )
 
-                print(error)
+                print(
+                    error
+                )
 
                 return False
 
@@ -1719,7 +2002,9 @@ def descargar_archivo_drive(
             "desde Drive:"
         )
 
-        print(error)
+        print(
+            error
+        )
 
         return False
 
@@ -2022,7 +2307,9 @@ def sincronizar_conocimiento_desde_drive():
             "conocimiento desde Drive:"
         )
 
-        print(error)
+        print(
+            error
+        )
 
 
 # ============================================================
@@ -2166,7 +2453,7 @@ app = FastAPI(
 
     title="Penaguillo IA",
 
-    version="5.4.0",
+    version="5.5.0",
 
     description=(
         "Backend del asistente inteligente Penaguillo"
@@ -2270,53 +2557,6 @@ class EnsenarRequest(BaseModel):
 class EliminarRequest(BaseModel):
 
     id: str
-
-
-# ============================================================
-# UTILIDADES
-# ============================================================
-
-def ahora_iso() -> str:
-
-    return datetime.now().isoformat()
-
-
-def generar_id() -> str:
-
-    return str(
-        uuid.uuid4()
-    )
-
-
-def nombre_seguro(
-    nombre: str,
-) -> str:
-
-    nombre = Path(
-        nombre
-    ).name
-
-
-    nombre = re.sub(
-
-        r"[^a-zA-Z0-9._-]",
-
-        "_",
-
-        nombre,
-
-    )
-
-
-    return (
-
-        nombre
-
-        or
-
-        f"archivo_{generar_id()}"
-
-    )
 
 
 # ============================================================
@@ -2608,9 +2848,12 @@ def calcular_relevancia(
 
 
     if (
+
         cantidad_coincidentes
         == len(palabras)
+
         and palabras
+
     ):
 
         puntuacion += 15
@@ -2720,7 +2963,6 @@ def buscar_conocimiento_relevante(
                 f"(score={puntuacion:.1f})"
 
             )
-
 
     else:
 
@@ -2840,8 +3082,11 @@ DESCRIPCIÓN:
             if restante > 500:
 
                 bloque_recortado = (
+
                     bloque[:restante]
+
                     + "\n[CONTEXTO RECORTADO]"
+
                 )
 
 
@@ -2867,6 +3112,7 @@ DESCRIPCIÓN:
 
         "\n\n"
         "==============================\n\n"
+
     ).join(
         bloques
     )
@@ -3281,7 +3527,9 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "5.4.0",
+        "version": "5.5.0",
+
+        "provider": "OpenRouter",
 
         "chat_model": CHAT_MODEL,
 
@@ -3299,6 +3547,10 @@ def root():
 
         "max_context_chars": (
             MAX_CHARS_CONOCIMIENTO_CHAT
+        ),
+
+        "openrouter": (
+            bool(OPENROUTER_API_KEY)
         ),
 
         "google_drive": (
@@ -3341,14 +3593,14 @@ def chat(
         )
 
 
-    if client is None:
+    if not OPENROUTER_API_KEY:
 
         raise HTTPException(
 
             status_code=500,
 
             detail=(
-                "GEMINI_API_KEY "
+                "OPENROUTER_API_KEY "
                 "no está configurada."
             ),
 
@@ -3363,11 +3615,7 @@ def chat(
 
 
         # ====================================================
-        # IMPORTANTE:
-        #
-        # YA NO construimos TODO el JSON.
-        #
-        # Primero buscamos los registros relevantes.
+        # BUSCAR SOLO CONOCIMIENTO RELEVANTE
         # ====================================================
 
         conocimiento_relevante = (
@@ -3380,6 +3628,10 @@ def chat(
             )
         )
 
+
+        # ====================================================
+        # SYSTEM PROMPT
+        # ====================================================
 
         system_prompt = (
 
@@ -3431,7 +3683,7 @@ normalmente utilizando tus capacidades.
 
 
         print(
-            "📤 Enviando pregunta a Gemini."
+            "📤 Enviando pregunta a OpenRouter."
         )
 
 
@@ -3441,23 +3693,35 @@ normalmente utilizando tus capacidades.
         )
 
 
-        respuesta = generar_con_gemini(
+        respuesta = generar_con_openrouter(
 
             model=CHAT_MODEL,
 
-            contents=mensaje,
+            messages=[
 
-            config=types.GenerateContentConfig(
+                {
 
-                system_instruction=system_prompt,
+                    "role": "system",
 
-            ),
+                    "content": system_prompt,
+
+                },
+
+                {
+
+                    "role": "user",
+
+                    "content": mensaje,
+
+                },
+
+            ],
 
         )
 
 
         contenido = (
-            extraer_contenido_respuesta(
+            extraer_contenido_openrouter(
                 respuesta
             )
         )
@@ -3501,6 +3765,27 @@ normalmente utilizando tus capacidades.
 
 
         if (
+            "429" in texto_error
+            or "RATE LIMIT" in texto_error
+            or "RESOURCE_EXHAUSTED" in texto_error
+        ):
+
+            raise HTTPException(
+
+                status_code=429,
+
+                detail=(
+
+                    "OpenRouter alcanzó "
+                    "un límite temporal. "
+                    "Intenta nuevamente."
+
+                ),
+
+            )
+
+
+        if (
             "503" in texto_error
             or "UNAVAILABLE" in texto_error
         ):
@@ -3511,31 +3796,9 @@ normalmente utilizando tus capacidades.
 
                 detail=(
 
-                    "Gemini está temporalmente "
-                    "saturado. Penaguillo reintentó "
-                    "automáticamente y no pudo "
-                    "completar la consulta."
-
-                ),
-
-            )
-
-
-        if (
-            "429" in texto_error
-            or "RESOURCE_EXHAUSTED"
-            in texto_error
-        ):
-
-            raise HTTPException(
-
-                status_code=429,
-
-                detail=(
-
-                    "Se alcanzó temporalmente "
-                    "el límite de Gemini. "
-                    "Intenta nuevamente."
+                    "El proveedor de IA "
+                    "está temporalmente "
+                    "no disponible."
 
                 ),
 
@@ -3547,8 +3810,10 @@ normalmente utilizando tus capacidades.
             status_code=500,
 
             detail=(
+
                 "Error consultando Penaguillo: "
                 f"{error}"
+
             ),
 
         )
@@ -3578,8 +3843,10 @@ def ensenar(
             status_code=400,
 
             detail=(
+
                 "El conocimiento "
                 "no puede estar vacío."
+
             ),
 
         )
@@ -3710,101 +3977,6 @@ def mime_imagen(
 
 
 # ============================================================
-# EXTRAER RESPUESTA GEMINI
-# ============================================================
-
-def extraer_contenido_respuesta(
-    respuesta,
-) -> str:
-
-    if respuesta is None:
-
-        raise RuntimeError(
-            "El proveedor de IA "
-            "no devolvió respuesta."
-        )
-
-
-    contenido = getattr(
-        respuesta,
-        "text",
-        None,
-    )
-
-
-    if (
-        isinstance(
-            contenido,
-            str,
-        )
-        and contenido.strip()
-    ):
-
-        return contenido.strip()
-
-
-    partes = []
-
-
-    for candidate in (
-        getattr(
-            respuesta,
-            "candidates",
-            None,
-        )
-        or []
-    ):
-
-        content = getattr(
-            candidate,
-            "content",
-            None,
-        )
-
-
-        for part in (
-            getattr(
-                content,
-                "parts",
-                None,
-            )
-            or []
-        ):
-
-            texto = getattr(
-                part,
-                "text",
-                None,
-            )
-
-
-            if texto:
-
-                partes.append(
-                    str(texto)
-                )
-
-
-    resultado = (
-        "\n".join(
-            partes
-        )
-        .strip()
-    )
-
-
-    if resultado:
-
-        return resultado
-
-
-    raise RuntimeError(
-        "El proveedor de IA "
-        "no devolvió contenido de texto."
-    )
-
-
-# ============================================================
 # VISION — IMAGEN
 # ============================================================
 
@@ -3813,18 +3985,30 @@ def analizar_imagen_con_vision(
     contexto: str = "",
 ) -> str:
 
-    if client is None:
+    if not OPENROUTER_API_KEY:
 
         raise RuntimeError(
-            "GEMINI_API_KEY "
+
+            "OPENROUTER_API_KEY "
             "no está configurada."
+
         )
 
 
     imagen_bytes = ruta.read_bytes()
 
+
     mime = mime_imagen(
         ruta
+    )
+
+
+    imagen_base64 = (
+        base64.b64encode(
+            imagen_bytes
+        ).decode(
+            "utf-8"
+        )
     )
 
 
@@ -3867,35 +4051,51 @@ Devuelve una descripción estructurada y detallada.
 
     try:
 
-        respuesta = generar_con_gemini(
+        respuesta = generar_con_openrouter(
 
             model=VISION_MODEL,
 
-            contents=[
+            messages=[
 
-                types.Part.from_bytes(
+                {
 
-                    data=imagen_bytes,
+                    "role": "user",
 
-                    mime_type=mime,
+                    "content": [
 
-                ),
+                        {
 
-                prompt,
+                            "type": "text",
+
+                            "text": prompt,
+
+                        },
+
+                        {
+
+                            "type": "image_url",
+
+                            "image_url": {
+
+                                "url":
+                                f"data:{mime};base64,"
+                                f"{imagen_base64}",
+
+                            },
+
+                        },
+
+                    ],
+
+                }
 
             ],
-
-            config=types.GenerateContentConfig(
-
-                max_output_tokens=8000,
-
-            ),
 
         )
 
 
         return (
-            extraer_contenido_respuesta(
+            extraer_contenido_openrouter(
                 respuesta
             )
         )
@@ -3904,7 +4104,8 @@ Devuelve una descripción estructurada y detallada.
     except Exception as error:
 
         print(
-            f"❌ Error Gemini Vision: {error}"
+            f"❌ Error OpenRouter Vision: "
+            f"{error}"
         )
 
 
@@ -3913,7 +4114,7 @@ Devuelve una descripción estructurada y detallada.
             "No fue posible analizar "
             f"la imagen: {error}"
 
-        )
+        ) from error
 
 
 # ============================================================
@@ -4121,20 +4322,22 @@ async def ensenar_imagen(
             status_code=500,
 
             detail=(
+
                 "Error procesando imagen: "
                 f"{error}"
+
             ),
 
         )
 
 
 # ============================================================
-# PDF — CONVERTIR PÁGINA A IMAGEN
+# PDF — CONVERTIR PÁGINA A BYTES PNG
 # ============================================================
 
-def pdf_a_imagen_base64(
+def pdf_a_imagen_bytes(
     pagina: fitz.Page,
-) -> str:
+) -> bytes:
 
     matriz = fitz.Matrix(
         1.5,
@@ -4151,20 +4354,13 @@ def pdf_a_imagen_base64(
     )
 
 
-    imagen_bytes = (
-        pixmap.tobytes("png")
-    )
-
-
-    return base64.b64encode(
-        imagen_bytes
-    ).decode(
-        "utf-8"
+    return pixmap.tobytes(
+        "png"
     )
 
 
 # ============================================================
-# PDF — VISION
+# PDF — VISION CON OPENROUTER
 # ============================================================
 
 def analizar_pagina_pdf_con_vision(
@@ -4172,24 +4368,28 @@ def analizar_pagina_pdf_con_vision(
     numero_pagina: int,
 ) -> str:
 
-    if client is None:
+    if not OPENROUTER_API_KEY:
 
         raise RuntimeError(
-            "GEMINI_API_KEY "
+
+            "OPENROUTER_API_KEY "
             "no está configurada."
+
         )
 
 
-    imagen_base64 = (
-        pdf_a_imagen_base64(
+    imagen_bytes = (
+        pdf_a_imagen_bytes(
             pagina
         )
     )
 
 
-    imagen_bytes = (
-        base64.b64decode(
-            imagen_base64
+    imagen_base64 = (
+        base64.b64encode(
+            imagen_bytes
+        ).decode(
+            "utf-8"
         )
     )
 
@@ -4230,35 +4430,51 @@ en texto estructurado.
 
     try:
 
-        respuesta = generar_con_gemini(
+        respuesta = generar_con_openrouter(
 
             model=VISION_MODEL,
 
-            contents=[
+            messages=[
 
-                types.Part.from_bytes(
+                {
 
-                    data=imagen_bytes,
+                    "role": "user",
 
-                    mime_type="image/png",
+                    "content": [
 
-                ),
+                        {
 
-                prompt,
+                            "type": "text",
+
+                            "text": prompt,
+
+                        },
+
+                        {
+
+                            "type": "image_url",
+
+                            "image_url": {
+
+                                "url":
+                                "data:image/png;base64,"
+                                f"{imagen_base64}",
+
+                            },
+
+                        },
+
+                    ],
+
+                }
 
             ],
-
-            config=types.GenerateContentConfig(
-
-                max_output_tokens=8000,
-
-            ),
 
         )
 
 
         return (
-            extraer_contenido_respuesta(
+            extraer_contenido_openrouter(
                 respuesta
             )
         )
@@ -4271,7 +4487,7 @@ en texto estructurado.
             f"Error analizando página "
             f"{numero_pagina}: {error}"
 
-        )
+        ) from error
 
 
 # ============================================================
@@ -4362,8 +4578,10 @@ async def ensenar_pdf(
             status_code=400,
 
             detail=(
+
                 "El PDF supera "
                 "el límite de 50 MB."
+
             ),
 
         )
@@ -4546,12 +4764,16 @@ async def ensenar_pdf(
             "contenido": contenido_final,
 
             "descripcion": (
+
                 "Documento PDF procesado "
                 "por Penaguillo."
+
             ),
 
             "archivo": (
+
                 f"/archivos/pdf/{nombre}"
+
             ),
 
             "nombre_archivo": nombre_original,
@@ -4678,8 +4900,10 @@ async def ensenar_pdf(
             status_code=500,
 
             detail=(
+
                 "Error procesando PDF: "
                 f"{error}"
+
             ),
 
         )
@@ -4769,8 +4993,10 @@ def eliminar_conocimiento(
                 status_code=404,
 
                 detail=(
+
                     "No se encontró "
                     "ese conocimiento."
+
                 ),
 
             )
@@ -4836,13 +5062,17 @@ def eliminar_conocimiento(
             if ruta_archivo.exists():
 
                 try:
+
                     ruta_archivo.unlink()
+
                 except OSError as error:
 
                     print(
+
                         "⚠️ No se pudo "
                         "eliminar archivo: "
                         f"{error}"
+
                     )
 
 
@@ -4851,8 +5081,10 @@ def eliminar_conocimiento(
             "ok": True,
 
             "mensaje": (
+
                 "Conocimiento eliminado "
                 "correctamente."
+
             ),
 
             "eliminado": encontrado,
@@ -4962,6 +5194,12 @@ def startup_event():
 
 
     print(
+        "🤖 PROVEEDOR IA: "
+        "OpenRouter"
+    )
+
+
+    print(
         "🤖 CHAT_MODEL: "
         f"{CHAT_MODEL}"
     )
@@ -4982,6 +5220,12 @@ def startup_event():
     print(
         "📦 MAX CONTEXT: "
         f"{MAX_KB_CONOCIMIENTO_CHAT} KB"
+    )
+
+
+    print(
+        "🔑 OPENROUTER: "
+        f"{'CONFIGURADO' if OPENROUTER_API_KEY else 'NO CONFIGURADO'}"
     )
 
 
