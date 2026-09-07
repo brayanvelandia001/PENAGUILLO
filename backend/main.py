@@ -9,8 +9,8 @@
 # - Enseñar imágenes
 # - Enseñar PDF
 # - PDF con texto seleccionable -> PyMuPDF
-# - PDF escaneado -> OpenRouter Vision
-# - Imágenes -> OpenRouter Vision
+# - PDF escaneado -> Gemini Vision
+# - Imágenes -> Gemini Vision
 # - Persistencia local
 # - Google Drive como almacenamiento permanente en Render
 # - penaguillo.json como FUENTE MAESTRA de conocimiento
@@ -69,7 +69,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from fastapi.staticfiles import StaticFiles
 
-from openai import OpenAI
+from google import genai
+from google.genai import types
 
 from pydantic import BaseModel
 
@@ -213,39 +214,34 @@ load_dotenv(
 
 
 # ============================================================
-# OPENROUTER
+# GOOGLE GEMINI
 # ============================================================
 
-OPENROUTER_API_KEY = os.getenv(
-    "OPENROUTER_API_KEY"
+# Preferimos GEMINI_API_KEY.
+# También aceptamos OPENROUTER_API_KEY como compatibilidad temporal
+# para que puedas dejar el mismo nombre de variable en Render.
+GEMINI_API_KEY = (
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("OPENROUTER_API_KEY")
 )
 
-if not OPENROUTER_API_KEY:
-
+if not GEMINI_API_KEY:
     print(
         "⚠️ ADVERTENCIA: "
-        "No se encontró OPENROUTER_API_KEY."
+        "No se encontró GEMINI_API_KEY "
+        "ni OPENROUTER_API_KEY."
     )
 
-
-client = OpenAI(
-
-    base_url=(
-        "https://openrouter.ai/api/v1"
-    ),
-
-    api_key=OPENROUTER_API_KEY,
-
+client = (
+    genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+    if GEMINI_API_KEY
+    else None
 )
 
-
-CHAT_MODEL = (
-    "openai/gpt-oss-20b"
-)
-
-VISION_MODEL = (
-    "openrouter/free"
-)
+CHAT_MODEL = "gemini-2.5-flash"
+VISION_MODEL = "gemini-2.5-flash"
 
 
 # ============================================================
@@ -3354,152 +3350,58 @@ def root():
 
 @app.post("/chat")
 def chat(
-
     data: ChatRequest,
-
 ):
-
-    mensaje = (
-        data.message
-        .strip()
-    )
-
+    mensaje = data.message.strip()
 
     if not mensaje:
-
         raise HTTPException(
-
             status_code=400,
-
-            detail=(
-                "El mensaje no puede "
-                "estar vacío."
-            ),
-
+            detail="El mensaje no puede estar vacío.",
         )
-
 
     try:
-
-        conocimiento = (
-            construir_conocimiento()
-        )
-
-
+        conocimiento = construir_conocimiento()
     except RuntimeError as error:
-
-        raise HTTPException(
-
-            status_code=500,
-
-            detail=str(error),
-
-        )
-
+        raise HTTPException(status_code=500, detail=str(error))
 
     system_prompt = (
-
         SYSTEM_PROMPT_BASE
-
         + "\n\n"
-
         + "==============================\n"
-
-        + "BASE DE CONOCIMIENTO "
-          "DE PENAGUILLO\n"
-
+        + "BASE DE CONOCIMIENTO DE PENAGUILLO\n"
         + "==============================\n"
-
         + conocimiento
-
     )
 
+    if client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY no está configurada.",
+        )
 
     try:
-
-        respuesta = (
-
-            client
-
-            .chat
-
-            .completions
-
-            .create(
-
-                model=CHAT_MODEL,
-
-                messages=[
-
-                    {
-
-                        "role": "system",
-
-                        "content": (
-                            system_prompt
-                        ),
-
-                    },
-
-                    {
-
-                        "role": "user",
-
-                        "content": mensaje,
-
-                    },
-
-                ],
-
+        respuesta = client.models.generate_content(
+            model=CHAT_MODEL,
+            contents=mensaje,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
                 temperature=0.2,
-
-            )
-
+            ),
         )
 
-
-        contenido = (
-
-            respuesta
-
-            .choices[0]
-
-            .message
-
-            .content
-
-        )
-
+        contenido = extraer_contenido_respuesta(respuesta)
 
         return {
-
             "ok": True,
-
-            "response": (
-
-                contenido or ""
-
-            ),
-
+            "response": contenido or "",
         }
 
-
     except Exception as error:
-
-        print(
-            f"❌ Error en /chat: {error}"
-        )
-
-
+        print(f"❌ Error en /chat: {error}")
         raise HTTPException(
-
             status_code=500,
-
-            detail=(
-                "Error consultando "
-                f"Penaguillo: {error}"
-            ),
-
+            detail=f"Error consultando Penaguillo: {error}",
         )
 
 
@@ -3672,145 +3574,32 @@ def mime_imagen(
 
 
 # ============================================================
-# EXTRAER CONTENIDO OPENROUTER
+# EXTRAER CONTENIDO GEMINI
 # ============================================================
 
 def extraer_contenido_respuesta(
     respuesta,
 ) -> str:
-
     if respuesta is None:
+        raise RuntimeError("El proveedor de IA no devolvió respuesta.")
 
-        raise RuntimeError(
-            "El proveedor de IA "
-            "no devolvió respuesta."
-        )
+    contenido = getattr(respuesta, "text", None)
+    if isinstance(contenido, str) and contenido.strip():
+        return contenido.strip()
 
-
-    choices = getattr(
-
-        respuesta,
-
-        "choices",
-
-        None,
-
-    )
-
-
-    if not choices:
-
-        raise RuntimeError(
-            "El proveedor de IA "
-            "no devolvió choices."
-        )
-
-
-    choice = choices[0]
-
-
-    message = getattr(
-
-        choice,
-
-        "message",
-
-        None,
-
-    )
-
-
-    if message is None:
-
-        raise RuntimeError(
-            "El proveedor de IA "
-            "no devolvió message."
-        )
-
-
-    content = getattr(
-
-        message,
-
-        "content",
-
-        None,
-
-    )
-
-
-    if isinstance(
-
-        content,
-
-        str,
-
-    ):
-
-        contenido = content.strip()
-
-
-        if contenido:
-
-            return contenido
-
-
-    if isinstance(
-
-        content,
-
-        list,
-
-    ):
-
-        partes = []
-
-
-        for bloque in content:
-
-            if isinstance(
-
-                bloque,
-
-                dict,
-
-            ):
-
-                texto = bloque.get(
-                    "text"
-                )
-
-            else:
-
-                texto = getattr(
-                    bloque,
-                    "text",
-                    None,
-                )
-
-
+    partes = []
+    for candidate in getattr(respuesta, "candidates", None) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            texto = getattr(part, "text", None)
             if texto:
+                partes.append(str(texto))
 
-                partes.append(
-                    str(texto)
-                )
+    resultado = "\n".join(partes).strip()
+    if resultado:
+        return resultado
 
-
-        resultado = (
-            "\n".join(partes)
-            .strip()
-        )
-
-
-        if resultado:
-
-            return resultado
-
-
-    raise RuntimeError(
-        "El proveedor de IA "
-        "no devolvió contenido de texto."
-    )
+    raise RuntimeError("El proveedor de IA no devolvió contenido de texto.")
 
 
 # ============================================================
@@ -3818,35 +3607,16 @@ def extraer_contenido_respuesta(
 # ============================================================
 
 def analizar_imagen_con_vision(
-
     ruta: Path,
-
     contexto: str = "",
-
 ) -> str:
+    if client is None:
+        raise RuntimeError("GEMINI_API_KEY no está configurada.")
 
-    if not OPENROUTER_API_KEY:
-
-        raise RuntimeError(
-
-            "No existe "
-            "OPENROUTER_API_KEY."
-
-        )
-
-
-    imagen_base64 = (
-        imagen_a_base64(ruta)
-    )
-
-
-    mime = (
-        mime_imagen(ruta)
-    )
-
+    imagen_bytes = ruta.read_bytes()
+    mime = mime_imagen(ruta)
 
     prompt = f"""
-
 Analiza cuidadosamente esta imagen para alimentar la base de
 conocimiento de Penaguillo.
 
@@ -3854,7 +3624,6 @@ Tu respuesta debe ser útil para una empresa de maquinaria agrícola
 y de procesamiento de café.
 
 Identifica cuando sea posible:
-
 - Qué aparece en la imagen.
 - Equipos o máquinas.
 - Nombre o referencia visible.
@@ -3870,97 +3639,34 @@ Identifica cuando sea posible:
 - Cualquier información relevante para Penagos.
 
 Si hay texto en la imagen, transcríbelo de forma clara.
-
 NO inventes información que no puedas observar.
 
 Contexto proporcionado por el usuario:
 {contexto}
 
 Devuelve una descripción estructurada y detallada.
-
 """
 
-
     try:
-
-        respuesta = (
-
-            client
-
-            .chat
-
-            .completions
-
-            .create(
-
-                model=VISION_MODEL,
-
-                messages=[
-
-                    {
-
-                        "role": "user",
-
-                        "content": [
-
-                            {
-
-                                "type": "text",
-
-                                "text": prompt,
-
-                            },
-
-                            {
-
-                                "type": "image_url",
-
-                                "image_url": {
-
-                                    "url": (
-
-                                        f"data:{mime};"
-                                        f"base64,"
-                                        f"{imagen_base64}"
-
-                                    )
-
-                                },
-
-                            },
-
-                        ],
-
-                    }
-
-                ],
-
+        respuesta = client.models.generate_content(
+            model=VISION_MODEL,
+            contents=[
+                types.Part.from_bytes(
+                    data=imagen_bytes,
+                    mime_type=mime,
+                ),
+                prompt,
+            ],
+            config=types.GenerateContentConfig(
                 temperature=0.1,
-
-                max_tokens=8000,
-
-            )
-
+                max_output_tokens=8000,
+            ),
         )
-
-
-        return extraer_contenido_respuesta(
-            respuesta
-        )
-
-
+        return extraer_contenido_respuesta(respuesta)
     except Exception as error:
-
-        print(
-            f"❌ Error Vision: {error}"
-        )
-
-
+        print(f"❌ Error Gemini Vision: {error}")
         raise RuntimeError(
-
-            "No fue posible analizar "
-            f"la imagen: {error}"
-
+            f"No fue posible analizar la imagen: {error}"
         )
 
 
@@ -4260,42 +3966,22 @@ def pdf_a_imagen_base64(
 # ============================================================
 
 def analizar_pagina_pdf_con_vision(
-
     pagina: fitz.Page,
-
     numero_pagina: int,
-
 ) -> str:
+    if client is None:
+        raise RuntimeError("GEMINI_API_KEY no está configurada.")
 
-    if not OPENROUTER_API_KEY:
-
-        raise RuntimeError(
-
-            "No existe OPENROUTER_API_KEY."
-
-        )
-
-
-    imagen_base64 = (
-
-        pdf_a_imagen_base64(
-
-            pagina
-
-        )
-
-    )
-
+    imagen_base64 = pdf_a_imagen_base64(pagina)
+    imagen_bytes = base64.b64decode(imagen_base64)
 
     prompt = f"""
-
 Analiza esta página de un PDF para alimentar la base de conocimiento
 de Penaguillo.
 
 Es la página {numero_pagina}.
 
 Extrae cuidadosamente:
-
 - Todo texto legible.
 - Títulos.
 - Subtítulos.
@@ -4307,96 +3993,32 @@ Extrae cuidadosamente:
 - Procesos.
 - Datos importantes.
 - Información comercial.
-- Información relacionada con maquinaria agrícola,
-  café o Penagos.
+- Información relacionada con maquinaria agrícola, café o Penagos.
 
 Si existe una tabla, intenta conservar su estructura.
-
 No inventes información.
-
 Devuelve todo lo útil de esta página en texto estructurado.
-
 """
 
-
     try:
-
-        respuesta = (
-
-            client
-
-            .chat
-
-            .completions
-
-            .create(
-
-                model=VISION_MODEL,
-
-                messages=[
-
-                    {
-
-                        "role": "user",
-
-                        "content": [
-
-                            {
-
-                                "type": "text",
-
-                                "text": prompt,
-
-                            },
-
-                            {
-
-                                "type": "image_url",
-
-                                "image_url": {
-
-                                    "url": (
-
-                                        "data:image/png;"
-                                        "base64,"
-                                        + imagen_base64
-
-                                    )
-
-                                },
-
-                            },
-
-                        ],
-
-                    }
-
-                ],
-
+        respuesta = client.models.generate_content(
+            model=VISION_MODEL,
+            contents=[
+                types.Part.from_bytes(
+                    data=imagen_bytes,
+                    mime_type="image/png",
+                ),
+                prompt,
+            ],
+            config=types.GenerateContentConfig(
                 temperature=0.1,
-
-                max_tokens=8000,
-
-            )
-
+                max_output_tokens=8000,
+            ),
         )
-
-
-        return extraer_contenido_respuesta(
-
-            respuesta
-
-        )
-
-
+        return extraer_contenido_respuesta(respuesta)
     except Exception as error:
-
         raise RuntimeError(
-
-            "Error analizando página "
-
-            f"{numero_pagina}: {error}"
-
+            f"Error analizando página {numero_pagina}: {error}"
         )
 
 
