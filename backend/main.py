@@ -156,6 +156,38 @@ MAX_CHARS_CONOCIMIENTO_CHAT = (
 UMBRAL_VECTOR = 0.30
 
 
+# ============================================================
+# PALABRAS IGNORADAS EN RETRIEVAL
+# ============================================================
+# Palabras que no aportan información útil para identificar
+# personas, equipos, áreas o temas dentro del conocimiento.
+# Se usan normalizadas porque normalizar_texto() elimina tildes.
+# ============================================================
+
+PALABRAS_IGNORADAS_RETRIEVAL = {
+    "hola",
+    "holi",
+    "hey",
+    "buenas",
+    "buenos",
+    "dias",
+    "tardes",
+    "noches",
+    "gracias",
+    "por",
+    "favor",
+    "ok",
+    "okay",
+    "vale",
+    "si",
+    "no",
+    "listo",
+    "perfecto",
+    "jaja",
+    "jajaja",
+}
+
+
 if not GEMINI_API_KEY:
     print(
         "⚠️ ADVERTENCIA: GEMINI_API_KEY no está configurada."
@@ -1527,6 +1559,27 @@ def construir_contexto_relevante(
     pregunta: str,
     conocimientos: list[dict[str, Any]],
 ) -> str:
+    """Construye el contexto local que será enviado a Gemini."""
+
+    pregunta_n = normalizar_texto(pregunta)
+
+    saludos = {
+        "hola",
+        "holi",
+        "buenas",
+        "buenos dias",
+        "buenas tardes",
+        "buenas noches",
+        "hey",
+        "que tal",
+        "como estas",
+    }
+
+    if pregunta_n in saludos:
+        return (
+            "No se requiere consultar la base de conocimiento "
+            "para este saludo."
+        )
 
     relevantes = buscar_conocimiento_vectorial(
         pregunta,
@@ -1560,9 +1613,7 @@ def construir_contexto_relevante(
 
         costo = len(bloque)
         costo_separador = (
-            len(separador)
-            if bloques
-            else 0
+            len(separador) if bloques else 0
         )
 
         if (
@@ -1574,21 +1625,15 @@ def construir_contexto_relevante(
         ):
             break
 
-        # Si un único registro supera el límite, se conserva al menos
-        # una parte útil en lugar de mandar un contexto ilimitado.
         if (
             not bloques
             and costo > MAX_CHARS_CONOCIMIENTO_CHAT
         ):
-            bloque = bloque[
-                :MAX_CHARS_CONOCIMIENTO_CHAT
-            ]
+            bloque = bloque[:MAX_CHARS_CONOCIMIENTO_CHAT]
             costo = len(bloque)
 
         bloques.append(bloque)
-        caracteres_usados += (
-            costo + costo_separador
-        )
+        caracteres_usados += costo + costo_separador
 
     if not bloques:
         return (
@@ -2433,7 +2478,7 @@ SYSTEM_PROMPT_BASE = (
 
 app = FastAPI(
     title="Penaguillo IA",
-    version="7.3.0",
+    version="7.4.0",
     description=(
         "Backend del asistente inteligente "
         "Penaguillo"
@@ -2568,23 +2613,18 @@ def construir_query_conversacional(
         "sus",
         "su",
         "tambien",
-        "también",
         "y",
         "quienes",
-        "quiénes",
         "cual",
-        "cuál",
         "cuales",
-        "cuáles",
         "correo",
         "correos",
         "telefono",
-        "teléfono",
         "celular",
         "celulares",
-        "ese proyecto",
-        "esa persona",
-        "ese equipo",
+        "proyecto",
+        "persona",
+        "equipo",
     }
 
     es_corta = len(palabras) <= 8
