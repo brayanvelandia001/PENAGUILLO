@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 6.1 (Corregido: Retrieval de Equipos + Fuzzy Matching + Conteo + Fix Enseñar + Blindaje ERP/Inferencia)
+# VERSIÓN 6.3 (Simplificado: Contexto Completo Directo + Cero Filtros Frágiles + Blindaje Anti-Inferencias)
 #
 # PROVEEDOR DE IA:
 # - Google Gemini Native API
@@ -10,27 +10,19 @@
 # - gemini-3.5-flash-lite
 #
 # FUNCIONES:
-# - Chat con Penaguillo
-# - Chat con historial
-# - Búsqueda contextual
+# - Chat conversacional directo con visibilidad 100% del JSON maestro
+# - Chat con historial conversacional
 # - Enseñar texto (Con Títulos dinámicos)
-# - Enseñar imágenes
-# - Enseñar PDF
-# - PDF con texto seleccionable -> PyMuPDF
-# - PDF escaneado -> Gemini Vision
-# - Imágenes -> Gemini Vision
-# - Persistencia local
-# - Google Drive como almacenamiento permanente
+# - Enseñar imágenes (Gemini Vision)
+# - Enseñar PDF (PyMuPDF + Gemini Vision para escaneados)
+# - Persistencia local y Google Drive permanente
 # - penaguillo.json como fuente maestra
-# - Backups
-# - Escritura atómica
-# - Búsqueda local por relevancia inteligente
-# - Búsqueda difusa (tolerancia a errores ortográficos)
-# - Deduplicación inteligente
+# - Backups automáticos y escritura atómica
+# - Reglas estrictas de fidelidad de datos (Copia literal de correos/celulares)
 # ============================================================
 
 import base64
-import difflib  # <-- IMPORTANTE: Librería para búsqueda difusa
+import difflib
 import hashlib
 import json
 import os
@@ -240,57 +232,10 @@ MAX_OUTPUT_TOKENS = 1200
 
 
 # ============================================================
-# CONFIGURACIÓN DEL RETRIEVAL LOCAL
-# ============================================================
-
-RELEVANCIA_TOP_K = 12
-
-MAX_KB_CONOCIMIENTO_CHAT = 32
-
-MAX_CHARS_CONOCIMIENTO_CHAT = (
-    MAX_KB_CONOCIMIENTO_CHAT * 1024
-)
-
-
-# ============================================================
 # CONFIGURACIÓN DEL HISTORIAL
 # ============================================================
 
 MAX_MENSAJES_HISTORIAL = 6
-
-
-# ============================================================
-# CONFIGURACIÓN DE BÚSQUEDA CONTEXTUAL
-# ============================================================
-
-MAX_MENSAJES_RETRIEVAL = 4
-
-MAX_CHARS_CONSULTA_RETRIEVAL = 4000
-
-
-# ============================================================
-# STOPWORDS
-# ============================================================
-
-STOPWORDS_ES = {
-
-    "a", "al", "algo", "algunas", "algunos",
-    "ante", "antes", "como", "con", "contra",
-    "cual", "cuales", "cuando", "de", "del",
-    "desde", "donde", "dos", "el", "ella",
-    "ellas", "ello", "ellos", "en", "entre",
-    "era", "es", "esa", "esas", "ese", "eso",
-    "esos", "esta", "estas", "este", "esto",
-    "estos", "fue", "ha", "hay", "la", "las",
-    "le", "les", "lo", "los", "más", "me",
-    "mi", "mis", "muy", "no", "nos", "o",
-    "para", "pero", "por", "que", "qué", "se",
-    "sea", "si", "sí", "sin", "sobre", "son",
-    "su", "sus", "también", "te", "tener",
-    "ti", "tu", "tus", "un", "una", "unas",
-    "uno", "unos", "y", "ya", "yo",
-
-}
 
 
 # ============================================================
@@ -2645,10 +2590,10 @@ app = FastAPI(
 
     title="Penaguillo IA",
 
-    version="6.1.0",
+    version="6.3.0",
 
     description=(
-        "Backend del asistente inteligente Penaguillo"
+        "Backend del asistente inteligente Penaguillo con Visibilidad Total de Conocimiento"
     ),
 
 )
@@ -2758,739 +2703,6 @@ class EnsenarRequest(BaseModel):
 class EliminarRequest(BaseModel):
 
     id: str
-
-
-# ============================================================
-# NORMALIZAR TEXTO
-# ============================================================
-
-def normalizar_texto(
-    texto: str,
-) -> str:
-
-    if not texto:
-
-        return ""
-
-
-    texto = str(
-        texto
-    ).lower()
-
-
-    reemplazos = {
-
-        "á": "a",
-        "é": "e",
-        "í": "i",
-        "ó": "o",
-        "ú": "u",
-        "ü": "u",
-        "ñ": "n",
-
-    }
-
-
-    for original, nuevo in reemplazos.items():
-
-        texto = texto.replace(
-            original,
-            nuevo,
-        )
-
-
-    texto = re.sub(
-
-        r"[^a-z0-9\s]",
-
-        " ",
-
-        texto,
-
-    )
-
-
-    texto = re.sub(
-
-        r"\s+",
-
-        " ",
-
-        texto,
-
-    )
-
-
-    return texto.strip()
-
-
-# ============================================================
-# EXTRAER PALABRAS IMPORTANTES
-# ============================================================
-
-def extraer_palabras_importantes(
-    texto: str,
-) -> list[str]:
-
-    texto_normalizado = (
-        normalizar_texto(texto)
-    )
-
-
-    palabras = (
-        texto_normalizado
-        .split()
-    )
-
-
-    resultado = []
-
-
-    for palabra in palabras:
-
-        if len(palabra) < 3:
-
-            continue
-
-
-        if palabra in STOPWORDS_ES:
-
-            continue
-
-
-        if palabra not in resultado:
-
-            resultado.append(
-                palabra
-            )
-
-
-    return resultado
-
-
-# ============================================================
-# CONSTRUIR CONSULTA DE RETRIEVAL (CORREGIDA PARA PREGUNTAS DE SEGUIMIENTO)
-# ============================================================
-
-def construir_consulta_retrieval(
-    mensaje: str,
-    history: list[ChatMessage],
-) -> str:
-    """Construye una consulta arrastrando entidades previas si la pregunta es de seguimiento."""
-    mensaje_actual = str(mensaje or "").strip()
-
-    if not mensaje_actual:
-        return ""
-
-    palabras_actuales = extraer_palabras_importantes(mensaje_actual)
-
-    # Palabras que indican que la pregunta es referencial/ambigua
-    palabras_intent_amplia = {
-        "toda", "todo", "datos", "data", "informacion", "info",
-        "completa", "completo", "disponible", "ficha", "perfil",
-        "dame", "dime", "sabes", "tienes",
-        "equipo", "grupo", "integrantes", "quienes", "conforman",
-        "personal", "area", "miembros", "cual", "cuales", "esos", "ellos", "este"
-    }
-    palabras_entidad = [p for p in palabras_actuales if p not in palabras_intent_amplia]
-
-    # Búsqueda de contexto previo en el historial de usuario
-    historial_usuario = []
-    if history:
-        historial_usuario = [
-            str(msg.content).strip()
-            for msg in history
-            if msg.role == "user"
-            and str(msg.content).strip()
-        ]
-
-    anteriores = historial_usuario[-MAX_MENSAJES_RETRIEVAL:]
-
-    es_amplia = _es_solicitud_amplia(mensaje_actual)
-
-    partes = [mensaje_actual]
-
-    # 🔥 SI NO HAY ENTIDAD EXPLÍCITA Y HAY HISTORIAL, INYECTAMOS LOS MENSAJES PREVIOS
-    if not palabras_entidad and anteriores:
-        partes = anteriores + [mensaje_actual]
-    elif len(palabras_actuales) <= 3 and anteriores:
-        partes = anteriores + [mensaje_actual]
-
-    consulta = " ".join(partes).strip()
-
-    if len(consulta) > MAX_CHARS_CONSULTA_RETRIEVAL:
-        espacio = MAX_CHARS_CONSULTA_RETRIEVAL - len(mensaje_actual) - 1
-        if espacio > 0:
-            contexto = " ".join(partes[:-1])
-            consulta = contexto[-espacio:] + " " + mensaje_actual
-        else:
-            consulta = mensaje_actual[:MAX_CHARS_CONSULTA_RETRIEVAL]
-
-    print("🧠 Consulta de búsqueda contextual:")
-    print(f"   {consulta}")
-    print("🎯 Pregunta actual priorizada:")
-    print(f"   {mensaje_actual}")
-
-    return consulta
-
-
-# ============================================================
-# RELEVANCIA DE UN REGISTRO
-# ============================================================
-
-def _es_solicitud_amplia(pregunta: str) -> bool:
-    """Detecta solicitudes de toda la información o miembros de un grupo/equipo."""
-    texto = normalizar_texto(str(pregunta or ""))
-
-    patrones = (
-        "toda la informacion",
-        "toda la info",
-        "toda la data",
-        "todos los datos",
-        "toda la informacion disponible",
-        "datos completos",
-        "informacion completa",
-        "ficha completa",
-        "perfil completo",
-        "dame todo",
-        "dime todo",
-        "todo sobre",
-        "que sabes de",
-        "que informacion tienes de",
-        "que datos tienes de",
-        # PATRONES PARA EQUIPOS Y GRUPOS
-        "equipo",
-        "grupo",
-        "integrantes",
-        "conforman",
-        "hacen parte",
-        "personal de",
-        "area de",
-        "miembros",
-    )
-
-    return any(patron in texto for patron in patrones)
-
-
-def _coincidencias_palabras(texto: str, palabras: list[str]) -> int:
-    """Cuenta palabras presentes, permitiendo pequeños errores tipográficos (fuzzy matching)."""
-    if not texto or not palabras:
-        return 0
-
-    total = 0
-    palabras_texto = set(re.findall(r'\b\w+\b', texto))
-
-    for palabra in palabras:
-        if re.search(rf"\b{re.escape(palabra)}\b", texto):
-            total += 1
-        else:
-            similares = difflib.get_close_matches(palabra, palabras_texto, n=1, cutoff=0.8)
-            if similares:
-                total += 1
-                
-    return total
-
-
-def calcular_relevancia(
-    pregunta: str,
-    item: dict[str, Any],
-    pregunta_actual: str | None = None,
-) -> float:
-    """Calcula relevancia dando mucha más importancia a la pregunta actual."""
-    palabras = extraer_palabras_importantes(pregunta)
-    actual = pregunta_actual if pregunta_actual else pregunta
-    palabras_actuales = extraer_palabras_importantes(actual)
-
-    if not palabras_actuales:
-        palabras_actuales = palabras
-
-    if not palabras:
-        return 0.0
-
-    titulo = normalizar_texto(str(item.get("titulo", "")))
-    contenido = normalizar_texto(str(item.get("contenido", "")))
-    descripcion = normalizar_texto(str(item.get("descripcion", "")))
-    tipo = normalizar_texto(str(item.get("tipo", "")))
-
-    texto_completo = " ".join((titulo, contenido, descripcion, tipo))
-
-    puntuacion = 0.0
-    es_amplia = _es_solicitud_amplia(actual)
-
-    # ------------------------------------------------------------
-    # 1. Coincidencias de la pregunta ACTUAL
-    # ------------------------------------------------------------
-    coincidencias_actuales = _coincidencias_palabras(
-        texto_completo,
-        palabras_actuales,
-    )
-
-    coincidencias_titulo = 0
-    coincidencias_descripcion = 0
-    coincidencias_contenido = 0
-
-    palabras_titulo_set = set(re.findall(r'\b\w+\b', titulo))
-    palabras_desc_set = set(re.findall(r'\b\w+\b', descripcion))
-    palabras_cont_set = set(re.findall(r'\b\w+\b', contenido))
-
-    for palabra in palabras_actuales:
-        patron = rf"\b{re.escape(palabra)}\b"
-        
-        # Titulo
-        if re.search(patron, titulo):
-            coincidencias_titulo += len(re.findall(patron, titulo))
-        elif difflib.get_close_matches(palabra, palabras_titulo_set, n=1, cutoff=0.8):
-            coincidencias_titulo += 1
-            
-        # Descripcion
-        if re.search(patron, descripcion):
-            coincidencias_descripcion += len(re.findall(patron, descripcion))
-        elif difflib.get_close_matches(palabra, palabras_desc_set, n=1, cutoff=0.8):
-            coincidencias_descripcion += 1
-            
-        # Contenido
-        if re.search(patron, contenido):
-            coincidencias_contenido += len(re.findall(patron, contenido))
-        elif difflib.get_close_matches(palabra, palabras_cont_set, n=1, cutoff=0.8):
-            coincidencias_contenido += 1
-
-    puntuacion += coincidencias_titulo * 24
-    puntuacion += coincidencias_descripcion * 10
-    puntuacion += min(coincidencias_contenido * 4, 40)
-
-    # 🔥 BONIFICACIÓN: Los textos enseñados a mano son "la verdad absoluta", les damos 20 puntos extra.
-    if tipo == "texto":
-        puntuacion += 20.0
-
-    # ------------------------------------------------------------
-    # 2. Coincidencia de frases completas
-    # ------------------------------------------------------------
-    palabras_frase = [p for p in palabras_actuales if len(p) >= 3]
-    if len(palabras_frase) >= 2:
-        frase = " ".join(palabras_frase)
-        if frase and frase in texto_completo:
-            puntuacion += 55
-
-    # ------------------------------------------------------------
-    # 3. Cobertura de la pregunta actual
-    # ------------------------------------------------------------
-    if palabras_actuales:
-        cobertura = coincidencias_actuales / len(palabras_actuales)
-
-        if cobertura >= 0.50:
-            puntuacion += 12
-        if cobertura >= 0.75:
-            puntuacion += 20
-        if cobertura >= 1.0:
-            puntuacion += 35
-
-    # ------------------------------------------------------------
-    # 4. Solicitudes Amplias (Toda la data, Equipos, Grupos)
-    # ------------------------------------------------------------
-    if es_amplia:
-        palabras_intent = {
-            "toda", "todo", "datos", "data", "informacion", "info",
-            "completa", "completo", "disponible", "ficha", "perfil",
-            "dame", "dime", "sabes", "tienes",
-            "equipo", "grupo", "integrantes", "quienes", "conforman",
-            "personal", "area", "miembros", "cual", "cuales"
-        }
-
-        entidad = [
-            p for p in palabras_actuales if p not in palabras_intent
-        ][:4]
-
-        coincidencias_entidad = _coincidencias_palabras(
-            texto_completo,
-            entidad,
-        )
-
-        if coincidencias_entidad >= 1:
-            puntuacion += 8
-        if coincidencias_entidad >= 2:
-            puntuacion += 25
-        if coincidencias_entidad >= 3:
-            puntuacion += 35
-
-        if _coincidencias_palabras(titulo, entidad) >= 1:
-            puntuacion += 15
-        if _coincidencias_palabras(descripcion, entidad) >= 1:
-            puntuacion += 8
-
-    # ------------------------------------------------------------
-    # 5. Historial: solo como apoyo
-    # ------------------------------------------------------------
-    palabras_contexto = [
-        palabra for palabra in palabras
-        if palabra not in palabras_actuales
-    ]
-
-    for palabra in palabras_contexto:
-        patron = rf"\b{re.escape(palabra)}\b"
-
-        if re.search(patron, titulo) or difflib.get_close_matches(palabra, palabras_titulo_set, n=1, cutoff=0.8):
-            puntuacion += 4
-        if re.search(patron, descripcion) or difflib.get_close_matches(palabra, palabras_desc_set, n=1, cutoff=0.8):
-            puntuacion += 2
-
-        coincidencias = len(re.findall(patron, texto_completo))
-        if coincidencias == 0 and difflib.get_close_matches(palabra, set(re.findall(r'\b\w+\b', texto_completo)), n=1, cutoff=0.8):
-            coincidencias = 1
-            
-        puntuacion += min(coincidencias * 0.5, 3)
-
-    if es_amplia and coincidencias_actuales >= 1:
-        puntuacion += 6
-
-    return puntuacion
-
-
-# ============================================================
-# CREAR CLAVE REAL DE DUPLICADO
-# ============================================================
-
-def clave_unica_conocimiento(
-    item: dict[str, Any],
-) -> str:
-
-    titulo = normalizar_texto(
-        str(
-            item.get(
-                "titulo",
-                "",
-            )
-        )
-    )
-
-
-    contenido = normalizar_texto(
-        str(
-            item.get(
-                "contenido",
-                "",
-            )
-        )
-    )
-
-
-    descripcion = normalizar_texto(
-        str(
-            item.get(
-                "descripcion",
-                "",
-            )
-        )
-    )
-
-
-    tipo = normalizar_texto(
-        str(
-            item.get(
-                "tipo",
-                "",
-            )
-        )
-    )
-
-
-    material = (
-
-        f"{tipo}|"
-
-        f"{titulo}|"
-
-        f"{contenido}|"
-
-        f"{descripcion}"
-
-    )
-
-
-    huella = hashlib.sha256(
-
-        material.encode(
-            "utf-8"
-        )
-
-    ).hexdigest()
-
-
-    return (
-        f"hash:{huella}"
-    )
-
-
-# ============================================================
-# BUSCAR CONOCIMIENTO RELEVANTE (UMBRAL FLEXIBILIZADO)
-# ============================================================
-
-def buscar_conocimiento_relevante(
-    pregunta: str,
-    conocimientos: list[dict[str, Any]],
-    top_k: int = RELEVANCIA_TOP_K,
-    pregunta_actual: str | None = None,
-) -> list[dict[str, Any]]:
-    """Busca y selecciona conocimiento con un umbral optimizado para no descartar fichas útiles."""
-    if not conocimientos:
-        return []
-
-    actual = pregunta_actual if pregunta_actual else pregunta
-    es_amplia = _es_solicitud_amplia(actual)
-
-    resultados = []
-    claves_vistas = set()
-
-    palabras_actuales = extraer_palabras_importantes(actual)
-    palabras_entidad = [
-        p for p in palabras_actuales
-        if p not in {
-            "toda", "todo", "datos", "data", "informacion", "info",
-            "completa", "completo", "disponible", "ficha", "perfil",
-            "dame", "dime", "sabes", "tienes",
-            "equipo", "grupo", "integrantes", "quienes", "conforman",
-            "personal", "area", "miembros", "cual", "cuales"
-        }
-    ]
-
-    for indice, item in enumerate(conocimientos):
-        clave = clave_unica_conocimiento(item)
-
-        if clave in claves_vistas:
-            continue
-
-        claves_vistas.add(clave)
-
-        puntuacion = calcular_relevancia(
-            pregunta,
-            item,
-            actual,
-        )
-
-        if es_amplia and palabras_entidad:
-            texto_item = normalizar_texto(
-                " ".join(
-                    (
-                        str(item.get("titulo", "")),
-                        str(item.get("contenido", "")),
-                        str(item.get("descripcion", "")),
-                        str(item.get("tipo", "")),
-                    )
-                )
-            )
-
-            coincidencias_entidad = _coincidencias_palabras(
-                texto_item,
-                palabras_entidad,
-            )
-
-            if coincidencias_entidad >= 1:
-                puntuacion += 10
-            if coincidencias_entidad >= 2:
-                puntuacion += 20
-            if coincidencias_entidad >= 3:
-                puntuacion += 30
-
-            titulo = normalizar_texto(str(item.get("titulo", "")))
-            if _coincidencias_palabras(titulo, palabras_entidad) >= 1:
-                puntuacion += 20
-
-        # 🔥 UMBRAL AJUSTADO: Más permisivo (1.5) para que no descarte registros válidos
-        umbral = 1.0 if es_amplia else 1.5
-
-        if puntuacion >= umbral:
-            resultados.append((puntuacion, indice, item))
-
-    resultados.sort(
-        key=lambda elemento: (
-            elemento[0],
-            -elemento[1],
-        ),
-        reverse=True,
-    )
-
-    limite_resultados = (
-        min(len(resultados), max(top_k, 20))
-        if es_amplia
-        else top_k
-    )
-
-    seleccionados = [
-        item
-        for _, _, item in resultados[:limite_resultados]
-    ]
-
-    print("🔎 Búsqueda de conocimiento:")
-    print(f"   Registros totales: {len(conocimientos)}")
-    print(f"   Registros únicos evaluados: {len(claves_vistas)}")
-    print(f"   Solicitud amplia/equipo: {'SÍ' if es_amplia else 'NO'}")
-    print(f"   Registros relevantes: {len(seleccionados)}")
-
-    if resultados:
-        for puntuacion, _, item in resultados[:limite_resultados]:
-            print(
-                "   📌 "
-                f"{item.get('titulo', '')} "
-                f"(score={puntuacion:.1f})"
-            )
-    else:
-        print("   ℹ️ No se encontraron coincidencias relevantes.")
-
-    return seleccionados
-
-
-# ============================================================
-# CONSTRUIR CONTEXTO RELEVANTE
-# ============================================================
-
-def construir_contexto_relevante(
-    pregunta: str,
-    conocimientos: list[dict[str, Any]],
-    pregunta_actual: str | None = None,
-) -> str:
-
-    relevantes = (
-        buscar_conocimiento_relevante(
-
-            pregunta,
-
-            conocimientos,
-
-            pregunta_actual=(
-                pregunta_actual
-            ),
-
-        )
-    )
-
-
-    if not relevantes:
-
-        return (
-            "No se encontraron registros "
-            "específicos de la base de conocimiento "
-            "relacionados con esta pregunta."
-        )
-
-
-    bloques = []
-
-    caracteres_actuales = 0
-
-
-    for indice, item in enumerate(
-        relevantes,
-        start=1,
-    ):
-
-        tipo = item.get(
-            "tipo",
-            "desconocido",
-        )
-
-
-        titulo = item.get(
-            "titulo",
-            "",
-        )
-
-
-        contenido = item.get(
-            "contenido",
-            "",
-        )
-
-
-        descripcion = item.get(
-            "descripcion",
-            "",
-        )
-
-
-        bloque = f"""
-REGISTRO RELEVANTE {indice}
-
-ID:
-{item.get("id", "")}
-
-TIPO:
-{tipo}
-
-TÍTULO:
-{titulo}
-
-CONTENIDO:
-{contenido}
-
-DESCRIPCIÓN:
-{descripcion}
-""".strip()
-
-
-        nuevo_total = (
-
-            caracteres_actuales
-
-            + len(
-                bloque
-            )
-
-        )
-
-
-        if (
-            nuevo_total
-            > MAX_CHARS_CONOCIMIENTO_CHAT
-        ):
-
-            restante = (
-
-                MAX_CHARS_CONOCIMIENTO_CHAT
-
-                - caracteres_actuales
-
-            )
-
-
-            if restante > 500:
-
-                bloque_recortado = (
-
-                    bloque[:restante]
-
-                    + "\n[CONTEXTO RECORTADO]"
-
-                )
-
-
-                bloques.append(
-                    bloque_recortado
-                )
-
-
-            break
-
-
-        bloques.append(
-            bloque
-        )
-
-
-        caracteres_actuales = (
-            nuevo_total
-        )
-
-
-    contexto = (
-
-        "\n\n"
-        "==============================\n\n"
-
-    ).join(
-        bloques
-    )
-
-
-    return contexto
 
 
 # ============================================================
@@ -3903,7 +3115,7 @@ def root():
 
         "app": "Penaguillo IA",
 
-        "version": "6.1.0",
+        "version": "6.3.0",
 
         "provider": "Google Gemini Native",
 
@@ -3915,35 +3127,17 @@ def root():
             conocimientos
         ),
 
-        "retrieval": True,
+        "retrieval": False,
 
-        "retrieval_top_k": (
-            RELEVANCIA_TOP_K
-        ),
-
-        "max_context_chars": (
-            MAX_CHARS_CONOCIMIENTO_CHAT
-        ),
-
-        "max_context_kb": (
-            MAX_KB_CONOCIMIENTO_CHAT
-        ),
+        "full_knowledge_context": True,
 
         "max_history_messages": (
             MAX_MENSAJES_HISTORIAL
         ),
 
-        "max_retrieval_messages": (
-            MAX_MENSAJES_RETRIEVAL
-        ),
-
         "max_output_tokens": (
             MAX_OUTPUT_TOKENS
         ),
-
-        "duplicate_retrieval_filter": True,
-
-        "current_question_priority": True,
 
         "gemini_api": (
             bool(GEMINI_API_KEY)
@@ -3965,7 +3159,7 @@ def root():
 
 
 # ============================================================
-# CHAT
+# CHAT DIRECTO CON VISIBILIDAD DE BASE DE DATOS COMPLETA
 # ============================================================
 
 @app.post("/chat")
@@ -4012,7 +3206,7 @@ def chat(
 
 
         # ====================================================
-        # CARGAR CONOCIMIENTO
+        # CARGAR BASE DE DATOS MAESTRA COMPLETA (SIN RECTORTES)
         # ====================================================
 
         conocimientos = (
@@ -4020,36 +3214,15 @@ def chat(
         )
 
 
-        # ====================================================
-        # RETRIEVAL
-        # ====================================================
-
-        consulta_retrieval = (
-            construir_consulta_retrieval(
-
-                mensaje,
-
-                data.history,
-
-            )
-        )
-
-
-        conocimiento_relevante = (
-            construir_contexto_relevante(
-
-                consulta_retrieval,
-
-                conocimientos,
-
-                pregunta_actual=mensaje,
-
-            )
+        contexto_completo = json.dumps(
+            conocimientos,
+            ensure_ascii=False,
+            indent=2,
         )
 
 
         # ====================================================
-        # SYSTEM PROMPT (CON REGLAS DE NO-INFERENCIA Y FIDELIDAD)
+        # SYSTEM PROMPT BLINDADO CON LA VERDAD COMPLETA
         # ====================================================
 
         system_prompt = (
@@ -4060,101 +3233,43 @@ def chat(
 
             + "==============================\n"
 
-            + "INSTRUCCIONES SOBRE LA BASE "
-            "DE CONOCIMIENTO\n"
+            + "BASE DE CONOCIMIENTO MAESTRA Y COMPLETA DE PENAGOS HERMANOS\n"
 
             + "==============================\n"
 
-            + f"DATO IMPORTANTE: Actualmente tienes exactamente {len(conocimientos)} registros en tu base de datos local.\n\n"
+            + f"DATO IMPORTANTE: A continuación tienes la totalidad de la base de datos local conteniendo exactamente {len(conocimientos)} registros.\n\n"
 
-            + """
+            + "No se ha ocultado ni recortado ningún registro. Cuentas con la visibilidad absoluta de todas las áreas, enlaces, personas, correos y procesos de la compañía.\n\n"
 
-La información que aparece a continuación
-es solamente el subconjunto de registros
-que el sistema local considera relacionados
-con la conversación y la pregunta del usuario.
-
-Debes tomar tú la decisión final sobre qué
-información utilizar para responder.
-
-La pregunta ACTUAL del usuario tiene prioridad.
-
-No asumas que todos los registros son relevantes.
-
-Si la información proporcionada no permite
-responder con seguridad, dilo claramente.
-
-No inventes información.
-
-Si la pregunta no necesita conocimiento
-específico de Penaguillo, puedes responder
-normalmente utilizando tus capacidades.
-
-Utiliza el historial de conversación proporcionado
-por el sistema para comprender referencias,
-pronombres y preguntas de seguimiento.
-
-Si el usuario dice cosas como:
-
-- "esa máquina"
-- "el casino"
-- "ese teléfono"
-- "allí"
-- "ellos"
-- "esa empresa"
-- "¿y cuál?"
-- "¿y dónde?"
-- "¿y el número?"
-
-debes intentar identificar a qué se refiere
-utilizando el contexto de la conversación.
-
-No obligues al usuario a repetir información
-que ya proporcionó anteriormente.
-
-Si el contexto de conversación permite saber
-a qué se refiere, continúa la conversación
-normalmente.
-
-IMPORTANTE:
-
-La pregunta actual que debes responder es
-la última pregunta enviada por el usuario.
-
-No reemplaces la pregunta actual por una
-palabra aislada del mensaje.
-
-"""
-
-            + "\n\n"
-
-            + "==============================\n"
-
-            + "CONOCIMIENTO RELEVANTE\n"
-
-            + "==============================\n"
-
-            + conocimiento_relevante
+            + contexto_completo
 
             + "\n\n==============================\n"
-            + "REGLAS STRICTAS DE NO-INFERENCIA Y EQUIPOS\n"
+
+            + "REGLAS STRICTAS DE RESPUESTA Y VERACIDAD\n"
+
             + "==============================\n"
-            + "1. Queda ABSOLUTAMENTE PROHIBIDO inferir o asumir qué área, equipo o persona maneja un sistema (como ERP SAP, servidores, CRM, etc.) si esa relación exacta no aparece explícitamente en el CONOCIMIENTO RELEVANTE.\n"
-            + "2. Si el contexto NO menciona explícitamente qué persona o equipo atiende un sistema o área, debes responder claramente: 'No tengo un responsable confirmado para esa solicitud en la información que manejo.'\n"
-            + "3. Si el usuario pregunta por un 'equipo', 'grupo' o 'área' (como Modernización Tecnológica, Optimización, etc.), debes listar ÚNICAMENTE a las personas que el contexto asigne formalmente a ese equipo. Jamás agregues personas de otros registros solo porque el usuario preguntó por un tema genérico antes.\n"
-            + "4. Queda PROHIBIDO alterar, acortar o modificar correos electrónicos o teléfonos. Cópialos exactamente iguales a como aparecen en el contexto (mantiene dominios completos como .co y .com).\n"
+
+            + "1. Si el usuario pregunta por los integrantes de un equipo o área (como Modernización Tecnológica, Optimización, Operaciones, etc.), DEBES revisar la base de datos completa y nombrar a TODOS los colaboradores asignados formalmente a ese equipo en el JSON.\n"
+
+            + "2. Queda ABSOLUTAMENTE PROHIBIDO asumir, adivinar o inferir que un área o persona atiende un sistema (como ERP SAP, servidores, soporte, etc.) a menos que en el JSON exista un texto que declare expresamente esa relación.\n"
+
+            + "3. Si la relación o el responsable NO está explícitamente especificado en la base de datos, debes responder claramente: 'No tengo un responsable confirmado para esa solicitud en la información que manejo.'\n"
+
+            + "4. Copia y pega de forma EXACTA e ÍNTEGRA los correos electrónicos y teléfonos sin alterar ni recortar los dominios (mantiene siempre la extensión completa como .co o .com).\n"
+
+            + "5. Utiliza el historial de conversación para entender referencias, pronombres o preguntas de seguimiento (como '¿quiénes son ellos?', '¿dónde queda esa máquina?').\n"
 
         )
 
 
         print(
-            "📤 Enviando pregunta a Gemini."
+            "📤 Enviando pregunta a Gemini con visibilidad completa del JSON."
         )
 
 
         print(
-            "📚 Contexto seleccionado: "
-            f"{len(conocimiento_relevante)} caracteres"
+            "📚 Tamaño de base de conocimiento inyectada: "
+            f"{len(contexto_completo)} caracteres"
         )
 
 
@@ -4195,8 +3310,7 @@ palabra aislada del mensaje.
 
 
             print(
-                "💬 Historial enviado a "
-                "Gemini: "
+                "💬 Historial enviado a Gemini: "
                 f"{len(historial_reciente)} mensajes"
             )
 
@@ -4260,8 +3374,7 @@ palabra aislada del mensaje.
 
 
         print(
-            "💬 Mensajes totales enviados "
-            "a Gemini: "
+            "💬 Mensajes totales enviados a Gemini: "
             f"{len(mensajes_api)}"
         )
 
@@ -5817,26 +4930,8 @@ def startup_event():
 
 
     print(
-        "🔎 RETRIEVAL TOP K: "
-        f"{RELEVANCIA_TOP_K}"
-    )
-
-
-    print(
         "💬 MAX HISTORIAL GEMINI: "
         f"{MAX_MENSAJES_HISTORIAL} mensajes"
-    )
-
-
-    print(
-        "🧠 MAX HISTORIAL RETRIEVAL: "
-        f"{MAX_MENSAJES_RETRIEVAL} mensajes"
-    )
-
-
-    print(
-        "📦 MAX CONTEXT: "
-        f"{MAX_KB_CONOCIMIENTO_CHAT} KB"
     )
 
 
@@ -5847,20 +4942,8 @@ def startup_event():
 
 
     print(
-        "♻️ DEDUPLICACIÓN RETRIEVAL: "
-        "ACTIVADA"
-    )
-
-
-    print(
-        "🎯 PRIORIDAD PREGUNTA ACTUAL: "
-        "ACTIVADA"
-    )
-
-
-    print(
-        "⚡ OPTIMIZACIÓN DE LATENCIA: "
-        "ACTIVADA"
+        "🧠 MODO DE VISIBILIDAD DE BASE DE DATOS: "
+        "CONTEXTO COMPLETO"
     )
 
 
