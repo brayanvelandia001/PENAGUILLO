@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 6.1 (Corregido: Retrieval de Equipos/Grupos)
+# VERSIÓN 6.1 (Corregido: Retrieval de Equipos + Fuzzy Matching)
 #
 # PROVEEDOR DE IA:
 # - Google Gemini Native API
@@ -25,10 +25,12 @@
 # - Backups
 # - Escritura atómica
 # - Búsqueda local por relevancia inteligente
+# - Búsqueda difusa (tolerancia a errores ortográficos)
 # - Deduplicación inteligente
 # ============================================================
 
 import base64
+import difflib  # <-- IMPORTANTE: Librería para búsqueda difusa
 import hashlib
 import json
 import os
@@ -2899,7 +2901,6 @@ def construir_consulta_retrieval(
     if es_corta and anteriores:
         partes = anteriores + [mensaje_actual]
     elif es_amplia:
-        # Para "toda la data de X" o equipos, mantener la pregunta limpia
         partes = [mensaje_actual]
     else:
         partes = [mensaje_actual]
@@ -2970,14 +2971,25 @@ def _es_solicitud_amplia(pregunta: str) -> bool:
 
 
 def _coincidencias_palabras(texto: str, palabras: list[str]) -> int:
-    """Cuenta palabras importantes presentes como palabras completas."""
+    """Cuenta palabras presentes, permitiendo pequeños errores tipográficos (fuzzy matching)."""
     if not texto or not palabras:
         return 0
 
     total = 0
+    # Extraemos palabras únicas del texto para comparar
+    palabras_texto = set(re.findall(r'\b\w+\b', texto))
+
     for palabra in palabras:
+        # 1. Intento de coincidencia exacta
         if re.search(rf"\b{re.escape(palabra)}\b", texto):
             total += 1
+        else:
+            # 2. Búsqueda difusa (tolerancia a errores tipográficos)
+            # cutoff=0.8 significa que debe haber un 80% de similitud
+            similares = difflib.get_close_matches(palabra, palabras_texto, n=1, cutoff=0.8)
+            if similares:
+                total += 1
+                
     return total
 
 
@@ -3020,11 +3032,31 @@ def calcular_relevancia(
     coincidencias_descripcion = 0
     coincidencias_contenido = 0
 
+    # Usamos la lógica difusa también para los contadores específicos si no encuentra coincidencia exacta
+    palabras_titulo_set = set(re.findall(r'\b\w+\b', titulo))
+    palabras_desc_set = set(re.findall(r'\b\w+\b', descripcion))
+    palabras_cont_set = set(re.findall(r'\b\w+\b', contenido))
+
     for palabra in palabras_actuales:
         patron = rf"\b{re.escape(palabra)}\b"
-        coincidencias_titulo += len(re.findall(patron, titulo))
-        coincidencias_descripcion += len(re.findall(patron, descripcion))
-        coincidencias_contenido += len(re.findall(patron, contenido))
+        
+        # Titulo
+        if re.search(patron, titulo):
+            coincidencias_titulo += len(re.findall(patron, titulo))
+        elif difflib.get_close_matches(palabra, palabras_titulo_set, n=1, cutoff=0.8):
+            coincidencias_titulo += 1
+            
+        # Descripcion
+        if re.search(patron, descripcion):
+            coincidencias_descripcion += len(re.findall(patron, descripcion))
+        elif difflib.get_close_matches(palabra, palabras_desc_set, n=1, cutoff=0.8):
+            coincidencias_descripcion += 1
+            
+        # Contenido
+        if re.search(patron, contenido):
+            coincidencias_contenido += len(re.findall(patron, contenido))
+        elif difflib.get_close_matches(palabra, palabras_cont_set, n=1, cutoff=0.8):
+            coincidencias_contenido += 1
 
     puntuacion += coincidencias_titulo * 24
     puntuacion += coincidencias_descripcion * 10
@@ -3096,12 +3128,17 @@ def calcular_relevancia(
     for palabra in palabras_contexto:
         patron = rf"\b{re.escape(palabra)}\b"
 
-        if re.search(patron, titulo):
+        if re.search(patron, titulo) or difflib.get_close_matches(palabra, palabras_titulo_set, n=1, cutoff=0.8):
             puntuacion += 4
-        if re.search(patron, descripcion):
+        if re.search(patron, descripcion) or difflib.get_close_matches(palabra, palabras_desc_set, n=1, cutoff=0.8):
             puntuacion += 2
 
+        # Contamos exacta para el multiplicador
         coincidencias = len(re.findall(patron, texto_completo))
+        # Si no hay exacta pero sí fuzzy general, sumamos al menos 1
+        if coincidencias == 0 and difflib.get_close_matches(palabra, set(re.findall(r'\b\w+\b', texto_completo)), n=1, cutoff=0.8):
+            coincidencias = 1
+            
         puntuacion += min(coincidencias * 0.5, 3)
 
     # ------------------------------------------------------------
