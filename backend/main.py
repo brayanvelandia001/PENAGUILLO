@@ -143,9 +143,15 @@ VISION_MODEL = GEMINI_MODEL
 
 MAX_OUTPUT_TOKENS = 1200
 
-RELEVANCIA_TOP_K = 10
+RELEVANCIA_TOP_K = 8
 
 MAX_MENSAJES_HISTORIAL = 6
+
+# Límite del contexto local enviado a Gemini.
+MAX_KB_CONOCIMIENTO_CHAT = 16
+MAX_CHARS_CONOCIMIENTO_CHAT = (
+    MAX_KB_CONOCIMIENTO_CHAT * 1024
+)
 
 UMBRAL_VECTOR = 0.30
 
@@ -170,20 +176,36 @@ if not EMBEDDINGS_HABILITADOS:
 
 
 # ============================================================
-# CONFIGURACIÓN DEL RETRIEVAL LOCAL
+# EQUIPOS CONOCIDOS
 # ============================================================
 
-# Máximo de conocimientos que pueden llegar a Gemini.
-# El buscador puede encontrar muchos candidatos, pero solamente
-# los mejores pasan al contexto final.
-RELEVANCIA_TOP_K = 8
+EQUIPOS_CONOCIDOS = {
+    "modernizacion": [
+        "modernizacion",
+        "modernizacion tecnologica",
+    ],
+    "operaciones": [
+        "operaciones",
+    ],
+    "optimizacion": [
+        "optimizacion",
+    ],
+    "comercial": [
+        "comercial",
+    ],
+    "nomina": [
+        "nomina",
+    ],
+    "soporte": [
+        "soporte",
+        "soporte tecnico",
+    ],
+    "sistemas": [
+        "sistemas",
+        "tecnologia",
+    ],
+}
 
-# Límite aproximado del contexto de conocimiento enviado a Gemini.
-# Evita saturar el prompt cuando el JSON crece.
-MAX_KB_CONOCIMIENTO_CHAT = 16
-MAX_CHARS_CONOCIMIENTO_CHAT = (
-    MAX_KB_CONOCIMIENTO_CHAT * 1024
-)
 
 # ============================================================
 # INTENCIONES DE EQUIPO
@@ -208,65 +230,537 @@ INTENCIONES_EQUIPO = [
     "quienes forman parte",
     "conoces el equipo",
     "conoce el equipo",
+    "equipo de",
 ]
 
-# Palabras demasiado generales para intentar identificar un tema.
-PALABRAS_IGNORADAS_RETRIEVAL = {
-    "quien",
-    "quienes",
-    "cual",
-    "cuales",
-    "que",
-    "como",
-    "donde",
-    "cuando",
-    "porque",
-    "para",
-    "del",
-    "de",
-    "la",
-    "el",
-    "los",
-    "las",
-    "un",
-    "una",
-    "unos",
-    "unas",
-    "y",
-    "o",
-    "en",
-    "por",
-    "con",
-    "sobre",
-    "este",
-    "esta",
-    "ese",
-    "esa",
-    "ellos",
-    "ellas",
-    "tambien",
-    "también",
-    "equipo",
-    "area",
-    "grupo",
-    "personas",
-    "persona",
-    "correo",
-    "correos",
-    "telefono",
-    "telefonos",
-    "celular",
-    "celulares",
-    "dime",
-    "dame",
-    "muestra",
-    "mostrar",
-    "informacion",
-    "información",
-}
 
 # ============================================================
-# DETECTAR TEMA DINÁMICAMENTE DESDE EL JSON
+# ERROR CONTROLADO DE GEMINI
+# ============================================================
+
+class GeminiError(RuntimeError):
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        retry_after: int | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+# ============================================================
+# GEMINI — RETRY AFTER
+# ============================================================
+
+def extraer_retry_after(
+    respuesta: requests.Response,
+    mensaje_error: str,
+) -> int | None:
+
+    valor_header = respuesta.headers.get("Retry-After")
+
+    if valor_header:
+        try:
+            segundos = int(valor_header)
+
+            if segundos >= 0:
+                return segundos
+
+        except (TypeError, ValueError):
+            pass
+
+    patrones = [
+        r"retry in ([0-9]+(?:\.[0-9]+)?)s",
+        r"retryDelay.*?([0-9]+)s",
+        r"seconds.*?([0-9]+)",
+    ]
+
+    texto = mensaje_error or ""
+
+    for patron in patrones:
+
+        coincidencia = re.search(
+            patron,
+            texto,
+            re.IGNORECASE,
+        )
+
+        if coincidencia:
+
+            try:
+                return max(
+                    1,
+                    int(float(coincidencia.group(1))),
+                )
+
+            except (TypeError, ValueError):
+                pass
+
+    return None
+
+
+# ============================================================
+# GEMINI — GENERAR RESPUESTA
+# ============================================================
+
+def generar_con_gemini(
+    *,
+    model: str,
+    messages: list,
+    max_retries: int = 2,
+):
+
+    if not GEMINI_API_KEY:
+        raise GeminiError(
+            "GEMINI_API_KEY no está configurada."
+        )
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{model}:generateContent"
+        f"?key={GEMINI_API_KEY}"
+    )
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    system_instruction = None
+    gemini_contents = []
+
+    for msg in messages:
+
+        role = msg.get("role")
+        content = msg.get("content")
+
+        # ----------------------------------------------------
+        # SYSTEM
+        # ----------------------------------------------------
+
+        if role == "system":
+
+            if isinstance(content, str):
+
+                system_instruction = {
+                    "parts": [
+                        {
+                            "text": content
+                        }
+                    ]
+                }
+
+            continue
+
+        # ----------------------------------------------------
+        # ROLE
+        # ----------------------------------------------------
+
+        gemini_role = (
+            "model"
+            if role == "assistant"
+            else "user"
+        )
+
+        parts = []
+
+        # ----------------------------------------------------
+        # TEXTO
+        # ----------------------------------------------------
+
+        if isinstance(content, str):
+
+            if content.strip():
+
+                parts.append(
+                    {
+                        "text": content
+                    }
+                )
+
+        # ----------------------------------------------------
+        # MULTIMODAL
+        # ----------------------------------------------------
+
+        elif isinstance(content, list):
+
+            for item in content:
+
+                if not isinstance(item, dict):
+                    continue
+
+                item_type = item.get("type")
+
+                # TEXTO
+                if item_type == "text":
+
+                    texto = item.get(
+                        "text",
+                        "",
+                    )
+
+                    if texto:
+
+                        parts.append(
+                            {
+                                "text": texto
+                            }
+                        )
+
+                # IMAGEN
+                elif item_type == "image_url":
+
+                    url_img = (
+                        item
+                        .get("image_url", {})
+                        .get("url", "")
+                    )
+
+                    if not url_img.startswith(
+                        "data:"
+                    ):
+                        continue
+
+                    try:
+
+                        encabezado, b64_data = (
+                            url_img.split(",", 1)
+                        )
+
+                        mime_type = (
+                            encabezado
+                            .split(":", 1)[1]
+                            .split(";", 1)[0]
+                            .strip()
+                        )
+
+                        parts.append(
+                            {
+                                "inlineData": {
+                                    "mimeType": mime_type,
+                                    "data": b64_data,
+                                }
+                            }
+                        )
+
+                    except Exception:
+                        pass
+
+        if parts:
+
+            gemini_contents.append(
+                {
+                    "role": gemini_role,
+                    "parts": parts,
+                }
+            )
+
+    payload = {
+        "contents": gemini_contents,
+        "generationConfig": {
+            "maxOutputTokens": MAX_OUTPUT_TOKENS,
+            "temperature": 0.3,
+        },
+    }
+
+    if system_instruction:
+
+        payload["systemInstruction"] = (
+            system_instruction
+        )
+
+    ultimo_error = None
+
+    for intento in range(
+        1,
+        max_retries + 1,
+    ):
+
+        try:
+
+            respuesta = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=120,
+            )
+
+            if respuesta.status_code == 200:
+                return respuesta.json()
+
+            mensaje_error = respuesta.text[:5000]
+
+            retry_after = extraer_retry_after(
+                respuesta,
+                mensaje_error,
+            )
+
+            ultimo_error = GeminiError(
+                (
+                    f"Gemini HTTP "
+                    f"{respuesta.status_code}: "
+                    f"{mensaje_error}"
+                ),
+                status_code=respuesta.status_code,
+                retry_after=retry_after,
+            )
+
+            es_temporal = (
+                respuesta.status_code
+                in (429, 500, 502, 503, 504)
+            )
+
+            if (
+                not es_temporal
+                or intento >= max_retries
+            ):
+                raise ultimo_error
+
+            espera = (
+                min(retry_after, 15)
+                if retry_after is not None
+                else 2 ** intento
+            )
+
+            time.sleep(espera)
+
+        except requests.RequestException as error:
+
+            ultimo_error = GeminiError(
+                "No fue posible conectar con Gemini: "
+                f"{error}"
+            )
+
+            if intento >= max_retries:
+                raise ultimo_error
+
+            time.sleep(2 ** intento)
+
+    raise GeminiError(
+        "Gemini no pudo generar una respuesta."
+    )
+
+
+# ============================================================
+# EXTRAER RESPUESTA GEMINI
+# ============================================================
+
+def extraer_contenido_gemini(
+    respuesta: dict,
+) -> str:
+
+    if not respuesta:
+        raise RuntimeError(
+            "Gemini no devolvió respuesta."
+        )
+
+    if "error" in respuesta:
+
+        raise RuntimeError(
+            "Gemini devolvió un error: "
+            f"{respuesta['error']}"
+        )
+
+    candidatos = respuesta.get(
+        "candidates",
+        [],
+    )
+
+    if not candidatos:
+
+        raise RuntimeError(
+            "Gemini no devolvió ningún candidato."
+        )
+
+    partes = (
+        candidatos[0]
+        .get("content", {})
+        .get("parts", [])
+    )
+
+    texto_final = [
+        p.get("text", "")
+        for p in partes
+        if "text" in p
+        and p.get("text", "")
+    ]
+
+    resultado = "\n".join(
+        texto_final
+    ).strip()
+
+    if resultado:
+        return resultado
+
+    raise RuntimeError(
+        "Gemini no devolvió contenido de texto."
+    )
+
+
+# ============================================================
+# EMBEDDINGS
+# ============================================================
+
+def obtener_embedding(
+    texto: str,
+) -> list[float]:
+
+    """
+    Obtiene un embedding cuando los embeddings
+    están habilitados.
+
+    Actualmente está deshabilitado porque
+    text-embedding-004 devuelve HTTP 404.
+    """
+
+    if not EMBEDDINGS_HABILITADOS:
+        return []
+
+    if (
+        not GEMINI_API_KEY
+        or not texto.strip()
+    ):
+        return []
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{EMBEDDING_MODEL}:embedContent"
+        f"?key={GEMINI_API_KEY}"
+    )
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": (
+            f"models/{EMBEDDING_MODEL}"
+        ),
+        "content": {
+            "parts": [
+                {
+                    "text": texto.strip()[:2000]
+                }
+            ]
+        },
+    }
+
+    try:
+
+        respuesta = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=15,
+        )
+
+        if respuesta.status_code == 200:
+
+            return (
+                respuesta.json()
+                .get("embedding", {})
+                .get("values", [])
+            )
+
+        print(
+            "⚠️ Embedding HTTP "
+            f"{respuesta.status_code}: "
+            f"{respuesta.text[:500]}"
+        )
+
+    except Exception as error:
+
+        print(
+            "⚠️ Error generando embedding: "
+            f"{error}"
+        )
+
+    return []
+
+
+# ============================================================
+# HASH DEL CONOCIMIENTO
+# ============================================================
+
+def hash_conocimiento(
+    item: dict[str, Any],
+) -> str:
+
+    texto = (
+        f"{item.get('titulo', '')}\n"
+        f"{item.get('contenido', '')}\n"
+        f"{item.get('descripcion', '')}"
+    )
+
+    return hashlib.sha256(
+        texto.encode("utf-8")
+    ).hexdigest()
+
+
+def texto_para_embedding(
+    item: dict[str, Any],
+) -> str:
+
+    return (
+        f"TÍTULO: {item.get('titulo', '')}\n"
+        f"CONTENIDO: {item.get('contenido', '')}\n"
+        f"DESCRIPCIÓN: {item.get('descripcion', '')}"
+    )
+
+
+# ============================================================
+# NORMALIZAR TEXTO
+# ============================================================
+
+def normalizar_texto(
+    texto: str,
+) -> str:
+
+    texto = str(texto or "")
+
+    texto = unicodedata.normalize(
+        "NFD",
+        texto,
+    )
+
+    texto = "".join(
+        caracter
+        for caracter in texto
+        if unicodedata.category(caracter)
+        != "Mn"
+    )
+
+    texto = texto.lower()
+
+    texto = re.sub(
+        r"\s+",
+        " ",
+        texto,
+    )
+
+    return texto.strip()
+
+
+def tokens_texto(
+    texto: str,
+) -> set[str]:
+
+    texto = normalizar_texto(
+        texto
+    )
+
+    return set(
+        re.findall(
+            r"[a-z0-9@._+-]+",
+            texto,
+        )
+    )
+
+
+# ============================================================
+# DETECTAR EQUIPO
 # ============================================================
 
 def detectar_tema_dinamico(
@@ -376,7 +870,7 @@ def es_intencion_equipo(
 
 
 # ============================================================
-# DETECTAR SI REGISTRO ES DE EQUIPO / ÁREA
+# DETECTAR SI REGISTRO ES DE EQUIPO
 # ============================================================
 
 def es_registro_equipo(
@@ -1939,7 +2433,7 @@ SYSTEM_PROMPT_BASE = (
 
 app = FastAPI(
     title="Penaguillo IA",
-    version="7.4.0",
+    version="7.3.0",
     description=(
         "Backend del asistente inteligente "
         "Penaguillo"
@@ -2136,6 +2630,7 @@ def construir_query_conversacional(
 # ============================================================
 
 @app.post("/chat")
+
 def chat(
     data: ChatRequest,
 ):
@@ -3322,7 +3817,7 @@ def startup_event():
 
     print(
         "🚀 Iniciando "
-        "Penaguillo IA v7.4..."
+        "Penaguillo IA v7.3..."
     )
 
     inicializar_google_drive()
