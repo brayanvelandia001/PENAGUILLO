@@ -455,42 +455,36 @@ def generar_con_gemini(
     gemini_contents = []
 
 
-    # ========================================================
+       # ========================================================
     # CONVERTIR MENSAJES A GEMINI
     # ========================================================
 
     for msg in messages:
 
-        role = msg.get(
-            "role"
-        )
+        role = msg.get("role")
+        content = msg.get("content")
 
-        content = msg.get(
-            "content"
-        )
-
+        # ----------------------------------------------------
+        # SYSTEM
+        # ----------------------------------------------------
 
         if role == "system":
 
-            if isinstance(
-                content,
-                str,
-            ):
+            if isinstance(content, str):
 
                 system_instruction = {
-
                     "parts": [
-
                         {
                             "text": content
                         }
-
                     ]
-
                 }
 
             continue
 
+        # ----------------------------------------------------
+        # ROL GEMINI
+        # ----------------------------------------------------
 
         gemini_role = (
             "model"
@@ -498,45 +492,38 @@ def generar_con_gemini(
             else "user"
         )
 
-
         parts = []
 
+        # ----------------------------------------------------
+        # CONTENIDO DE TEXTO
+        # ----------------------------------------------------
 
-        if isinstance(
-            content,
-            str,
-        ):
+        if isinstance(content, str):
 
             if content.strip():
 
                 parts.append(
-
                     {
                         "text": content
                     }
-
                 )
 
+        # ----------------------------------------------------
+        # CONTENIDO MULTIMODAL
+        # ----------------------------------------------------
 
-        elif isinstance(
-            content,
-            list,
-        ):
+        elif isinstance(content, list):
 
             for item in content:
 
-                if not isinstance(
-                    item,
-                    dict,
-                ):
-
+                if not isinstance(item, dict):
                     continue
 
+                item_type = item.get("type")
 
-                item_type = item.get(
-                    "type"
-                )
-
+                # --------------------------------------------
+                # TEXTO
+                # --------------------------------------------
 
                 if item_type == "text":
 
@@ -548,13 +535,14 @@ def generar_con_gemini(
                     if texto:
 
                         parts.append(
-
                             {
                                 "text": texto
                             }
-
                         )
 
+                # --------------------------------------------
+                # IMAGEN
+                # --------------------------------------------
 
                 elif item_type == "image_url":
 
@@ -563,75 +551,99 @@ def generar_con_gemini(
                         {}
                     )
 
-
                     url_img = image_data.get(
                         "url",
                         ""
                     )
 
+                    if not isinstance(
+                        url_img,
+                        str,
+                    ):
+                        continue
 
                     if not url_img.startswith(
                         "data:"
                     ):
-
                         continue
-
 
                     try:
 
-                        header,
-                        b64_data = url_img.split(
-                            ",",
-                            1,
+                        # ------------------------------------
+                        # SEPARAR MIME Y BASE64
+                        # ------------------------------------
+
+                        encabezado, b64_data = (
+                            url_img.split(
+                                ",",
+                                1,
+                            )
                         )
 
+                        # ------------------------------------
+                        # OBTENER MIME TYPE
+                        # ------------------------------------
+
+                        if ":" not in encabezado:
+
+                            raise ValueError(
+                                "Encabezado MIME inválido."
+                            )
 
                         mime_type = (
-                            header
-                            .split(":")[1]
-                            .split(";")[0]
+                            encabezado
+                            .split(
+                                ":",
+                                1,
+                            )[1]
+                            .split(
+                                ";",
+                                1,
+                            )[0]
+                            .strip()
                         )
 
+                        if not mime_type:
+
+                            raise ValueError(
+                                "MIME type vacío."
+                            )
+
+                        # ------------------------------------
+                        # AGREGAR IMAGEN A GEMINI
+                        # ------------------------------------
 
                         parts.append(
-
                             {
                                 "inlineData": {
-
                                     "mimeType": mime_type,
-
                                     "data": b64_data,
-
                                 }
-
                             }
-
                         )
 
                     except (
                         ValueError,
                         IndexError,
-                    ):
+                    ) as error:
 
                         print(
                             "⚠️ Imagen Base64 "
-                            "con formato inválido."
+                            f"con formato inválido: {error}"
                         )
 
+        # ----------------------------------------------------
+        # AGREGAR MENSAJE
+        # ----------------------------------------------------
 
         if parts:
 
             gemini_contents.append(
-
                 {
                     "role": gemini_role,
-
                     "parts": parts,
-
                 }
-
             )
-
 
     # ========================================================
     # PAYLOAD
