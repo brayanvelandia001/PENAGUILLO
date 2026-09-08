@@ -254,11 +254,11 @@ MAX_OUTPUT_TOKENS = 1200
 # ============================================================
 
 # Antes: 5
-RELEVANCIA_TOP_K = 3
+RELEVANCIA_TOP_K = 8
 
 
 # Antes: 25 KB
-MAX_KB_CONOCIMIENTO_CHAT = 10
+MAX_KB_CONOCIMIENTO_CHAT = 16
 
 MAX_CHARS_CONOCIMIENTO_CHAT = (
     MAX_KB_CONOCIMIENTO_CHAT * 1024
@@ -277,9 +277,9 @@ MAX_MENSAJES_HISTORIAL = 6
 # CONFIGURACIÓN DE BÚSQUEDA CONTEXTUAL
 # ============================================================
 
-MAX_MENSAJES_RETRIEVAL = 2
+MAX_MENSAJES_RETRIEVAL = 4
 
-MAX_CHARS_CONSULTA_RETRIEVAL = 2500
+MAX_CHARS_CONSULTA_RETRIEVAL = 4000
 
 
 # ============================================================
@@ -2931,220 +2931,66 @@ def construir_consulta_retrieval(
     mensaje: str,
     history: list[ChatMessage],
 ) -> str:
-
-    # ========================================================
-    # IMPORTANTE
-    #
-    # mensaje es SIEMPRE la pregunta real actual.
-    #
-    # No se modifica.
-    # No se corta.
-    # No se toma solamente la primera palabra.
-    # ========================================================
-
-    mensaje_actual = (
-        str(mensaje)
-        .strip()
-    )
-
+    """Construye una consulta centrada en la pregunta actual."""
+    mensaje_actual = str(mensaje or "").strip()
 
     if not mensaje_actual:
-
         return ""
 
-
-    palabras_actuales = (
-        extraer_palabras_importantes(
-            mensaje_actual
-        )
-    )
-
+    palabras_actuales = extraer_palabras_importantes(mensaje_actual)
 
     historial_usuario = []
-
-
     if history:
-
         historial_usuario = [
-
-            str(
-                msg.content
-            ).strip()
-
+            str(msg.content).strip()
             for msg in history
-
             if msg.role == "user"
-
-            and str(
-                msg.content
-            ).strip()
-
+            and str(msg.content).strip()
         ]
 
+    anteriores = historial_usuario[-MAX_MENSAJES_RETRIEVAL:]
 
-    anteriores = historial_usuario[
-        -MAX_MENSAJES_RETRIEVAL:
-    ]
+    # Una pregunta normal se busca principalmente por sí misma.
+    # Solo añadimos historial reciente como apoyo para resolver referencias
+    # como "¿y cuál?", "¿y el teléfono?", etc.
+    es_completa = _es_pregunta_completa(mensaje_actual)
+    es_corta = len(palabras_actuales) <= 2 or len(mensaje_actual) <= 12
 
-
-    # ========================================================
-    # PREGUNTA DESCRIPTIVA
-    #
-    # Ejemplo:
-    #
-    # "manejan tratamiento de datos?"
-    #
-    # Se utiliza completa.
-    # ========================================================
-
-    if palabras_actuales:
-
-        partes = [
-            mensaje_actual
-        ]
-
-
-        # Añadir únicamente contexto anterior
-        # cuando puede aportar información.
-        for anterior in anteriores:
-
-            if (
-                normalizar_texto(
-                    anterior
-                )
-                ==
-                normalizar_texto(
-                    mensaje_actual
-                )
-            ):
-
-                continue
-
-
-            palabras_anterior = (
-                extraer_palabras_importantes(
-                    anterior
-                )
-            )
-
-
-            if palabras_anterior:
-
-                partes.append(
-                    anterior
-                )
-
-
-    # ========================================================
-    # PREGUNTA MUY CORTA
-    #
-    # Ejemplos:
-    #
-    # "hola"
-    # "¿y cuál?"
-    # "¿y dónde?"
-    #
-    # Aquí sí usamos historial.
-    # ========================================================
-
+    if es_corta and anteriores:
+        partes = anteriores + [mensaje_actual]
+    elif es_completa:
+        # Para "toda la data de X", mantener la pregunta limpia evita que
+        # palabras de conversaciones anteriores bajen la precisión.
+        partes = [mensaje_actual]
     else:
+        # Una pregunta normal puede beneficiarse únicamente del último
+        # mensaje del usuario, no de todo el historial.
+        partes = [mensaje_actual]
+        if anteriores:
+            ultimo = anteriores[-1]
+            if normalizar_texto(ultimo) != normalizar_texto(mensaje_actual):
+                palabras_ultimo = extraer_palabras_importantes(ultimo)
+                palabras_compartidas = (
+                    set(palabras_actuales) & set(palabras_ultimo)
+                )
+                if palabras_compartidas:
+                    partes.insert(0, ultimo)
 
-        partes = []
+    consulta = " ".join(partes).strip()
 
-
-        for anterior in anteriores:
-
-            partes.append(
-                anterior
-            )
-
-
-        partes.append(
-            mensaje_actual
-        )
-
-
-    consulta = " ".join(
-        partes
-    ).strip()
-
-
-    # ========================================================
-    # LIMITE
-    # ========================================================
-
-    if len(
-        consulta
-    ) > MAX_CHARS_CONSULTA_RETRIEVAL:
-
-        pregunta_actual = (
-            mensaje_actual
-        )
-
-
-        espacio = (
-
-            MAX_CHARS_CONSULTA_RETRIEVAL
-
-            - len(
-                pregunta_actual
-            )
-
-            - 1
-
-        )
-
-
+    if len(consulta) > MAX_CHARS_CONSULTA_RETRIEVAL:
+        # La pregunta actual SIEMPRE conserva prioridad.
+        espacio = MAX_CHARS_CONSULTA_RETRIEVAL - len(mensaje_actual) - 1
         if espacio > 0:
-
-            contexto = " ".join(
-                anteriores
-            )
-
-
-            contexto = contexto[
-                -espacio:
-            ]
-
-
-            consulta = (
-
-                contexto
-
-                + " "
-
-                + pregunta_actual
-
-            )
-
+            contexto = " ".join(partes[:-1])
+            consulta = contexto[-espacio:] + " " + mensaje_actual
         else:
+            consulta = mensaje_actual[:MAX_CHARS_CONSULTA_RETRIEVAL]
 
-            consulta = (
-                pregunta_actual[
-                    :MAX_CHARS_CONSULTA_RETRIEVAL
-                ]
-            )
-
-
-    print(
-        "🧠 Consulta de búsqueda contextual:"
-    )
-
-
-    print(
-        f"   {consulta}"
-    )
-
-
-    print(
-        "🎯 Pregunta actual priorizada:"
-    )
-
-
-    print(
-        f"   {mensaje_actual}"
-    )
-
+    print("🧠 Consulta de búsqueda contextual:")
+    print(f"   {consulta}")
+    print("🎯 Pregunta actual priorizada:")
+    print(f"   {mensaje_actual}")
 
     return consulta
 
@@ -3153,275 +2999,175 @@ def construir_consulta_retrieval(
 # RELEVANCIA DE UN REGISTRO
 # ============================================================
 
+def _es_pregunta_completa(pregunta: str) -> bool:
+    """Detecta solicitudes donde el usuario quiere toda la información disponible."""
+    texto = normalizar_texto(str(pregunta or ""))
+
+    patrones = (
+        "toda la informacion",
+        "toda la info",
+        "toda la data",
+        "todos los datos",
+        "toda la informacion disponible",
+        "datos completos",
+        "informacion completa",
+        "ficha completa",
+        "perfil completo",
+        "dame todo",
+        "dime todo",
+        "todo sobre",
+        "que sabes de",
+        "que informacion tienes de",
+        "que datos tienes de",
+    )
+
+    return any(patron in texto for patron in patrones)
+
+
+def _coincidencias_palabras(texto: str, palabras: list[str]) -> int:
+    """Cuenta palabras importantes presentes como palabras completas."""
+    if not texto or not palabras:
+        return 0
+
+    total = 0
+    for palabra in palabras:
+        if re.search(rf"\b{re.escape(palabra)}\b", texto):
+            total += 1
+    return total
+
+
 def calcular_relevancia(
     pregunta: str,
     item: dict[str, Any],
     pregunta_actual: str | None = None,
 ) -> float:
+    """
+    Calcula relevancia dando mucha más importancia a la pregunta actual.
 
-    palabras = (
-        extraer_palabras_importantes(
-            pregunta
-        )
-    )
-
-
-    palabras_actuales = (
-        extraer_palabras_importantes(
-
-            pregunta_actual
-
-            if pregunta_actual
-
-            else pregunta
-
-        )
-    )
-
-
-    # ========================================================
-    # Si la pregunta actual no tiene palabras útiles,
-    # utilizamos las palabras de la consulta contextual.
-    # ========================================================
+    En solicitudes de información completa se busca especialmente que todos
+    los registros que compartan la persona/área/entidad principal entren al
+    contexto, aunque cada registro contenga campos diferentes.
+    """
+    palabras = extraer_palabras_importantes(pregunta)
+    actual = pregunta_actual if pregunta_actual else pregunta
+    palabras_actuales = extraer_palabras_importantes(actual)
 
     if not palabras_actuales:
-
         palabras_actuales = palabras
 
-
     if not palabras:
-
         return 0.0
 
+    titulo = normalizar_texto(str(item.get("titulo", "")))
+    contenido = normalizar_texto(str(item.get("contenido", "")))
+    descripcion = normalizar_texto(str(item.get("descripcion", "")))
+    tipo = normalizar_texto(str(item.get("tipo", "")))
 
-    titulo = normalizar_texto(
-        str(
-            item.get(
-                "titulo",
-                "",
-            )
-        )
-    )
-
-
-    contenido = normalizar_texto(
-        str(
-            item.get(
-                "contenido",
-                "",
-            )
-        )
-    )
-
-
-    descripcion = normalizar_texto(
-        str(
-            item.get(
-                "descripcion",
-                "",
-            )
-        )
-    )
-
-
-    tipo = normalizar_texto(
-        str(
-            item.get(
-                "tipo",
-                "",
-            )
-        )
-    )
-
-
-    texto_completo = " ".join(
-
-        [
-
-            titulo,
-            contenido,
-            descripcion,
-            tipo,
-
-        ]
-
-    )
-
+    texto_completo = " ".join((titulo, contenido, descripcion, tipo))
+    pregunta_normalizada = normalizar_texto(actual)
 
     puntuacion = 0.0
+    es_completa = _es_pregunta_completa(actual)
 
+    # ------------------------------------------------------------
+    # 1. Coincidencias de la pregunta ACTUAL
+    # ------------------------------------------------------------
+    coincidencias_actuales = _coincidencias_palabras(
+        texto_completo,
+        palabras_actuales,
+    )
 
-    # ========================================================
-    # PALABRAS DE LA PREGUNTA ACTUAL
-    # ========================================================
+    coincidencias_titulo = 0
+    coincidencias_descripcion = 0
+    coincidencias_contenido = 0
 
     for palabra in palabras_actuales:
+        patron = rf"\b{re.escape(palabra)}\b"
+        coincidencias_titulo += len(re.findall(patron, titulo))
+        coincidencias_descripcion += len(re.findall(patron, descripcion))
+        coincidencias_contenido += len(re.findall(patron, contenido))
 
-        patron = (
-            rf"\b{re.escape(palabra)}\b"
+    puntuacion += coincidencias_titulo * 24
+    puntuacion += coincidencias_descripcion * 10
+    puntuacion += min(coincidencias_contenido * 3, 18)
+
+    # ------------------------------------------------------------
+    # 2. Coincidencia de frases completas
+    # ------------------------------------------------------------
+    # Muy útil para nombres completos como "Santiago Cruz Buendía".
+    palabras_frase = [p for p in palabras_actuales if len(p) >= 3]
+    if len(palabras_frase) >= 2:
+        frase = " ".join(palabras_frase)
+        if frase and frase in texto_completo:
+            puntuacion += 55
+
+    # ------------------------------------------------------------
+    # 3. Cobertura de la pregunta actual
+    # ------------------------------------------------------------
+    if palabras_actuales:
+        cobertura = coincidencias_actuales / len(palabras_actuales)
+
+        if cobertura >= 0.50:
+            puntuacion += 12
+        if cobertura >= 0.75:
+            puntuacion += 20
+        if cobertura >= 1.0:
+            puntuacion += 35
+
+    # ------------------------------------------------------------
+    # 4. Para "toda la data", los registros que comparten la
+    #    entidad principal deben sobrevivir aunque tengan campos
+    #    diferentes.
+    # ------------------------------------------------------------
+    if es_completa:
+        # Las primeras palabras importantes suelen contener la entidad
+        # solicitada (persona, área, proyecto, equipo, etc.).
+        entidad = palabras_actuales[:4]
+        coincidencias_entidad = _coincidencias_palabras(
+            texto_completo,
+            entidad,
         )
 
+        if coincidencias_entidad >= 1:
+            puntuacion += 8
+        if coincidencias_entidad >= 2:
+            puntuacion += 25
+        if coincidencias_entidad >= 3:
+            puntuacion += 35
 
-        coincidencias_titulo = len(
+        # Si la entidad aparece en título o descripción, este registro
+        # es especialmente útil para completar la ficha.
+        if _coincidencias_palabras(titulo, entidad) >= 1:
+            puntuacion += 15
+        if _coincidencias_palabras(descripcion, entidad) >= 1:
+            puntuacion += 8
 
-            re.findall(
-                patron,
-                titulo,
-            )
-
-        )
-
-
-        coincidencias_descripcion = len(
-
-            re.findall(
-                patron,
-                descripcion,
-            )
-
-        )
-
-
-        coincidencias_contenido = len(
-
-            re.findall(
-                patron,
-                contenido,
-            )
-
-        )
-
-
-        # Título tiene mayor peso.
-        puntuacion += (
-            coincidencias_titulo
-            * 18
-        )
-
-
-        puntuacion += (
-            coincidencias_descripcion
-            * 8
-        )
-
-
-        puntuacion += min(
-
-            coincidencias_contenido
-            * 2,
-
-            12,
-
-        )
-
-
-    # ========================================================
-    # CONTEXTO DE CONVERSACIÓN
-    # ========================================================
-
+    # ------------------------------------------------------------
+    # 5. Historial: solo como apoyo, nunca por encima de la pregunta
+    #    actual.
+    # ------------------------------------------------------------
     palabras_contexto = [
-
-        palabra
-
-        for palabra in palabras
-
-        if palabra
-        not in palabras_actuales
-
+        palabra for palabra in palabras
+        if palabra not in palabras_actuales
     ]
 
-
     for palabra in palabras_contexto:
+        patron = rf"\b{re.escape(palabra)}\b"
 
-        patron = (
-            rf"\b{re.escape(palabra)}\b"
-        )
-
-
-        if re.search(
-            patron,
-            titulo,
-        ):
-
-            puntuacion += 5
-
-
-        if re.search(
-            patron,
-            descripcion,
-        ):
-
+        if re.search(patron, titulo):
+            puntuacion += 4
+        if re.search(patron, descripcion):
             puntuacion += 2
 
+        coincidencias = len(re.findall(patron, texto_completo))
+        puntuacion += min(coincidencias * 0.5, 3)
 
-        coincidencias = len(
-
-            re.findall(
-                patron,
-                texto_completo,
-            )
-
-        )
-
-
-        puntuacion += min(
-
-            coincidencias
-            * 0.75,
-
-            4,
-
-        )
-
-
-    # ========================================================
-    # BONUS DE VARIAS PALABRAS ACTUALES
-    # ========================================================
-
-    palabras_en_texto = set(
-        texto_completo.split()
-    )
-
-
-    coincidencias_actuales = (
-
-        set(
-            palabras_actuales
-        )
-
-        & palabras_en_texto
-
-    )
-
-
-    cantidad_actuales = len(
-        coincidencias_actuales
-    )
-
-
-    if cantidad_actuales >= 2:
-
-        puntuacion += (
-            cantidad_actuales
-            * 8
-        )
-
-
-    if (
-
-        palabras_actuales
-
-        and
-
-        cantidad_actuales
-        == len(
-            palabras_actuales
-        )
-
-    ):
-
-        puntuacion += 30
-
+    # ------------------------------------------------------------
+    # 6. Una pregunta completa debe devolver información, no solo
+    #    el registro que tenga el mayor score.
+    # ------------------------------------------------------------
+    if es_completa and coincidencias_actuales >= 1:
+        puntuacion += 6
 
     return puntuacion
 
@@ -3511,162 +3257,123 @@ def buscar_conocimiento_relevante(
     top_k: int = RELEVANCIA_TOP_K,
     pregunta_actual: str | None = None,
 ) -> list[dict[str, Any]]:
-
+    """Busca y selecciona conocimiento, ampliando resultados para preguntas completas."""
     if not conocimientos:
-
         return []
 
+    actual = pregunta_actual if pregunta_actual else pregunta
+    es_completa = _es_pregunta_completa(actual)
 
     resultados = []
-
     claves_vistas = set()
 
-
-    for indice, item in enumerate(
-        conocimientos
-    ):
-
-        clave = (
-            clave_unica_conocimiento(
-                item
-            )
-        )
-
-
-        if clave in claves_vistas:
-
-            continue
-
-
-        claves_vistas.add(
-            clave
-        )
-
-
-        puntuacion = (
-            calcular_relevancia(
-
-                pregunta,
-
-                item,
-
-                pregunta_actual,
-
-            )
-        )
-
-
-        # ====================================================
-        # FILTRO MÍNIMO
-        #
-        # Evita documentos con coincidencias demasiado débiles.
-        # ====================================================
-
-        if puntuacion >= 3:
-
-            resultados.append(
-
-                (
-
-                    puntuacion,
-
-                    indice,
-
-                    item,
-
-                )
-
-            )
-
-
-    resultados.sort(
-
-        key=lambda elemento: (
-
-            elemento[0],
-
-            -elemento[1],
-
-        ),
-
-        reverse=True,
-
-    )
-
-
-    seleccionados = [
-
-        item
-
-        for _, _, item
-
-        in resultados[:top_k]
-
+    palabras_actuales = extraer_palabras_importantes(actual)
+    # Quitamos palabras típicas de intención para que no se conviertan en
+    # la "entidad" principal de una búsqueda de información completa.
+    palabras_entidad = [
+        p for p in palabras_actuales
+        if p not in {
+            "toda", "todo", "datos", "data", "informacion", "info",
+            "completa", "completo", "disponible", "ficha", "perfil",
+            "dame", "dime", "sabes", "tienes",
+        }
     ]
 
+    for indice, item in enumerate(conocimientos):
+        clave = clave_unica_conocimiento(item)
 
-    print(
-        "🔎 Búsqueda de conocimiento:"
-    )
+        if clave in claves_vistas:
+            continue
 
+        claves_vistas.add(clave)
 
-    print(
-        f"   Registros totales: "
-        f"{len(conocimientos)}"
-    )
-
-
-    print(
-        f"   Registros únicos evaluados: "
-        f"{len(claves_vistas)}"
-    )
-
-
-    print(
-        f"   Registros relevantes: "
-        f"{len(seleccionados)}"
-    )
-
-
-    if (
-        len(conocimientos)
-        != len(claves_vistas)
-    ):
-
-        print(
-
-            "♻️ Duplicados ignorados durante retrieval: "
-
-            f"{len(conocimientos) - len(claves_vistas)}"
-
+        puntuacion = calcular_relevancia(
+            pregunta,
+            item,
+            actual,
         )
 
-
-    if resultados:
-
-        for puntuacion, _, item in (
-
-            resultados[:top_k]
-
-        ):
-
-            print(
-
-                "   📌 "
-
-                f"{item.get('titulo', '')} "
-
-                f"(score={puntuacion:.1f})"
-
+        # --------------------------------------------------------
+        # Refuerzo de entidad para solicitudes completas.
+        # Permite reunir varios registros de una misma persona/área.
+        # --------------------------------------------------------
+        if es_completa and palabras_entidad:
+            texto_item = normalizar_texto(
+                " ".join(
+                    (
+                        str(item.get("titulo", "")),
+                        str(item.get("contenido", "")),
+                        str(item.get("descripcion", "")),
+                        str(item.get("tipo", "")),
+                    )
+                )
             )
 
-    else:
+            coincidencias_entidad = _coincidencias_palabras(
+                texto_item,
+                palabras_entidad,
+            )
 
+            if coincidencias_entidad >= 1:
+                puntuacion += 10
+            if coincidencias_entidad >= 2:
+                puntuacion += 20
+            if coincidencias_entidad >= 3:
+                puntuacion += 30
+
+            # Una coincidencia en el título es una señal fuerte de que
+            # el registro pertenece directamente a la entidad solicitada.
+            titulo = normalizar_texto(str(item.get("titulo", "")))
+            if _coincidencias_palabras(titulo, palabras_entidad) >= 1:
+                puntuacion += 20
+
+        # El umbral sigue evitando ruido, pero es más permisivo cuando
+        # el usuario pidió explícitamente toda la información.
+        umbral = 2 if es_completa else 3
+
+        if puntuacion >= umbral:
+            resultados.append((puntuacion, indice, item))
+
+    resultados.sort(
+        key=lambda elemento: (
+            elemento[0],
+            -elemento[1],
+        ),
+        reverse=True,
+    )
+
+    limite_resultados = (
+        min(len(resultados), max(top_k, 12))
+        if es_completa
+        else top_k
+    )
+
+    seleccionados = [
+        item
+        for _, _, item in resultados[:limite_resultados]
+    ]
+
+    print("🔎 Búsqueda de conocimiento:")
+    print(f"   Registros totales: {len(conocimientos)}")
+    print(f"   Registros únicos evaluados: {len(claves_vistas)}")
+    print(f"   Solicitud completa: {'SÍ' if es_completa else 'NO'}")
+    print(f"   Registros relevantes: {len(seleccionados)}")
+
+    if len(conocimientos) != len(claves_vistas):
         print(
-            "   ℹ️ No se encontraron "
-            "coincidencias relevantes."
+            "♻️ Duplicados ignorados durante retrieval: "
+            f"{len(conocimientos) - len(claves_vistas)}"
         )
 
+    if resultados:
+        for puntuacion, _, item in resultados[:limite_resultados]:
+            print(
+                "   📌 "
+                f"{item.get('titulo', '')} "
+                f"(score={puntuacion:.1f})"
+            )
+    else:
+        print("   ℹ️ No se encontraron coincidencias relevantes.")
 
     return seleccionados
 
@@ -4467,6 +4174,15 @@ palabra aislada del mensaje.
 
             + conocimiento_relevante
 
+            + "\n\n==============================\n"
+            + "REGLAS DE COMPLETITUD\n"
+            + "==============================\n"
+            + "Si el usuario pide toda la información, toda la data, datos completos, ficha completa, perfil completo o pregunta qué sabes sobre una persona, área, equipo o tema, reúne TODOS los registros relevantes incluidos en el contexto.\n"
+            + "Si existen varios registros sobre la misma entidad, combínalos en una sola respuesta y no obligues al usuario a pedir cada campo por separado.\n"
+            + "Entrega primero los datos concretos disponibles y después los detalles adicionales.\n"
+            + "Nunca inventes un dato que no aparezca en el conocimiento. Si falta un dato, simplemente indícalo.\n"
+            + "No descartes un registro relevante solo porque contenga un campo diferente: puede complementar la información de otro registro.\n"
+
         )
 
 
@@ -4587,6 +4303,9 @@ palabra aislada del mensaje.
             "a Gemini: "
             f"{len(mensajes_api)}"
         )
+
+        print("🎯 MENSAJE FINAL ENVIADO A GEMINI:")
+        print(f"   {mensaje}")
 
 
         # ====================================================
