@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 6.1 (Corregido: Retrieval de Equipos + Fuzzy Matching)
+# VERSIÓN 6.1 (Corregido: Retrieval de Equipos + Fuzzy Matching + Conteo)
 #
 # PROVEEDOR DE IA:
 # - Google Gemini Native API
@@ -245,6 +245,7 @@ MAX_OUTPUT_TOKENS = 1200
 
 RELEVANCIA_TOP_K = 8
 
+# CAMBIADO DE 16 a 32 PARA SOPORTAR EQUIPOS GRANDES
 MAX_KB_CONOCIMIENTO_CHAT = 32
 
 MAX_CHARS_CONOCIMIENTO_CHAT = (
@@ -4093,6 +4094,8 @@ def chat(
             "DE CONOCIMIENTO\n"
 
             + "==============================\n"
+
+            + f"DATO IMPORTANTE: Actualmente tienes exactamente {len(conocimientos)} registros en tu base de datos local.\n\n"
 
             + """
 
