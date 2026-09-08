@@ -1,24 +1,26 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 7.2
+# VERSIÓN 7.3
 #
 # PROVEEDOR:
 # - Google Gemini Native API
 #
 # MODELOS:
 # - CHAT/VISION: gemini-3.5-flash-lite
-# - EMBEDDINGS: text-embedding-004
 #
-# MEJORAS:
-# - Búsqueda híbrida vectorial + textual
-# - Regeneración automática de embeddings cuando cambia el texto
-# - Mejor recuperación de equipos/personas
-# - Protección de correos, teléfonos y URLs
-# - Mejor continuidad conversacional
-# - No altera subida de imágenes
-# - No altera subida de PDF
-# - Google Drive conservado
+# CAMBIOS 7.3:
+# - Embeddings deshabilitados temporalmente porque
+#   text-embedding-004 devuelve HTTP 404.
+# - Búsqueda textual rápida y priorizada.
+# - Detección directa de equipos.
+# - Detección directa de personas.
+# - Protección de correos y teléfonos literales.
+# - Mejor recuperación de equipos completos.
+# - Evita saturar scores en 1.000.
+# - No altera subida de imágenes.
+# - No altera subida de PDF.
+# - Google Drive conservado.
 # ============================================================
 
 import base64
@@ -114,6 +116,26 @@ GEMINI_MODEL = os.getenv(
     "gemini-3.5-flash-lite",
 )
 
+# ============================================================
+# EMBEDDINGS
+# ============================================================
+#
+# IMPORTANTE:
+#
+# text-embedding-004 está devolviendo HTTP 404 en la API
+# que está utilizando actualmente Penaguillo.
+#
+# Por eso se deshabilita para evitar:
+# - llamadas innecesarias
+# - errores 404
+# - lentitud
+# - regeneración de embeddings en cada búsqueda
+#
+# La búsqueda textual continúa funcionando.
+# ============================================================
+
+EMBEDDINGS_HABILITADOS = False
+
 EMBEDDING_MODEL = "text-embedding-004"
 
 CHAT_MODEL = GEMINI_MODEL
@@ -121,12 +143,10 @@ VISION_MODEL = GEMINI_MODEL
 
 MAX_OUTPUT_TOKENS = 1200
 
-# Cantidad máxima de registros enviados al modelo
 RELEVANCIA_TOP_K = 10
 
 MAX_MENSAJES_HISTORIAL = 6
 
-# Umbral vectorial
 UMBRAL_VECTOR = 0.30
 
 
@@ -136,6 +156,76 @@ if not GEMINI_API_KEY:
     )
 else:
     print("🔑 GEMINI_API_KEY: configurada")
+
+print(
+    "🔎 Motor de búsqueda: "
+    "textual prioritaria"
+)
+
+if not EMBEDDINGS_HABILITADOS:
+    print(
+        "ℹ️ Embeddings deshabilitados "
+        "temporalmente."
+    )
+
+
+# ============================================================
+# EQUIPOS CONOCIDOS
+# ============================================================
+
+EQUIPOS_CONOCIDOS = {
+    "modernizacion": [
+        "modernizacion",
+        "modernizacion tecnologica",
+    ],
+    "operaciones": [
+        "operaciones",
+    ],
+    "optimizacion": [
+        "optimizacion",
+    ],
+    "comercial": [
+        "comercial",
+    ],
+    "nomina": [
+        "nomina",
+    ],
+    "soporte": [
+        "soporte",
+        "soporte tecnico",
+    ],
+    "sistemas": [
+        "sistemas",
+        "tecnologia",
+    ],
+}
+
+
+# ============================================================
+# INTENCIONES DE EQUIPO
+# ============================================================
+
+INTENCIONES_EQUIPO = [
+    "quienes conforman",
+    "quienes son",
+    "quienes integran",
+    "integrantes",
+    "miembros",
+    "personas que conforman",
+    "personas del equipo",
+    "equipo esta conformado",
+    "equipo esta formado",
+    "conformado por",
+    "formado por",
+    "cuantos son",
+    "cuantas personas",
+    "cuantas personas son",
+    "quien forma parte",
+    "quienes forman parte",
+    "conoces el equipo",
+    "conoce el equipo",
+    "equipo de",
+]
 
 
 # ============================================================
@@ -154,6 +244,10 @@ class GeminiError(RuntimeError):
         self.status_code = status_code
         self.retry_after = retry_after
 
+
+# ============================================================
+# GEMINI — RETRY AFTER
+# ============================================================
 
 def extraer_retry_after(
     respuesta: requests.Response,
@@ -508,8 +602,15 @@ def obtener_embedding(
 ) -> list[float]:
 
     """
-    Convierte un texto en vector usando Gemini.
+    Obtiene un embedding cuando los embeddings
+    están habilitados.
+
+    Actualmente está deshabilitado porque
+    text-embedding-004 devuelve HTTP 404.
     """
+
+    if not EMBEDDINGS_HABILITADOS:
+        return []
 
     if (
         not GEMINI_API_KEY
@@ -580,13 +681,6 @@ def obtener_embedding(
 def hash_conocimiento(
     item: dict[str, Any],
 ) -> str:
-
-    """
-    Crea una huella del contenido.
-
-    Si el contenido cambia, el embedding se vuelve
-    automáticamente obsoleto y se regenera.
-    """
 
     texto = (
         f"{item.get('titulo', '')}\n"
@@ -660,6 +754,225 @@ def tokens_texto(
 
 
 # ============================================================
+# DETECTAR EQUIPO
+# ============================================================
+
+def detectar_tema_equipo(
+    pregunta: str,
+) -> str | None:
+
+    pregunta_n = normalizar_texto(
+        pregunta
+    )
+
+    for equipo, aliases in EQUIPOS_CONOCIDOS.items():
+
+        for alias in aliases:
+
+            if alias in pregunta_n:
+                return equipo
+
+    return None
+
+
+# ============================================================
+# DETECTAR INTENCIÓN DE EQUIPO
+# ============================================================
+
+def es_intencion_equipo(
+    pregunta: str,
+) -> bool:
+
+    pregunta_n = normalizar_texto(
+        pregunta
+    )
+
+    return any(
+        intencion in pregunta_n
+        for intencion in INTENCIONES_EQUIPO
+    )
+
+
+# ============================================================
+# DETECTAR SI REGISTRO ES DE EQUIPO
+# ============================================================
+
+def es_registro_equipo(
+    item: dict[str, Any],
+    tema: str,
+) -> bool:
+
+    if not tema:
+        return False
+
+    titulo = normalizar_texto(
+        item.get("titulo", "")
+    )
+
+    contenido = normalizar_texto(
+        item.get("contenido", "")
+    )
+
+    aliases = EQUIPOS_CONOCIDOS.get(
+        tema,
+        [tema],
+    )
+
+    tiene_tema_titulo = any(
+        alias in titulo
+        for alias in aliases
+    )
+
+    tiene_tema_contenido = any(
+        alias in contenido
+        for alias in aliases
+    )
+
+    es_equipo_titulo = (
+        "equipo" in titulo
+        or "area" in titulo
+        or "grupo" in titulo
+    )
+
+    if (
+        tiene_tema_titulo
+        and es_equipo_titulo
+    ):
+        return True
+
+    if (
+        tiene_tema_titulo
+        and "conformado" in contenido
+    ):
+        return True
+
+    if (
+        tiene_tema_contenido
+        and "equipo" in contenido
+        and "conformado" in contenido
+    ):
+        return True
+
+    return False
+
+
+# ============================================================
+# COINCIDENCIA DE PERSONA
+# ============================================================
+
+def puntuacion_persona(
+    pregunta: str,
+    item: dict[str, Any],
+) -> float:
+
+    pregunta_n = normalizar_texto(
+        pregunta
+    )
+
+    texto_item = normalizar_texto(
+        (
+            f"{item.get('titulo', '')} "
+            f"{item.get('contenido', '')} "
+            f"{item.get('descripcion', '')}"
+        )
+    )
+
+    tokens_pregunta = tokens_texto(
+        pregunta_n
+    )
+
+    tokens_item = tokens_texto(
+        texto_item
+    )
+
+    if not tokens_pregunta:
+        return 0.0
+
+    palabras_ignoradas = {
+        "quien",
+        "quienes",
+        "quien",
+        "es",
+        "el",
+        "la",
+        "los",
+        "las",
+        "del",
+        "de",
+        "un",
+        "una",
+        "equipo",
+        "area",
+        "persona",
+        "personas",
+        "correo",
+        "correos",
+        "telefono",
+        "telefonos",
+        "celular",
+        "celulares",
+        "sus",
+        "son",
+        "y",
+        "en",
+        "para",
+        "que",
+    }
+
+    candidatos = {
+        token
+        for token in tokens_pregunta
+        if (
+            len(token) >= 4
+            and token not in palabras_ignoradas
+        )
+    }
+
+    if not candidatos:
+        return 0.0
+
+    coincidencias = [
+        token
+        for token in candidatos
+        if token in tokens_item
+    ]
+
+    if not coincidencias:
+        return 0.0
+
+    score = 0.0
+
+    # Dos o más palabras de nombre coincidentes
+    # es una señal muy fuerte.
+    if len(coincidencias) >= 2:
+        score += 0.70
+
+    elif len(coincidencias) == 1:
+        score += 0.40
+
+    # Refuerzo si aparecen juntas en el contenido.
+    for i, token_a in enumerate(
+        coincidencias
+    ):
+
+        for token_b in coincidencias[
+            i + 1:
+        ]:
+
+            frase = (
+                f"{token_a} {token_b}"
+            )
+
+            if frase in texto_item:
+                score += 0.20
+
+    return min(
+        score,
+        0.95,
+    )
+
+
+# ============================================================
 # SIMILITUD COSENO
 # ============================================================
 
@@ -708,35 +1021,33 @@ def similitud_textual(
     item: dict[str, Any],
 ) -> float:
 
-    """
-    Búsqueda textual complementaria.
-
-    Es especialmente importante para:
-    - nombres
-    - equipos
-    - cargos
-    - emails
-    - teléfonos
-    - URLs
-    """
-
-    pregunta_normalizada = normalizar_texto(
+    pregunta_n = normalizar_texto(
         pregunta
     )
 
-    texto_item = normalizar_texto(
-        (
-            f"{item.get('titulo', '')} "
-            f"{item.get('contenido', '')} "
-            f"{item.get('descripcion', '')}"
-        )
+    titulo_n = normalizar_texto(
+        item.get("titulo", "")
     )
 
-    if not pregunta_normalizada or not texto_item:
+    contenido_n = normalizar_texto(
+        item.get("contenido", "")
+    )
+
+    descripcion_n = normalizar_texto(
+        item.get("descripcion", "")
+    )
+
+    texto_item = (
+        f"{titulo_n} "
+        f"{contenido_n} "
+        f"{descripcion_n}"
+    ).strip()
+
+    if not pregunta_n or not texto_item:
         return 0.0
 
     tokens_pregunta = tokens_texto(
-        pregunta_normalizada
+        pregunta_n
     )
 
     tokens_item = tokens_texto(
@@ -751,76 +1062,100 @@ def similitud_textual(
         & tokens_item
     )
 
-    score = (
-        len(coincidencias)
-        / max(
-            len(tokens_pregunta),
-            1,
-        )
-    )
+    score = 0.0
 
     # --------------------------------------------------------
-    # Coincidencia fuerte de frases
+    # COINCIDENCIA DE TOKENS
+    # --------------------------------------------------------
+
+    if coincidencias:
+
+        score += (
+            len(coincidencias)
+            / max(
+                len(tokens_pregunta),
+                1,
+            )
+        ) * 0.45
+
+    # --------------------------------------------------------
+    # COINCIDENCIA DE TEMA
+    # --------------------------------------------------------
+
+    tema = detectar_tema_equipo(
+        pregunta_n
+    )
+
+    if tema:
+
+        aliases = EQUIPOS_CONOCIDOS.get(
+            tema,
+            [tema],
+        )
+
+        if any(
+            alias in titulo_n
+            for alias in aliases
+        ):
+            score += 0.35
+
+        elif any(
+            alias in contenido_n
+            for alias in aliases
+        ):
+            score += 0.18
+
+    # --------------------------------------------------------
+    # COINCIDENCIA DE PERSONA
+    # --------------------------------------------------------
+
+    score += puntuacion_persona(
+        pregunta,
+        item,
+    ) * 0.55
+
+    # --------------------------------------------------------
+    # COINCIDENCIA EXACTA DE FRASE
     # --------------------------------------------------------
 
     palabras_importantes = [
         palabra
         for palabra in tokens_pregunta
-        if len(palabra) >= 4
+        if len(palabra) >= 5
     ]
 
-    for palabra in palabras_importantes:
-
-        if palabra in texto_item:
-
-            score += 0.08
-
-    # --------------------------------------------------------
-    # Nombres propios / nombres completos
-    # --------------------------------------------------------
-
-    contenido = normalizar_texto(
-        item.get("contenido", "")
+    coincidencias_titulo = sum(
+        1
+        for palabra in palabras_importantes
+        if palabra in titulo_n
     )
 
-    titulo = normalizar_texto(
-        item.get("titulo", "")
+    coincidencias_contenido = sum(
+        1
+        for palabra in palabras_importantes
+        if palabra in contenido_n
     )
 
-    # Palabras clave de equipos
-    palabras_equipo = [
-        "modernizacion",
-        "operaciones",
-        "optimizacion",
-        "comercial",
-        "nomina",
-        "soporte",
-        "sistemas",
-        "tecnologia",
-    ]
+    if coincidencias_titulo:
+        score += min(
+            coincidencias_titulo * 0.10,
+            0.25,
+        )
 
-    for palabra in palabras_equipo:
-
-        if (
-            palabra in pregunta_normalizada
-            and palabra in titulo
-        ):
-            score += 0.30
-
-        elif (
-            palabra in pregunta_normalizada
-            and palabra in contenido
-        ):
-            score += 0.15
+    elif coincidencias_contenido:
+        score += min(
+            coincidencias_contenido * 0.05,
+            0.15,
+        )
 
     return min(
         score,
-        1.0,
+        0.99,
     )
 
 
 # ============================================================
-# DETECTAR SI DOS REGISTROS HABLAN DEL MISMO TEMA
+# DETECTAR MISMO TEMA
 # ============================================================
 
 def pertenece_al_mismo_tema(
@@ -828,50 +1163,21 @@ def pertenece_al_mismo_tema(
     item: dict[str, Any],
 ) -> bool:
 
-    """
-    Detecta temas importantes de directorio.
-
-    No sustituye la búsqueda vectorial.
-    Sirve para reforzar preguntas de equipos/personas.
-    """
-
-    pregunta_n = normalizar_texto(
+    tema = detectar_tema_equipo(
         pregunta
     )
 
-    titulo_n = normalizar_texto(
-        item.get("titulo", "")
+    if not tema:
+        return False
+
+    return es_registro_equipo(
+        item,
+        tema,
     )
-
-    contenido_n = normalizar_texto(
-        item.get("contenido", "")
-    )
-
-    temas = [
-        "modernizacion",
-        "operaciones",
-        "optimizacion",
-        "comercial",
-        "nomina",
-        "soporte tecnico",
-        "soporte",
-    ]
-
-    for tema in temas:
-
-        if tema in pregunta_n:
-
-            if (
-                tema in titulo_n
-                or tema in contenido_n
-            ):
-                return True
-
-    return False
 
 
 # ============================================================
-# BÚSQUEDA HÍBRIDA
+# BÚSQUEDA HÍBRIDA / TEXTUAL
 # ============================================================
 
 def buscar_conocimiento_vectorial(
@@ -881,12 +1187,14 @@ def buscar_conocimiento_vectorial(
 ) -> list[dict[str, Any]]:
 
     """
-    Búsqueda híbrida:
+    Búsqueda optimizada.
 
-    1. Embedding semántico.
-    2. Coincidencia textual.
-    3. Prioridad para nombres/equipos.
-    4. Regeneración de embeddings obsoletos.
+    Actualmente:
+    - NO realiza llamadas de embedding.
+    - Busca por texto.
+    - Detecta equipos directamente.
+    - Detecta personas directamente.
+    - Fuerza el registro correcto al principio.
     """
 
     if (
@@ -909,97 +1217,59 @@ def buscar_conocimiento_vectorial(
         f"{len(conocimientos)}"
     )
 
+    pregunta_n = normalizar_texto(
+        pregunta
+    )
+
+    tema = detectar_tema_equipo(
+        pregunta_n
+    )
+
+    intencion_equipo = (
+        es_intencion_equipo(
+            pregunta_n
+        )
+    )
+
+    resultados = []
+
     # --------------------------------------------------------
-    # EMBEDDING DE LA PREGUNTA
+    # EMBEDDING DE PREGUNTA
+    # --------------------------------------------------------
+    #
+    # obtener_embedding() retorna inmediatamente []
+    # cuando EMBEDDINGS_HABILITADOS=False.
+    #
     # --------------------------------------------------------
 
     v_pregunta = obtener_embedding(
         pregunta
     )
 
-    resultados = []
-    actualizados = False
-
     # --------------------------------------------------------
-    # EVALUAR TODO EL JSON
+    # EVALUAR CONOCIMIENTO
     # --------------------------------------------------------
 
     for item in conocimientos:
 
-        # ----------------------------------------------------
-        # EMBEDDING ACTUAL
-        # ----------------------------------------------------
+        score_vectorial = 0.0
 
         embedding_guardado = item.get(
             "embedding",
             [],
         )
 
-        hash_actual = hash_conocimiento(
-            item
-        )
-
-        hash_guardado = item.get(
-            "embedding_hash",
-            "",
-        )
-
-        # ----------------------------------------------------
-        # REGENERAR SI:
-        # - no existe embedding
-        # - cambió contenido
-        # ----------------------------------------------------
-
+        # Solo se utilizan embeddings si están habilitados.
         if (
-            not embedding_guardado
-            or hash_guardado != hash_actual
+            EMBEDDINGS_HABILITADOS
+            and v_pregunta
+            and embedding_guardado
         ):
-
-            texto_embedding = (
-                texto_para_embedding(item)
-            )
-
-            nuevo_embedding = obtener_embedding(
-                texto_embedding
-            )
-
-            if nuevo_embedding:
-
-                item["embedding"] = (
-                    nuevo_embedding
-                )
-
-                item["embedding_hash"] = (
-                    hash_actual
-                )
-
-                embedding_guardado = (
-                    nuevo_embedding
-                )
-
-                actualizados = True
-
-                print(
-                    "♻️ Embedding actualizado: "
-                    f"{item.get('titulo', '')}"
-                )
-
-        # ----------------------------------------------------
-        # SCORE VECTORIAL
-        # ----------------------------------------------------
-
-        score_vectorial = 0.0
-
-        if v_pregunta and embedding_guardado:
 
             score_vectorial = sim_coseno(
                 v_pregunta,
                 embedding_guardado,
             )
-
-        # ----------------------------------------------------
-        # SCORE TEXTUAL
-        # ----------------------------------------------------
 
         score_textual = similitud_textual(
             pregunta,
@@ -1007,10 +1277,13 @@ def buscar_conocimiento_vectorial(
         )
 
         # ----------------------------------------------------
-        # SCORE FINAL
+        # SCORE BASE
         # ----------------------------------------------------
 
-        if v_pregunta:
+        if (
+            EMBEDDINGS_HABILITADOS
+            and v_pregunta
+        ):
 
             score = (
                 score_vectorial * 0.65
@@ -1022,63 +1295,56 @@ def buscar_conocimiento_vectorial(
             score = score_textual
 
         # ----------------------------------------------------
-        # BONO PARA CONOCIMIENTO MANUAL
+        # REGISTRO DE EQUIPO
+        # ----------------------------------------------------
+
+        es_equipo = False
+
+        if tema:
+
+            es_equipo = es_registro_equipo(
+                item,
+                tema,
+            )
+
+        if (
+            tema
+            and es_equipo
+        ):
+
+            # Este bono NO se suma ilimitadamente.
+            # Se fuerza posteriormente.
+            score = max(
+                score,
+                0.80,
+            )
+
+        # ----------------------------------------------------
+        # PERSONA
+        # ----------------------------------------------------
+
+        score_persona = puntuacion_persona(
+            pregunta,
+            item,
+        )
+
+        if score_persona:
+
+            score = max(
+                score,
+                score_persona,
+            )
+
+        # ----------------------------------------------------
+        # TIPO TEXTO
         # ----------------------------------------------------
 
         if item.get("tipo") == "texto":
 
-            score += 0.05
-
-        # ----------------------------------------------------
-        # BONO POR MISMO TEMA
-        # ----------------------------------------------------
-
-        if pertenece_al_mismo_tema(
-            pregunta,
-            item,
-        ):
-
-            score += 0.25
-
-        # ----------------------------------------------------
-        # COINCIDENCIA DE NOMBRE
-        # ----------------------------------------------------
-
-        pregunta_n = normalizar_texto(
-            pregunta
-        )
-
-        contenido_n = normalizar_texto(
-            item.get("contenido", "")
-        )
-
-        titulo_n = normalizar_texto(
-            item.get("titulo", "")
-        )
-
-        # Si una palabra importante aparece
-        # exactamente en título o contenido.
-
-        tokens_pregunta = tokens_texto(
-            pregunta_n
-        )
-
-        for token in tokens_pregunta:
-
-            if len(token) >= 5:
-
-                if token in titulo_n:
-
-                    score += 0.15
-
-                elif token in contenido_n:
-
-                    score += 0.08
-
-        score = min(
-            score,
-            1.0,
-        )
+            score = min(
+                score + 0.03,
+                0.99,
+            )
 
         resultados.append(
             (
@@ -1090,30 +1356,6 @@ def buscar_conocimiento_vectorial(
         )
 
     # --------------------------------------------------------
-    # GUARDAR EMBEDDINGS ACTUALIZADOS
-    # --------------------------------------------------------
-
-    if actualizados:
-
-        try:
-
-            guardar_conocimiento(
-                conocimientos
-            )
-
-            print(
-                "💾 Embeddings actualizados "
-                "y guardados."
-            )
-
-        except Exception as error:
-
-            print(
-                "⚠️ No se pudieron guardar "
-                f"los embeddings: {error}"
-            )
-
-    # --------------------------------------------------------
     # ORDENAR
     # --------------------------------------------------------
 
@@ -1123,7 +1365,7 @@ def buscar_conocimiento_vectorial(
     )
 
     # --------------------------------------------------------
-    # MOSTRAR DIAGNÓSTICO
+    # DIAGNÓSTICO
     # --------------------------------------------------------
 
     print(
@@ -1146,126 +1388,153 @@ def buscar_conocimiento_vectorial(
         )
 
     # --------------------------------------------------------
-    # FILTRAR
+    # REGISTROS FORZADOS
+    # --------------------------------------------------------
+
+    forzados = []
+
+    # ========================================================
+    # CASO 1 — PREGUNTA DE EQUIPO
+    # ========================================================
+
+    if (
+        tema
+        and intencion_equipo
+    ):
+
+        for (
+            score,
+            score_vectorial,
+            score_textual,
+            item,
+        ) in resultados:
+
+            if es_registro_equipo(
+                item,
+                tema,
+            ):
+
+                if item not in forzados:
+
+                    forzados.append(
+                        item
+                    )
+
+    # ========================================================
+    # CASO 2 — PREGUNTA MENCIONA EQUIPO
+    # ========================================================
+
+    elif tema:
+
+        for (
+            score,
+            score_vectorial,
+            score_textual,
+            item,
+        ) in resultados:
+
+            if es_registro_equipo(
+                item,
+                tema,
+            ):
+
+                if item not in forzados:
+
+                    forzados.append(
+                        item
+                    )
+
+    # ========================================================
+    # CASO 3 — PERSONA
+    # ========================================================
+
+    for (
+        score,
+        score_vectorial,
+        score_textual,
+        item,
+    ) in resultados:
+
+        score_persona = puntuacion_persona(
+            pregunta,
+            item,
+        )
+
+        if score_persona >= 0.40:
+
+            if item not in forzados:
+
+                forzados.append(
+                    item
+                )
+
+    # --------------------------------------------------------
+    # RELEVANTES NORMALES
     # --------------------------------------------------------
 
     relevantes = []
 
-    for resultado in resultados:
-
-        score = resultado[0]
-        item = resultado[3]
-
-        # Para equipos/personas usamos un umbral
-        # más flexible debido al refuerzo textual.
+    for (
+        score,
+        score_vectorial,
+        score_textual,
+        item,
+    ) in resultados:
 
         if score >= 0.22:
 
-            relevantes.append(item)
+            if item not in relevantes:
 
-    # --------------------------------------------------------
-    # GARANTÍA: SI HAY TEMA DE EQUIPO
-    # --------------------------------------------------------
-
-    pregunta_n = normalizar_texto(
-        pregunta
-    )
-
-    palabras_equipo = [
-        "modernizacion",
-        "operaciones",
-        "optimizacion",
-        "comercial",
-        "nomina",
-        "soporte",
-    ]
-
-    for tema in palabras_equipo:
-
-        if tema in pregunta_n:
-
-            candidatos_tema = []
-
-            for item in conocimientos:
-
-                titulo_n = normalizar_texto(
-                    item.get("titulo", "")
+                relevantes.append(
+                    item
                 )
 
-                contenido_n = normalizar_texto(
-                    item.get("contenido", "")
-                )
-
-                if (
-                    tema in titulo_n
-                    or tema in contenido_n
-                ):
-
-                    candidatos_tema.append(
-                        item
-                    )
-
-            # Agregar los registros del tema
-            # que no estén ya incluidos.
-
-            for item in candidatos_tema:
-
-                if item not in relevantes:
-
-                    relevantes.append(item)
-
-            break
-
     # --------------------------------------------------------
-    # ELIMINAR DUPLICADOS
+    # CONSTRUIR RESULTADO FINAL
     # --------------------------------------------------------
 
-    unicos = []
-    ids_vistos = set()
+    seleccionados = []
 
+    # Primero los forzados.
+    for item in forzados:
+
+        if item not in seleccionados:
+
+            seleccionados.append(
+                item
+            )
+
+    # Después los normales.
     for item in relevantes:
 
-        item_id = str(
-            item.get(
-                "id",
-                "",
+        if len(seleccionados) >= top_k:
+            break
+
+        if item not in seleccionados:
+
+            seleccionados.append(
+                item
             )
-        )
 
-        if item_id in ids_vistos:
-            continue
+    # Si todavía no hay nada, utilizar los mejores resultados.
+    if not seleccionados:
 
-        ids_vistos.add(
-            item_id
-        )
-
-        unicos.append(
-            item
-        )
-
-    # --------------------------------------------------------
-    # ORDENAR SEGÚN RESULTADO ORIGINAL
-    # --------------------------------------------------------
-
-    mapa_scores = {
-        str(item.get("id", "")): score
         for (
             score,
-            _vector,
-            _texto,
+            score_vectorial,
+            score_textual,
             item,
-        ) in resultados
-    }
+        ) in resultados[:top_k]:
 
-    unicos.sort(
-        key=lambda item: mapa_scores.get(
-            str(item.get("id", "")),
-            0,
-        ),
-        reverse=True,
-    )
+            if item not in seleccionados:
 
-    seleccionados = unicos[:top_k]
+                seleccionados.append(
+                    item
+                )
+
+    # --------------------------------------------------------
+    # DIAGNÓSTICO FINAL
+    # --------------------------------------------------------
 
     print(
         "🔎 RESULTADOS FINALES: "
@@ -1279,11 +1548,123 @@ def buscar_conocimiento_vectorial(
             f"{item.get('titulo', '')}"
         )
 
+    if tema:
+
+        print(
+            "🎯 Tema detectado: "
+            f"{tema}"
+        )
+
+    if intencion_equipo:
+
+        print(
+            "👥 Intención de equipo detectada."
+        )
+
     print(
         "🔎 ==================================\n"
     )
 
     return seleccionados
+
+
+# ============================================================
+# PROTEGER DATOS LITERALES
+# ============================================================
+
+def proteger_datos_literales(
+    respuesta: str,
+    contexto: str,
+) -> str:
+
+    """
+    Protege datos exactos recuperados del conocimiento.
+
+    Especialmente útil para evitar que Gemini transforme:
+
+    modernizacion@penagos.co
+    en
+    modernizacion@penagos
+
+    o:
+
+    administrador@penagos.co
+    en
+    administrador@penagos.c
+    """
+
+    if not respuesta or not contexto:
+        return respuesta
+
+    # --------------------------------------------------------
+    # EMAILS
+    # --------------------------------------------------------
+
+    emails = sorted(
+        set(
+            re.findall(
+                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+                contexto,
+            )
+        ),
+        key=len,
+        reverse=True,
+    )
+
+    for email in emails:
+
+        local = email.split(
+            "@",
+            1,
+        )[0]
+
+        if not local:
+            continue
+
+        patron = re.compile(
+            rf"\b{re.escape(local)}@[\w.-]+",
+            re.IGNORECASE,
+        )
+
+        respuesta = patron.sub(
+            email,
+            respuesta,
+        )
+
+    # --------------------------------------------------------
+    # TELÉFONOS
+    # --------------------------------------------------------
+
+    telefonos = sorted(
+        set(
+            re.findall(
+                r"(?<!\d)\d{7,15}(?!\d)",
+                contexto,
+            )
+        ),
+        key=len,
+        reverse=True,
+    )
+
+    for telefono in telefonos:
+
+        if len(telefono) < 7:
+            continue
+
+        # Solo reemplaza si aparece exactamente
+        # el mismo número o con separadores.
+        patron = re.compile(
+            rf"(?<!\d)"
+            rf"{re.escape(telefono)}"
+            rf"(?!\d)"
+        )
+
+        respuesta = patron.sub(
+            telefono,
+            respuesta,
+        )
+
+    return respuesta
 
 
 # ============================================================
@@ -2160,7 +2541,7 @@ SYSTEM_PROMPT_BASE = (
 
 app = FastAPI(
     title="Penaguillo IA",
-    version="7.2.0",
+    version="7.3.0",
     description=(
         "Backend del asistente inteligente "
         "Penaguillo"
@@ -2250,18 +2631,7 @@ def construir_query_conversacional(
 ) -> str:
 
     """
-    Para preguntas cortas utiliza el contexto
-    anterior.
-
-    Ejemplo:
-
-    Usuario:
-    "quienes conforman modernizacion"
-
-    Usuario:
-    "y sus correos"
-
-    La segunda búsqueda utiliza ambas ideas.
+    Para preguntas cortas utiliza contexto anterior.
     """
 
     mensaje_limpio = mensaje.strip()
@@ -2298,6 +2668,7 @@ def construir_query_conversacional(
         "telefono",
         "teléfono",
         "celular",
+        "celulares",
     }
 
     es_corta = (
@@ -2305,8 +2676,11 @@ def construir_query_conversacional(
     )
 
     tiene_referencia = any(
-        palabra.lower()
-        in palabras_seguimiento
+        normalizar_texto(palabra)
+        in {
+            normalizar_texto(x)
+            for x in palabras_seguimiento
+        }
         for palabra in palabras
     )
 
@@ -2318,6 +2692,8 @@ def construir_query_conversacional(
 
     ultimos = []
 
+    # Para recuperar contexto se priorizan
+    # los últimos mensajes del usuario.
     for msg in history[-4:]:
 
         if (
@@ -2572,6 +2948,17 @@ def chat(
             )
         )
 
+        # ----------------------------------------------------
+        # PROTEGER DATOS LITERALES
+        # ----------------------------------------------------
+
+        contenido = (
+            proteger_datos_literales(
+                contenido,
+                contexto_relevante,
+            )
+        )
+
         print(
             "⏱️ Tiempo total /chat: "
             f"{time.time() - tiempo_inicio_chat:.2f}s"
@@ -2666,7 +3053,7 @@ def ensenar(
         )
 
         # ----------------------------------------------------
-        # CREAR REGISTRO SIN EMBEDDING
+        # CREAR REGISTRO
         # ----------------------------------------------------
 
         nuevo = {
@@ -2693,7 +3080,7 @@ def ensenar(
         }
 
         # ----------------------------------------------------
-        # GENERAR EMBEDDING
+        # EMBEDDING
         # ----------------------------------------------------
 
         nuevo["embedding"] = (
@@ -2881,7 +3268,7 @@ async def ensenar_imagen(
         )
 
         # ----------------------------------------------------
-        # EMBEDDING
+        # CREAR REGISTRO
         # ----------------------------------------------------
 
         nuevo = {
@@ -3244,10 +3631,6 @@ async def ensenar_pdf(
                 ahora_iso(),
         }
 
-        # ----------------------------------------------------
-        # EMBEDDING
-        # ----------------------------------------------------
-
         nuevo["embedding"] = (
             obtener_embedding(
                 texto_para_embedding(
@@ -3494,11 +3877,13 @@ def root():
             "Penaguillo IA",
 
         "version":
-            "7.2.0",
+            "7.3.0",
 
         "engine":
-            "Búsqueda híbrida "
-            "vectorial + textual",
+            "Búsqueda textual optimizada",
+
+        "embeddings":
+            EMBEDDINGS_HABILITADOS,
 
         "chat_model":
             CHAT_MODEL,
@@ -3522,7 +3907,7 @@ def startup_event():
 
     print(
         "🚀 Iniciando "
-        "Penaguillo IA v7.2..."
+        "Penaguillo IA v7.3..."
     )
 
     inicializar_google_drive()
