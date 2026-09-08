@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 6.1 (Corregido: Retrieval de Equipos + Fuzzy Matching + Conteo)
+# VERSIÓN 6.1 (Corregido: Retrieval de Equipos + Fuzzy Matching + Conteo + Fix Enseñar)
 #
 # PROVEEDOR DE IA:
 # - Google Gemini Native API
@@ -13,7 +13,7 @@
 # - Chat con Penaguillo
 # - Chat con historial
 # - Búsqueda contextual
-# - Enseñar texto
+# - Enseñar texto (Con Títulos dinámicos)
 # - Enseñar imágenes
 # - Enseñar PDF
 # - PDF con texto seleccionable -> PyMuPDF
@@ -3074,7 +3074,13 @@ def calcular_relevancia(
 
     puntuacion += coincidencias_titulo * 24
     puntuacion += coincidencias_descripcion * 10
-    puntuacion += min(coincidencias_contenido * 3, 18)
+    
+    # 🔥 Aumentamos el límite de 18 a 40 para que el contenido gane peso
+    puntuacion += min(coincidencias_contenido * 4, 40)
+
+    # 🔥 BONIFICACIÓN: Los textos enseñados a mano son "la verdad absoluta", les damos 15 puntos extra.
+    if tipo == "texto":
+        puntuacion += 15
 
     # ------------------------------------------------------------
     # 2. Coincidencia de frases completas
@@ -4495,95 +4501,48 @@ palabra aislada del mensaje.
 
 @app.post("/ensenar")
 def ensenar(
-
     data: EnsenarRequest,
-
 ):
-
-    texto = (
-        data.conocimiento
-        .strip()
-    )
-
+    texto = data.conocimiento.strip()
 
     if not texto:
-
         raise HTTPException(
-
             status_code=400,
-
-            detail=(
-
-                "El conocimiento "
-                "no puede estar vacío."
-
-            ),
-
+            detail="El conocimiento no puede estar vacío.",
         )
-
 
     try:
+        conocimientos = cargar_conocimiento()
 
-        conocimientos = (
-            cargar_conocimiento()
-        )
-
+        # 🔥 MAGIA AQUÍ: Creamos un título dinámico con las primeras palabras
+        palabras = texto.split()
+        titulo_dinamico = " ".join(palabras[:8])
+        if len(palabras) > 8:
+            titulo_dinamico += "..."
 
         nuevo = {
-
             "id": generar_id(),
-
             "tipo": "texto",
-
-            "titulo": (
-                "Conocimiento manual"
-            ),
-
+            "titulo": titulo_dinamico, # Ya no es "Conocimiento manual"
             "contenido": texto,
-
-            "descripcion": "",
-
+            "descripcion": f"Información clave: {titulo_dinamico}", # Ya no está vacío
             "fecha": ahora_iso(),
-
         }
 
-
-        conocimientos.append(
-            nuevo
-        )
-
-
-        guardar_conocimiento(
-            conocimientos
-        )
-
+        conocimientos.append(nuevo)
+        guardar_conocimiento(conocimientos)
 
         return {
-
             "ok": True,
-
-            "mensaje": (
-                "Conocimiento guardado "
-                "correctamente."
-            ),
-
+            "mensaje": "Conocimiento guardado correctamente.",
             "conocimiento": nuevo,
-
-            "total": len(
-                conocimientos
-            ),
-
+            "total": len(conocimientos),
         }
 
-
     except RuntimeError as error:
-
         raise HTTPException(
-
             status_code=500,
-
             detail=str(error),
-
         )
 
 
@@ -6010,4 +5969,4 @@ if __name__ == "__main__":
 
         reload=False,
 
-    )
+    ) 
