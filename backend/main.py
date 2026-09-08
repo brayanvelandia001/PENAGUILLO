@@ -2877,7 +2877,7 @@ def construir_consulta_retrieval(
     mensaje: str,
     history: list[ChatMessage],
 ) -> str:
-    """Construye una consulta centrada en la pregunta actual."""
+    """Construye una consulta arrastrando entidades previas si la pregunta es de seguimiento."""
     mensaje_actual = str(mensaje or "").strip()
 
     if not mensaje_actual:
@@ -2885,6 +2885,17 @@ def construir_consulta_retrieval(
 
     palabras_actuales = extraer_palabras_importantes(mensaje_actual)
 
+    # Identificamos palabras de intención para ver si el usuario está preguntando por una entidad previa
+    palabras_intent_amplia = {
+        "toda", "todo", "datos", "data", "informacion", "info",
+        "completa", "completo", "disponible", "ficha", "perfil",
+        "dame", "dime", "sabes", "tienes",
+        "equipo", "grupo", "integrantes", "quienes", "conforman",
+        "personal", "area", "miembros", "cual", "cuales", "esos", "ellos", "este"
+    }
+    palabras_entidad = [p for p in palabras_actuales if p not in palabras_intent_amplia]
+
+    # Búsqueda de contexto previo en el historial de usuario
     historial_usuario = []
     if history:
         historial_usuario = [
@@ -2899,34 +2910,14 @@ def construir_consulta_retrieval(
     es_amplia = _es_solicitud_amplia(mensaje_actual)
     es_corta = len(palabras_actuales) <= 2 or len(mensaje_actual) <= 12
 
-    # Verificamos si la pregunta actual menciona el área/entidad 
-    # o si solo son palabras de intención (ej. "quienes", "conforman", "grupo")
-    palabras_intent_amplia = {
-        "toda", "todo", "datos", "data", "informacion", "info",
-        "completa", "completo", "disponible", "ficha", "perfil",
-        "dame", "dime", "sabes", "tienes",
-        "equipo", "grupo", "integrantes", "quienes", "conforman",
-        "personal", "area", "miembros", "cual", "cuales"
-    }
-    palabras_entidad = [p for p in palabras_actuales if p not in palabras_intent_amplia]
+    partes = [mensaje_actual]
 
-    if es_corta and anteriores:
+    # Si la pregunta actual NO nombra una entidad concreta (ej. "¿quiénes son los integrantes de este equipo?"),
+    # inyectamos los turnos anteriores para rescatar el área/equipo recién mencionado.
+    if not palabras_entidad and anteriores:
+        partes = [anteriores[-1], mensaje_actual]
+    elif es_corta and anteriores:
         partes = anteriores + [mensaje_actual]
-    elif es_amplia:
-        # Si pide un equipo pero no dice cuál (palabras_entidad vacío), jalamos el historial
-        if not palabras_entidad and anteriores:
-            partes = [anteriores[-1], mensaje_actual]
-        else:
-            partes = [mensaje_actual]
-    else:
-        partes = [mensaje_actual]
-        if anteriores:
-            ultimo = anteriores[-1]
-            if normalizar_texto(ultimo) != normalizar_texto(mensaje_actual):
-                palabras_ultimo = extraer_palabras_importantes(ultimo)
-                palabras_compartidas = set(palabras_actuales) & set(palabras_ultimo)
-                if palabras_compartidas:
-                    partes.insert(0, ultimo)
 
     consulta = " ".join(partes).strip()
 
@@ -4107,7 +4098,7 @@ def chat(
 
 La información que aparece a continuación
 es solamente el subconjunto de registros
-que el sistema local considera relacionados
+que el sistema local considers relacionados
 con la conversación y la pregunta del usuario.
 
 Debes tomar tú la decisión final sobre qué
