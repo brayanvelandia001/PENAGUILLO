@@ -245,7 +245,7 @@ MAX_OUTPUT_TOKENS = 1200
 
 RELEVANCIA_TOP_K = 8
 
-MAX_KB_CONOCIMIENTO_CHAT = 16
+MAX_KB_CONOCIMIENTO_CHAT = 32
 
 MAX_CHARS_CONOCIMIENTO_CHAT = (
     MAX_KB_CONOCIMIENTO_CHAT * 1024
@@ -2898,19 +2898,32 @@ def construir_consulta_retrieval(
     es_amplia = _es_solicitud_amplia(mensaje_actual)
     es_corta = len(palabras_actuales) <= 2 or len(mensaje_actual) <= 12
 
+    # Verificamos si la pregunta actual menciona el área/entidad 
+    # o si solo son palabras de intención (ej. "quienes", "conforman", "grupo")
+    palabras_intent_amplia = {
+        "toda", "todo", "datos", "data", "informacion", "info",
+        "completa", "completo", "disponible", "ficha", "perfil",
+        "dame", "dime", "sabes", "tienes",
+        "equipo", "grupo", "integrantes", "quienes", "conforman",
+        "personal", "area", "miembros", "cual", "cuales"
+    }
+    palabras_entidad = [p for p in palabras_actuales if p not in palabras_intent_amplia]
+
     if es_corta and anteriores:
         partes = anteriores + [mensaje_actual]
     elif es_amplia:
-        partes = [mensaje_actual]
+        # Si pide un equipo pero no dice cuál (palabras_entidad vacío), jalamos el historial
+        if not palabras_entidad and anteriores:
+            partes = [anteriores[-1], mensaje_actual]
+        else:
+            partes = [mensaje_actual]
     else:
         partes = [mensaje_actual]
         if anteriores:
             ultimo = anteriores[-1]
             if normalizar_texto(ultimo) != normalizar_texto(mensaje_actual):
                 palabras_ultimo = extraer_palabras_importantes(ultimo)
-                palabras_compartidas = (
-                    set(palabras_actuales) & set(palabras_ultimo)
-                )
+                palabras_compartidas = set(palabras_actuales) & set(palabras_ultimo)
                 if palabras_compartidas:
                     partes.insert(0, ultimo)
 
