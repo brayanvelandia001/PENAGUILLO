@@ -243,9 +243,8 @@ MAX_OUTPUT_TOKENS = 1200
 # CONFIGURACIÓN DEL RETRIEVAL LOCAL
 # ============================================================
 
-RELEVANCIA_TOP_K = 8
+RELEVANCIA_TOP_K = 12
 
-# CAMBIADO DE 16 a 32 PARA SOPORTAR EQUIPOS GRANDES
 MAX_KB_CONOCIMIENTO_CHAT = 32
 
 MAX_CHARS_CONOCIMIENTO_CHAT = (
@@ -2870,7 +2869,7 @@ def extraer_palabras_importantes(
 
 
 # ============================================================
-# CONSTRUIR CONSULTA DE RETRIEVAL
+# CONSTRUIR CONSULTA DE RETRIEVAL (CORREGIDA PARA PREGUNTAS DE SEGUIMIENTO)
 # ============================================================
 
 def construir_consulta_retrieval(
@@ -2885,7 +2884,7 @@ def construir_consulta_retrieval(
 
     palabras_actuales = extraer_palabras_importantes(mensaje_actual)
 
-    # Identificamos palabras de intención para ver si el usuario está preguntando por una entidad previa
+    # Palabras que indican que la pregunta es referencial/ambigua
     palabras_intent_amplia = {
         "toda", "todo", "datos", "data", "informacion", "info",
         "completa", "completo", "disponible", "ficha", "perfil",
@@ -2908,15 +2907,13 @@ def construir_consulta_retrieval(
     anteriores = historial_usuario[-MAX_MENSAJES_RETRIEVAL:]
 
     es_amplia = _es_solicitud_amplia(mensaje_actual)
-    es_corta = len(palabras_actuales) <= 2 or len(mensaje_actual) <= 12
 
     partes = [mensaje_actual]
 
-    # Si la pregunta actual NO nombra una entidad concreta (ej. "¿quiénes son los integrantes de este equipo?"),
-    # inyectamos los turnos anteriores para rescatar el área/equipo recién mencionado.
+    # 🔥 SI NO HAY ENTIDAD EXPLÍCITA Y HAY HISTORIAL, INYECTAMOS LOS MENSAJES PREVIOS
     if not palabras_entidad and anteriores:
-        partes = [anteriores[-1], mensaje_actual]
-    elif es_corta and anteriores:
+        partes = anteriores + [mensaje_actual]
+    elif len(palabras_actuales) <= 3 and anteriores:
         partes = anteriores + [mensaje_actual]
 
     consulta = " ".join(partes).strip()
@@ -2981,16 +2978,12 @@ def _coincidencias_palabras(texto: str, palabras: list[str]) -> int:
         return 0
 
     total = 0
-    # Extraemos palabras únicas del texto para comparar
     palabras_texto = set(re.findall(r'\b\w+\b', texto))
 
     for palabra in palabras:
-        # 1. Intento de coincidencia exacta
         if re.search(rf"\b{re.escape(palabra)}\b", texto):
             total += 1
         else:
-            # 2. Búsqueda difusa (tolerancia a errores tipográficos)
-            # cutoff=0.8 significa que debe haber un 80% de similitud
             similares = difflib.get_close_matches(palabra, palabras_texto, n=1, cutoff=0.8)
             if similares:
                 total += 1
@@ -3020,7 +3013,6 @@ def calcular_relevancia(
     tipo = normalizar_texto(str(item.get("tipo", "")))
 
     texto_completo = " ".join((titulo, contenido, descripcion, tipo))
-    pregunta_normalizada = normalizar_texto(actual)
 
     puntuacion = 0.0
     es_amplia = _es_solicitud_amplia(actual)
@@ -3037,7 +3029,6 @@ def calcular_relevancia(
     coincidencias_descripcion = 0
     coincidencias_contenido = 0
 
-    # Usamos la lógica difusa también para los contadores específicos si no encuentra coincidencia exacta
     palabras_titulo_set = set(re.findall(r'\b\w+\b', titulo))
     palabras_desc_set = set(re.findall(r'\b\w+\b', descripcion))
     palabras_cont_set = set(re.findall(r'\b\w+\b', contenido))
@@ -3065,8 +3056,6 @@ def calcular_relevancia(
 
     puntuacion += coincidencias_titulo * 24
     puntuacion += coincidencias_descripcion * 10
-    
-    # 🔥 Aumentamos el límite de 18 a 40 para que el contenido gane peso
     puntuacion += min(coincidencias_contenido * 4, 40)
 
     # 🔥 BONIFICACIÓN: Los textos enseñados a mano son "la verdad absoluta", les damos 20 puntos extra.
@@ -3144,18 +3133,12 @@ def calcular_relevancia(
         if re.search(patron, descripcion) or difflib.get_close_matches(palabra, palabras_desc_set, n=1, cutoff=0.8):
             puntuacion += 2
 
-        # Contamos exacta para el multiplicador
         coincidencias = len(re.findall(patron, texto_completo))
-        # Si no hay exacta pero sí fuzzy general, sumamos al menos 1
         if coincidencias == 0 and difflib.get_close_matches(palabra, set(re.findall(r'\b\w+\b', texto_completo)), n=1, cutoff=0.8):
             coincidencias = 1
             
         puntuacion += min(coincidencias * 0.5, 3)
 
-    # ------------------------------------------------------------
-    # 6. Una pregunta amplia debe devolver información, no solo
-    #    el registro que tenga el mayor score.
-    # ------------------------------------------------------------
     if es_amplia and coincidencias_actuales >= 1:
         puntuacion += 6
 
@@ -3238,7 +3221,7 @@ def clave_unica_conocimiento(
 
 
 # ============================================================
-# BUSCAR CONOCIMIENTO RELEVANTE
+# BUSCAR CONOCIMIENTO RELEVANTE (UMBRAL FLEXIBILIZADO)
 # ============================================================
 
 def buscar_conocimiento_relevante(
@@ -3247,7 +3230,7 @@ def buscar_conocimiento_relevante(
     top_k: int = RELEVANCIA_TOP_K,
     pregunta_actual: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Busca y selecciona conocimiento, ampliando resultados para preguntas completas o de equipos."""
+    """Busca y selecciona conocimiento con un umbral optimizado para no descartar fichas útiles."""
     if not conocimientos:
         return []
 
@@ -3283,9 +3266,6 @@ def buscar_conocimiento_relevante(
             actual,
         )
 
-        # --------------------------------------------------------
-        # Refuerzo de entidad para solicitudes amplias (Equipos/Info)
-        # --------------------------------------------------------
         if es_amplia and palabras_entidad:
             texto_item = normalizar_texto(
                 " ".join(
@@ -3314,8 +3294,8 @@ def buscar_conocimiento_relevante(
             if _coincidencias_palabras(titulo, palabras_entidad) >= 1:
                 puntuacion += 20
 
-        # Permisivo cuando se busca equipos o perfiles completos
-        umbral = 2 if es_amplia else 3
+        # 🔥 UMBRAL AJUSTADO: Más permisivo (1.5) para que no descarte registros válidos
+        umbral = 1.0 if es_amplia else 1.5
 
         if puntuacion >= umbral:
             resultados.append((puntuacion, indice, item))
@@ -3328,7 +3308,6 @@ def buscar_conocimiento_relevante(
         reverse=True,
     )
 
-    # Aumentado a 20 para soportar equipos más grandes
     limite_resultados = (
         min(len(resultados), max(top_k, 20))
         if es_amplia
@@ -3345,12 +3324,6 @@ def buscar_conocimiento_relevante(
     print(f"   Registros únicos evaluados: {len(claves_vistas)}")
     print(f"   Solicitud amplia/equipo: {'SÍ' if es_amplia else 'NO'}")
     print(f"   Registros relevantes: {len(seleccionados)}")
-
-    if len(conocimientos) != len(claves_vistas):
-        print(
-            "♻️ Duplicados ignorados durante retrieval: "
-            f"{len(conocimientos) - len(claves_vistas)}"
-        )
 
     if resultados:
         for puntuacion, _, item in resultados[:limite_resultados]:
@@ -4076,7 +4049,7 @@ def chat(
 
 
         # ====================================================
-        # SYSTEM PROMPT (CON REGLAS DE NO-INFERENCIA DE EQUIPOS)
+        # SYSTEM PROMPT (CON REGLAS DE NO-INFERENCIA Y FIDELIDAD)
         # ====================================================
 
         system_prompt = (
@@ -4098,7 +4071,7 @@ def chat(
 
 La información que aparece a continuación
 es solamente el subconjunto de registros
-que el sistema local considers relacionados
+que el sistema local considera relacionados
 con la conversación y la pregunta del usuario.
 
 Debes tomar tú la decisión final sobre qué
@@ -4512,9 +4485,9 @@ def ensenar(
         nuevo = {
             "id": generar_id(),
             "tipo": "texto",
-            "titulo": titulo_dinamico,  # <-- Ya no guarda "Conocimiento manual"
+            "titulo": titulo_dinamico,
             "contenido": texto,
-            "descripcion": f"Información importante sobre: {titulo_dinamico}",  # <-- Ya no queda vacío
+            "descripcion": f"Información importante sobre: {titulo_dinamico}",
             "fecha": ahora_iso(),
         }
 
