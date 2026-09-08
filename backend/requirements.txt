@@ -3,6 +3,7 @@ uvicorn
 python-dotenv
 openai
 pymupdf
+numpy
 python-multipart
 google-api-python-client
 google-auth
