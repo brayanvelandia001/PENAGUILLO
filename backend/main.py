@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 7.3
+# VERSIÓN 7.4
 #
 # PROVEEDOR:
 # - Google Gemini Native API
@@ -170,36 +170,20 @@ if not EMBEDDINGS_HABILITADOS:
 
 
 # ============================================================
-# EQUIPOS CONOCIDOS
+# CONFIGURACIÓN DEL RETRIEVAL LOCAL
 # ============================================================
 
-EQUIPOS_CONOCIDOS = {
-    "modernizacion": [
-        "modernizacion",
-        "modernizacion tecnologica",
-    ],
-    "operaciones": [
-        "operaciones",
-    ],
-    "optimizacion": [
-        "optimizacion",
-    ],
-    "comercial": [
-        "comercial",
-    ],
-    "nomina": [
-        "nomina",
-    ],
-    "soporte": [
-        "soporte",
-        "soporte tecnico",
-    ],
-    "sistemas": [
-        "sistemas",
-        "tecnologia",
-    ],
-}
+# Máximo de conocimientos que pueden llegar a Gemini.
+# El buscador puede encontrar muchos candidatos, pero solamente
+# los mejores pasan al contexto final.
+RELEVANCIA_TOP_K = 8
 
+# Límite aproximado del contexto de conocimiento enviado a Gemini.
+# Evita saturar el prompt cuando el JSON crece.
+MAX_KB_CONOCIMIENTO_CHAT = 16
+MAX_CHARS_CONOCIMIENTO_CHAT = (
+    MAX_KB_CONOCIMIENTO_CHAT * 1024
+)
 
 # ============================================================
 # INTENCIONES DE EQUIPO
@@ -224,555 +208,153 @@ INTENCIONES_EQUIPO = [
     "quienes forman parte",
     "conoces el equipo",
     "conoce el equipo",
-    "equipo de",
 ]
 
+# Palabras demasiado generales para intentar identificar un tema.
+PALABRAS_IGNORADAS_RETRIEVAL = {
+    "quien",
+    "quienes",
+    "cual",
+    "cuales",
+    "que",
+    "como",
+    "donde",
+    "cuando",
+    "porque",
+    "para",
+    "del",
+    "de",
+    "la",
+    "el",
+    "los",
+    "las",
+    "un",
+    "una",
+    "unos",
+    "unas",
+    "y",
+    "o",
+    "en",
+    "por",
+    "con",
+    "sobre",
+    "este",
+    "esta",
+    "ese",
+    "esa",
+    "ellos",
+    "ellas",
+    "tambien",
+    "también",
+    "equipo",
+    "area",
+    "grupo",
+    "personas",
+    "persona",
+    "correo",
+    "correos",
+    "telefono",
+    "telefonos",
+    "celular",
+    "celulares",
+    "dime",
+    "dame",
+    "muestra",
+    "mostrar",
+    "informacion",
+    "información",
+}
 
 # ============================================================
-# ERROR CONTROLADO DE GEMINI
+# DETECTAR TEMA DINÁMICAMENTE DESDE EL JSON
 # ============================================================
 
-class GeminiError(RuntimeError):
+def detectar_tema_dinamico(
+    pregunta: str,
+    conocimientos: list[dict[str, Any]],
+) -> str | None:
+    """
+    Intenta identificar el tema de la pregunta usando los propios
+    títulos y contenidos del JSON.
 
-    def __init__(
-        self,
-        message: str,
-        status_code: int | None = None,
-        retry_after: int | None = None,
-    ):
-        super().__init__(message)
-        self.status_code = status_code
-        self.retry_after = retry_after
+    No depende de una lista fija de equipos o áreas.
+    """
 
-
-# ============================================================
-# GEMINI — RETRY AFTER
-# ============================================================
-
-def extraer_retry_after(
-    respuesta: requests.Response,
-    mensaje_error: str,
-) -> int | None:
-
-    valor_header = respuesta.headers.get("Retry-After")
-
-    if valor_header:
-        try:
-            segundos = int(valor_header)
-
-            if segundos >= 0:
-                return segundos
-
-        except (TypeError, ValueError):
-            pass
-
-    patrones = [
-        r"retry in ([0-9]+(?:\.[0-9]+)?)s",
-        r"retryDelay.*?([0-9]+)s",
-        r"seconds.*?([0-9]+)",
-    ]
-
-    texto = mensaje_error or ""
-
-    for patron in patrones:
-
-        coincidencia = re.search(
-            patron,
-            texto,
-            re.IGNORECASE,
+    pregunta_n = normalizar_texto(pregunta)
+    tokens_pregunta = {
+        token
+        for token in tokens_texto(pregunta_n)
+        if (
+            len(token) >= 4
+            and token not in PALABRAS_IGNORADAS_RETRIEVAL
         )
-
-        if coincidencia:
-
-            try:
-                return max(
-                    1,
-                    int(float(coincidencia.group(1))),
-                )
-
-            except (TypeError, ValueError):
-                pass
-
-    return None
-
-
-# ============================================================
-# GEMINI — GENERAR RESPUESTA
-# ============================================================
-
-def generar_con_gemini(
-    *,
-    model: str,
-    messages: list,
-    max_retries: int = 2,
-):
-
-    if not GEMINI_API_KEY:
-        raise GeminiError(
-            "GEMINI_API_KEY no está configurada."
-        )
-
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        f"v1beta/models/{model}:generateContent"
-        f"?key={GEMINI_API_KEY}"
-    )
-
-    headers = {
-        "Content-Type": "application/json"
     }
 
-    system_instruction = None
-    gemini_contents = []
+    if not tokens_pregunta or not conocimientos:
+        return None
 
-    for msg in messages:
+    candidatos: dict[str, float] = {}
 
-        role = msg.get("role")
-        content = msg.get("content")
+    for item in conocimientos:
+        titulo = normalizar_texto(item.get("titulo", ""))
+        contenido = normalizar_texto(item.get("contenido", ""))
+        descripcion = normalizar_texto(item.get("descripcion", ""))
 
-        # ----------------------------------------------------
-        # SYSTEM
-        # ----------------------------------------------------
-
-        if role == "system":
-
-            if isinstance(content, str):
-
-                system_instruction = {
-                    "parts": [
-                        {
-                            "text": content
-                        }
-                    ]
-                }
-
+        if not titulo:
             continue
 
-        # ----------------------------------------------------
-        # ROLE
-        # ----------------------------------------------------
+        tokens_titulo = tokens_texto(titulo)
+        coincidencias_titulo = tokens_pregunta & tokens_titulo
 
-        gemini_role = (
-            "model"
-            if role == "assistant"
-            else "user"
+        if not coincidencias_titulo:
+            continue
+
+        score = len(coincidencias_titulo) * 2.0
+
+        # Los títulos tienen más valor que el contenido para detectar
+        # de qué equipo/área/tema se está hablando.
+        if any(
+            palabra in titulo
+            for palabra in (
+                "equipo",
+                "area",
+                "grupo",
+                "departamento",
+            )
+        ):
+            score += 2.0
+
+        tokens_contenido = tokens_texto(
+            f"{contenido} {descripcion}"
+        )
+        score += min(
+            len(tokens_pregunta & tokens_contenido) * 0.25,
+            2.0,
         )
 
-        parts = []
+        # El título completo es una señal extremadamente fuerte.
+        if titulo in pregunta_n or pregunta_n in titulo:
+            score += 4.0
 
-        # ----------------------------------------------------
-        # TEXTO
-        # ----------------------------------------------------
-
-        if isinstance(content, str):
-
-            if content.strip():
-
-                parts.append(
-                    {
-                        "text": content
-                    }
-                )
-
-        # ----------------------------------------------------
-        # MULTIMODAL
-        # ----------------------------------------------------
-
-        elif isinstance(content, list):
-
-            for item in content:
-
-                if not isinstance(item, dict):
-                    continue
-
-                item_type = item.get("type")
-
-                # TEXTO
-                if item_type == "text":
-
-                    texto = item.get(
-                        "text",
-                        "",
-                    )
-
-                    if texto:
-
-                        parts.append(
-                            {
-                                "text": texto
-                            }
-                        )
-
-                # IMAGEN
-                elif item_type == "image_url":
-
-                    url_img = (
-                        item
-                        .get("image_url", {})
-                        .get("url", "")
-                    )
-
-                    if not url_img.startswith(
-                        "data:"
-                    ):
-                        continue
-
-                    try:
-
-                        encabezado, b64_data = (
-                            url_img.split(",", 1)
-                        )
-
-                        mime_type = (
-                            encabezado
-                            .split(":", 1)[1]
-                            .split(";", 1)[0]
-                            .strip()
-                        )
-
-                        parts.append(
-                            {
-                                "inlineData": {
-                                    "mimeType": mime_type,
-                                    "data": b64_data,
-                                }
-                            }
-                        )
-
-                    except Exception:
-                        pass
-
-        if parts:
-
-            gemini_contents.append(
-                {
-                    "role": gemini_role,
-                    "parts": parts,
-                }
-            )
-
-    payload = {
-        "contents": gemini_contents,
-        "generationConfig": {
-            "maxOutputTokens": MAX_OUTPUT_TOKENS,
-            "temperature": 0.3,
-        },
-    }
-
-    if system_instruction:
-
-        payload["systemInstruction"] = (
-            system_instruction
+        candidatos[titulo] = max(
+            candidatos.get(titulo, 0.0),
+            score,
         )
-
-    ultimo_error = None
-
-    for intento in range(
-        1,
-        max_retries + 1,
-    ):
-
-        try:
-
-            respuesta = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=120,
-            )
-
-            if respuesta.status_code == 200:
-                return respuesta.json()
-
-            mensaje_error = respuesta.text[:5000]
-
-            retry_after = extraer_retry_after(
-                respuesta,
-                mensaje_error,
-            )
-
-            ultimo_error = GeminiError(
-                (
-                    f"Gemini HTTP "
-                    f"{respuesta.status_code}: "
-                    f"{mensaje_error}"
-                ),
-                status_code=respuesta.status_code,
-                retry_after=retry_after,
-            )
-
-            es_temporal = (
-                respuesta.status_code
-                in (429, 500, 502, 503, 504)
-            )
-
-            if (
-                not es_temporal
-                or intento >= max_retries
-            ):
-                raise ultimo_error
-
-            espera = (
-                min(retry_after, 15)
-                if retry_after is not None
-                else 2 ** intento
-            )
-
-            time.sleep(espera)
-
-        except requests.RequestException as error:
-
-            ultimo_error = GeminiError(
-                "No fue posible conectar con Gemini: "
-                f"{error}"
-            )
-
-            if intento >= max_retries:
-                raise ultimo_error
-
-            time.sleep(2 ** intento)
-
-    raise GeminiError(
-        "Gemini no pudo generar una respuesta."
-    )
-
-
-# ============================================================
-# EXTRAER RESPUESTA GEMINI
-# ============================================================
-
-def extraer_contenido_gemini(
-    respuesta: dict,
-) -> str:
-
-    if not respuesta:
-        raise RuntimeError(
-            "Gemini no devolvió respuesta."
-        )
-
-    if "error" in respuesta:
-
-        raise RuntimeError(
-            "Gemini devolvió un error: "
-            f"{respuesta['error']}"
-        )
-
-    candidatos = respuesta.get(
-        "candidates",
-        [],
-    )
 
     if not candidatos:
+        return None
 
-        raise RuntimeError(
-            "Gemini no devolvió ningún candidato."
-        )
-
-    partes = (
-        candidatos[0]
-        .get("content", {})
-        .get("parts", [])
+    mejor_titulo, mejor_score = max(
+        candidatos.items(),
+        key=lambda x: x[1],
     )
 
-    texto_final = [
-        p.get("text", "")
-        for p in partes
-        if "text" in p
-        and p.get("text", "")
-    ]
+    # Evita declarar un tema cuando solamente existe una coincidencia
+    # débil de una palabra genérica.
+    if mejor_score < 2.0:
+        return None
 
-    resultado = "\n".join(
-        texto_final
-    ).strip()
-
-    if resultado:
-        return resultado
-
-    raise RuntimeError(
-        "Gemini no devolvió contenido de texto."
-    )
-
-
-# ============================================================
-# EMBEDDINGS
-# ============================================================
-
-def obtener_embedding(
-    texto: str,
-) -> list[float]:
-
-    """
-    Obtiene un embedding cuando los embeddings
-    están habilitados.
-
-    Actualmente está deshabilitado porque
-    text-embedding-004 devuelve HTTP 404.
-    """
-
-    if not EMBEDDINGS_HABILITADOS:
-        return []
-
-    if (
-        not GEMINI_API_KEY
-        or not texto.strip()
-    ):
-        return []
-
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        f"v1beta/models/{EMBEDDING_MODEL}:embedContent"
-        f"?key={GEMINI_API_KEY}"
-    )
-
-    headers = {
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "model": (
-            f"models/{EMBEDDING_MODEL}"
-        ),
-        "content": {
-            "parts": [
-                {
-                    "text": texto.strip()[:2000]
-                }
-            ]
-        },
-    }
-
-    try:
-
-        respuesta = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=15,
-        )
-
-        if respuesta.status_code == 200:
-
-            return (
-                respuesta.json()
-                .get("embedding", {})
-                .get("values", [])
-            )
-
-        print(
-            "⚠️ Embedding HTTP "
-            f"{respuesta.status_code}: "
-            f"{respuesta.text[:500]}"
-        )
-
-    except Exception as error:
-
-        print(
-            "⚠️ Error generando embedding: "
-            f"{error}"
-        )
-
-    return []
-
-
-# ============================================================
-# HASH DEL CONOCIMIENTO
-# ============================================================
-
-def hash_conocimiento(
-    item: dict[str, Any],
-) -> str:
-
-    texto = (
-        f"{item.get('titulo', '')}\n"
-        f"{item.get('contenido', '')}\n"
-        f"{item.get('descripcion', '')}"
-    )
-
-    return hashlib.sha256(
-        texto.encode("utf-8")
-    ).hexdigest()
-
-
-def texto_para_embedding(
-    item: dict[str, Any],
-) -> str:
-
-    return (
-        f"TÍTULO: {item.get('titulo', '')}\n"
-        f"CONTENIDO: {item.get('contenido', '')}\n"
-        f"DESCRIPCIÓN: {item.get('descripcion', '')}"
-    )
-
-
-# ============================================================
-# NORMALIZAR TEXTO
-# ============================================================
-
-def normalizar_texto(
-    texto: str,
-) -> str:
-
-    texto = str(texto or "")
-
-    texto = unicodedata.normalize(
-        "NFD",
-        texto,
-    )
-
-    texto = "".join(
-        caracter
-        for caracter in texto
-        if unicodedata.category(caracter)
-        != "Mn"
-    )
-
-    texto = texto.lower()
-
-    texto = re.sub(
-        r"\s+",
-        " ",
-        texto,
-    )
-
-    return texto.strip()
-
-
-def tokens_texto(
-    texto: str,
-) -> set[str]:
-
-    texto = normalizar_texto(
-        texto
-    )
-
-    return set(
-        re.findall(
-            r"[a-z0-9@._+-]+",
-            texto,
-        )
-    )
-
-
-# ============================================================
-# DETECTAR EQUIPO
-# ============================================================
-
-def detectar_tema_equipo(
-    pregunta: str,
-) -> str | None:
-
-    pregunta_n = normalizar_texto(
-        pregunta
-    )
-
-    for equipo, aliases in EQUIPOS_CONOCIDOS.items():
-
-        for alias in aliases:
-
-            if alias in pregunta_n:
-                return equipo
-
-    return None
+    return mejor_titulo
 
 
 # ============================================================
@@ -794,12 +376,12 @@ def es_intencion_equipo(
 
 
 # ============================================================
-# DETECTAR SI REGISTRO ES DE EQUIPO
+# DETECTAR SI REGISTRO ES DE EQUIPO / ÁREA
 # ============================================================
 
 def es_registro_equipo(
     item: dict[str, Any],
-    tema: str,
+    tema: str | None,
 ) -> bool:
 
     if not tema:
@@ -813,43 +395,59 @@ def es_registro_equipo(
         item.get("contenido", "")
     )
 
-    aliases = EQUIPOS_CONOCIDOS.get(
-        tema,
-        [tema],
+    tema_n = normalizar_texto(tema)
+
+    tokens_tema = {
+        token
+        for token in tokens_texto(tema_n)
+        if len(token) >= 4
+        and token not in PALABRAS_IGNORADAS_RETRIEVAL
+    }
+
+    tokens_titulo = tokens_texto(titulo)
+    tokens_contenido = tokens_texto(contenido)
+
+    coincidencias_titulo = (
+        tokens_tema & tokens_titulo
+    )
+    coincidencias_contenido = (
+        tokens_tema & tokens_contenido
     )
 
-    tiene_tema_titulo = any(
-        alias in titulo
-        for alias in aliases
+    es_equipo_titulo = any(
+        palabra in titulo
+        for palabra in (
+            "equipo",
+            "area",
+            "grupo",
+            "departamento",
+        )
     )
 
-    tiene_tema_contenido = any(
-        alias in contenido
-        for alias in aliases
-    )
-
-    es_equipo_titulo = (
-        "equipo" in titulo
-        or "area" in titulo
-        or "grupo" in titulo
+    tiene_estructura_equipo = (
+        "conformado" in contenido
+        or "formado" in contenido
+        or "integrantes" in contenido
+        or "miembros" in contenido
+        or "integran" in contenido
     )
 
     if (
-        tiene_tema_titulo
+        coincidencias_titulo
         and es_equipo_titulo
     ):
         return True
 
     if (
-        tiene_tema_titulo
-        and "conformado" in contenido
+        coincidencias_titulo
+        and tiene_estructura_equipo
     ):
         return True
 
     if (
-        tiene_tema_contenido
+        coincidencias_contenido
+        and tiene_estructura_equipo
         and "equipo" in contenido
-        and "conformado" in contenido
     ):
         return True
 
@@ -888,43 +486,12 @@ def puntuacion_persona(
     if not tokens_pregunta:
         return 0.0
 
-    palabras_ignoradas = {
-        "quien",
-        "quienes",
-        "quien",
-        "es",
-        "el",
-        "la",
-        "los",
-        "las",
-        "del",
-        "de",
-        "un",
-        "una",
-        "equipo",
-        "area",
-        "persona",
-        "personas",
-        "correo",
-        "correos",
-        "telefono",
-        "telefonos",
-        "celular",
-        "celulares",
-        "sus",
-        "son",
-        "y",
-        "en",
-        "para",
-        "que",
-    }
-
     candidatos = {
         token
         for token in tokens_pregunta
         if (
             len(token) >= 4
-            and token not in palabras_ignoradas
+            and token not in PALABRAS_IGNORADAS_RETRIEVAL
         )
     }
 
@@ -942,34 +509,24 @@ def puntuacion_persona(
 
     score = 0.0
 
-    # Dos o más palabras de nombre coincidentes
-    # es una señal muy fuerte.
     if len(coincidencias) >= 2:
         score += 0.70
-
     elif len(coincidencias) == 1:
         score += 0.40
 
-    # Refuerzo si aparecen juntas en el contenido.
-    for i, token_a in enumerate(
-        coincidencias
-    ):
+    # Refuerzo cuando dos tokens aparecen juntos en el texto.
+    for i, token_a in enumerate(coincidencias):
+        for token_b in coincidencias[i + 1:]:
+            frase_a = f"{token_a} {token_b}"
+            frase_b = f"{token_b} {token_a}"
 
-        for token_b in coincidencias[
-            i + 1:
-        ]:
-
-            frase = (
-                f"{token_a} {token_b}"
-            )
-
-            if frase in texto_item:
+            if (
+                frase_a in texto_item
+                or frase_b in texto_item
+            ):
                 score += 0.20
 
-    return min(
-        score,
-        0.95,
-    )
+    return min(score, 0.95)
 
 
 # ============================================================
@@ -985,16 +542,8 @@ def sim_coseno(
         return 0.0
 
     try:
-
-        a = np.array(
-            v1,
-            dtype=float,
-        )
-
-        b = np.array(
-            v2,
-            dtype=float,
-        )
+        a = np.array(v1, dtype=float)
+        b = np.array(v2, dtype=float)
 
         na = np.linalg.norm(a)
         nb = np.linalg.norm(b)
@@ -1003,12 +552,10 @@ def sim_coseno(
             return 0.0
 
         return float(
-            np.dot(a, b)
-            / (na * nb)
+            np.dot(a, b) / (na * nb)
         )
 
     except Exception:
-
         return 0.0
 
 
@@ -1019,11 +566,10 @@ def sim_coseno(
 def similitud_textual(
     pregunta: str,
     item: dict[str, Any],
+    tema: str | None = None,
 ) -> float:
 
-    pregunta_n = normalizar_texto(
-        pregunta
-    )
+    pregunta_n = normalizar_texto(pregunta)
 
     titulo_n = normalizar_texto(
         item.get("titulo", "")
@@ -1037,29 +583,27 @@ def similitud_textual(
         item.get("descripcion", "")
     )
 
-    texto_item = (
-        f"{titulo_n} "
-        f"{contenido_n} "
-        f"{descripcion_n}"
-    ).strip()
-
-    if not pregunta_n or not texto_item:
+    if not pregunta_n:
         return 0.0
 
-    tokens_pregunta = tokens_texto(
-        pregunta_n
-    )
-
-    tokens_item = tokens_texto(
-        texto_item
-    )
-
+    tokens_pregunta = tokens_texto(pregunta_n)
     if not tokens_pregunta:
         return 0.0
 
+    tokens_titulo = tokens_texto(titulo_n)
+    tokens_contenido = tokens_texto(
+        f"{contenido_n} {descripcion_n}"
+    )
+    tokens_item = (
+        tokens_titulo
+        | tokens_contenido
+    )
+
+    if not tokens_item:
+        return 0.0
+
     coincidencias = (
-        tokens_pregunta
-        & tokens_item
+        tokens_pregunta & tokens_item
     )
 
     score = 0.0
@@ -1069,89 +613,58 @@ def similitud_textual(
     # --------------------------------------------------------
 
     if coincidencias:
-
         score += (
             len(coincidencias)
-            / max(
-                len(tokens_pregunta),
-                1,
-            )
-        ) * 0.45
+            / max(len(tokens_pregunta), 1)
+        ) * 0.40
 
     # --------------------------------------------------------
-    # COINCIDENCIA DE TEMA
+    # TÍTULO — PESO MAYOR
     # --------------------------------------------------------
 
-    tema = detectar_tema_equipo(
-        pregunta_n
+    coincidencias_titulo = (
+        tokens_pregunta & tokens_titulo
     )
 
-    if tema:
-
-        aliases = EQUIPOS_CONOCIDOS.get(
-            tema,
-            [tema],
+    if coincidencias_titulo:
+        score += min(
+            len(coincidencias_titulo) * 0.12,
+            0.30,
         )
 
-        if any(
-            alias in titulo_n
-            for alias in aliases
-        ):
-            score += 0.35
+    # --------------------------------------------------------
+    # FRASE EXACTA
+    # --------------------------------------------------------
 
-        elif any(
-            alias in contenido_n
-            for alias in aliases
-        ):
-            score += 0.18
+    if (
+        len(pregunta_n) >= 6
+        and pregunta_n in titulo_n
+    ):
+        score += 0.25
+
+    elif (
+        len(pregunta_n) >= 10
+        and pregunta_n in contenido_n
+    ):
+        score += 0.15
 
     # --------------------------------------------------------
-    # COINCIDENCIA DE PERSONA
+    # TEMA DINÁMICO
+    # --------------------------------------------------------
+
+    if tema and es_registro_equipo(item, tema):
+        score += 0.20
+
+    # --------------------------------------------------------
+    # PERSONA
     # --------------------------------------------------------
 
     score += puntuacion_persona(
         pregunta,
         item,
-    ) * 0.55
+    ) * 0.45
 
-    # --------------------------------------------------------
-    # COINCIDENCIA EXACTA DE FRASE
-    # --------------------------------------------------------
-
-    palabras_importantes = [
-        palabra
-        for palabra in tokens_pregunta
-        if len(palabra) >= 5
-    ]
-
-    coincidencias_titulo = sum(
-        1
-        for palabra in palabras_importantes
-        if palabra in titulo_n
-    )
-
-    coincidencias_contenido = sum(
-        1
-        for palabra in palabras_importantes
-        if palabra in contenido_n
-    )
-
-    if coincidencias_titulo:
-        score += min(
-            coincidencias_titulo * 0.10,
-            0.25,
-        )
-
-    elif coincidencias_contenido:
-        score += min(
-            coincidencias_contenido * 0.05,
-            0.15,
-        )
-
-    return min(
-        score,
-        0.99,
-    )
+    return min(score, 0.99)
 
 
 # ============================================================
@@ -1161,10 +674,15 @@ def similitud_textual(
 def pertenece_al_mismo_tema(
     pregunta: str,
     item: dict[str, Any],
+    conocimientos: list[dict[str, Any]] | None = None,
 ) -> bool:
 
-    tema = detectar_tema_equipo(
-        pregunta
+    if not conocimientos:
+        return False
+
+    tema = detectar_tema_dinamico(
+        pregunta,
+        conocimientos,
     )
 
     if not tema:
@@ -1177,7 +695,7 @@ def pertenece_al_mismo_tema(
 
 
 # ============================================================
-# BÚSQUEDA HÍBRIDA / TEXTUAL
+# BÚSQUEDA TEXTUAL INTELIGENTE
 # ============================================================
 
 def buscar_conocimiento_vectorial(
@@ -1185,87 +703,67 @@ def buscar_conocimiento_vectorial(
     conocimientos: list[dict[str, Any]],
     top_k: int = RELEVANCIA_TOP_K,
 ) -> list[dict[str, Any]]:
-
     """
-    Búsqueda optimizada.
+    Retrieval local optimizado.
 
-    Actualmente:
-    - NO realiza llamadas de embedding.
-    - Busca por texto.
-    - Detecta equipos directamente.
-    - Detecta personas directamente.
-    - Fuerza el registro correcto al principio.
+    Actualmente funciona sin embeddings para evitar la llamada rota
+    a text-embedding-004.
+
+    Características:
+    - evalúa todos los registros del JSON;
+    - identifica el tema dinámicamente desde los propios registros;
+    - prioriza títulos y coincidencias fuertes;
+    - reconoce personas por coincidencia textual;
+    - para preguntas de equipo conserva el registro completo del equipo;
+    - elimina duplicados;
+    - aplica un umbral mínimo de relevancia;
+    - nunca rellena artificialmente hasta top_k;
+    - devuelve como máximo top_k resultados.
     """
 
-    if (
-        not conocimientos
-        or not pregunta.strip()
-    ):
+    if not conocimientos or not pregunta.strip():
         return []
 
-    print(
-        "\n🔎 =================================="
-    )
+    top_k = max(1, min(int(top_k), 8))
 
-    print(
-        "🔎 BUSCANDO: "
-        f"{pregunta}"
-    )
-
+    print("\n🔎 ==================================")
+    print(f"🔎 BUSCANDO: {pregunta}")
     print(
         "🔎 Registros disponibles: "
         f"{len(conocimientos)}"
     )
 
-    pregunta_n = normalizar_texto(
+    pregunta_n = normalizar_texto(pregunta)
+
+    tema = detectar_tema_dinamico(
+        pregunta,
+        conocimientos,
+    )
+
+    intencion_equipo = es_intencion_equipo(
         pregunta
     )
 
-    tema = detectar_tema_equipo(
-        pregunta_n
+    print(
+        "🎯 Tema dinámico detectado: "
+        f"{tema or 'ninguno'}"
     )
 
-    intencion_equipo = (
-        es_intencion_equipo(
-            pregunta_n
-        )
-    )
-
+    v_pregunta = obtener_embedding(pregunta)
     resultados = []
 
-    # --------------------------------------------------------
-    # EMBEDDING DE PREGUNTA
-    # --------------------------------------------------------
-    #
-    # obtener_embedding() retorna inmediatamente []
-    # cuando EMBEDDINGS_HABILITADOS=False.
-    #
-    # --------------------------------------------------------
-
-    v_pregunta = obtener_embedding(
-        pregunta
-    )
-
-    # --------------------------------------------------------
-    # EVALUAR CONOCIMIENTO
-    # --------------------------------------------------------
-
-    for item in conocimientos:
+    for indice, item in enumerate(conocimientos):
+        if not isinstance(item, dict):
+            continue
 
         score_vectorial = 0.0
+        embedding_guardado = item.get("embedding", [])
 
-        embedding_guardado = item.get(
-            "embedding",
-            [],
-        )
-
-        # Solo se utilizan embeddings si están habilitados.
         if (
             EMBEDDINGS_HABILITADOS
             and v_pregunta
             and embedding_guardado
         ):
-
             score_vectorial = sim_coseno(
                 v_pregunta,
                 embedding_guardado,
@@ -1274,54 +772,19 @@ def buscar_conocimiento_vectorial(
         score_textual = similitud_textual(
             pregunta,
             item,
+            tema,
         )
-
-        # ----------------------------------------------------
-        # SCORE BASE
-        # ----------------------------------------------------
 
         if (
             EMBEDDINGS_HABILITADOS
             and v_pregunta
         ):
-
             score = (
                 score_vectorial * 0.65
                 + score_textual * 0.35
             )
-
         else:
-
             score = score_textual
-
-        # ----------------------------------------------------
-        # REGISTRO DE EQUIPO
-        # ----------------------------------------------------
-
-        es_equipo = False
-
-        if tema:
-
-            es_equipo = es_registro_equipo(
-                item,
-                tema,
-            )
-
-        if (
-            tema
-            and es_equipo
-        ):
-
-            # Este bono NO se suma ilimitadamente.
-            # Se fuerza posteriormente.
-            score = max(
-                score,
-                0.80,
-            )
-
-        # ----------------------------------------------------
-        # PERSONA
-        # ----------------------------------------------------
 
         score_persona = puntuacion_persona(
             pregunta,
@@ -1329,38 +792,50 @@ def buscar_conocimiento_vectorial(
         )
 
         if score_persona:
-
             score = max(
                 score,
                 score_persona,
             )
 
-        # ----------------------------------------------------
-        # TIPO TEXTO
-        # ----------------------------------------------------
-
-        if item.get("tipo") == "texto":
-
-            score = min(
-                score + 0.03,
-                0.99,
-            )
-
-        resultados.append(
-            (
-                score,
-                score_vectorial,
-                score_textual,
-                item,
-            )
+        es_equipo = (
+            bool(tema)
+            and es_registro_equipo(item, tema)
         )
+
+        # Para una pregunta explícita sobre integrantes, el registro
+        # de equipo correspondiente recibe una prioridad fuerte, pero
+        # solamente si realmente pertenece al tema detectado.
+        if tema and es_equipo:
+            if intencion_equipo:
+                score = max(score, 0.92)
+            else:
+                score = max(score, 0.72)
+
+        # Los registros de texto suelen ser más fáciles de consultar,
+        # pero el bono es pequeño para no aplastar otras coincidencias.
+        if item.get("tipo") == "texto":
+            score = min(score + 0.02, 0.99)
+
+        resultados.append({
+            "score": min(score, 0.99),
+            "score_vectorial": score_vectorial,
+            "score_textual": score_textual,
+            "score_persona": score_persona,
+            "es_equipo": es_equipo,
+            "indice": indice,
+            "item": item,
+        })
 
     # --------------------------------------------------------
     # ORDENAR
     # --------------------------------------------------------
 
     resultados.sort(
-        key=lambda x: x[0],
+        key=lambda resultado: (
+            resultado["score"],
+            resultado["score_textual"],
+            resultado["score_persona"],
+        ),
         reverse=True,
     )
 
@@ -1368,173 +843,69 @@ def buscar_conocimiento_vectorial(
     # DIAGNÓSTICO
     # --------------------------------------------------------
 
-    print(
-        "🔎 TOP RESULTADOS:"
-    )
+    print("🔎 TOP CANDIDATOS:")
 
-    for (
-        score,
-        score_vectorial,
-        score_textual,
-        item,
-    ) in resultados[:top_k]:
-
+    for resultado in resultados[:top_k]:
+        item = resultado["item"]
         print(
             "   📌 "
             f"{item.get('titulo', '')} "
-            f"| final={score:.3f} "
-            f"| vector={score_vectorial:.3f} "
-            f"| texto={score_textual:.3f}"
+            f"| final={resultado['score']:.3f} "
+            f"| texto={resultado['score_textual']:.3f} "
+            f"| persona={resultado['score_persona']:.3f}"
         )
 
     # --------------------------------------------------------
-    # REGISTROS FORZADOS
-    # --------------------------------------------------------
-
-    forzados = []
-
-    # ========================================================
-    # CASO 1 — PREGUNTA DE EQUIPO
-    # ========================================================
-
-    if (
-        tema
-        and intencion_equipo
-    ):
-
-        for (
-            score,
-            score_vectorial,
-            score_textual,
-            item,
-        ) in resultados:
-
-            if es_registro_equipo(
-                item,
-                tema,
-            ):
-
-                if item not in forzados:
-
-                    forzados.append(
-                        item
-                    )
-
-    # ========================================================
-    # CASO 2 — PREGUNTA MENCIONA EQUIPO
-    # ========================================================
-
-    elif tema:
-
-        for (
-            score,
-            score_vectorial,
-            score_textual,
-            item,
-        ) in resultados:
-
-            if es_registro_equipo(
-                item,
-                tema,
-            ):
-
-                if item not in forzados:
-
-                    forzados.append(
-                        item
-                    )
-
-    # ========================================================
-    # CASO 3 — PERSONA
-    # ========================================================
-
-    for (
-        score,
-        score_vectorial,
-        score_textual,
-        item,
-    ) in resultados:
-
-        score_persona = puntuacion_persona(
-            pregunta,
-            item,
-        )
-
-        if score_persona >= 0.40:
-
-            if item not in forzados:
-
-                forzados.append(
-                    item
-                )
-
-    # --------------------------------------------------------
-    # RELEVANTES NORMALES
-    # --------------------------------------------------------
-
-    relevantes = []
-
-    for (
-        score,
-        score_vectorial,
-        score_textual,
-        item,
-    ) in resultados:
-
-        if score >= 0.22:
-
-            if item not in relevantes:
-
-                relevantes.append(
-                    item
-                )
-
-    # --------------------------------------------------------
-    # CONSTRUIR RESULTADO FINAL
+    # SELECCIÓN FINAL
     # --------------------------------------------------------
 
     seleccionados = []
+    ids_vistos = set()
 
-    # Primero los forzados.
-    for item in forzados:
+    def agregar(item: dict[str, Any]) -> None:
+        if len(seleccionados) >= top_k:
+            return
 
-        if item not in seleccionados:
+        identificador = str(
+            item.get("id")
+            or id(item)
+        )
 
-            seleccionados.append(
-                item
-            )
+        if identificador in ids_vistos:
+            return
 
-    # Después los normales.
-    for item in relevantes:
+        ids_vistos.add(identificador)
+        seleccionados.append(item)
+
+    # 1. Para preguntas de equipo, primero el registro que describe
+    #    explícitamente ese equipo.
+    if tema and intencion_equipo:
+        for resultado in resultados:
+            if resultado["es_equipo"]:
+                agregar(resultado["item"])
+
+    # 2. Para preguntas de persona, priorizar coincidencias fuertes.
+    for resultado in resultados:
+        if resultado["score_persona"] >= 0.40:
+            agregar(resultado["item"])
+
+    # 3. Agregar solamente resultados con relevancia suficiente.
+    #    No se completa la lista con resultados irrelevantes.
+    for resultado in resultados:
+        score = resultado["score"]
+
+        if score >= 0.28:
+            agregar(resultado["item"])
 
         if len(seleccionados) >= top_k:
             break
 
-        if item not in seleccionados:
-
-            seleccionados.append(
-                item
-            )
-
-    # Si todavía no hay nada, utilizar los mejores resultados.
-    if not seleccionados:
-
-        for (
-            score,
-            score_vectorial,
-            score_textual,
-            item,
-        ) in resultados[:top_k]:
-
-            if item not in seleccionados:
-
-                seleccionados.append(
-                    item
-                )
-
-    # --------------------------------------------------------
-    # DIAGNÓSTICO FINAL
-    # --------------------------------------------------------
+    # 4. Si hubo una coincidencia muy fuerte pero quedó por debajo
+    #    del umbral debido a la distribución del texto, conservarla.
+    if not seleccionados and resultados:
+        mejor = resultados[0]
+        if mejor["score"] >= 0.20:
+            agregar(mejor["item"])
 
     print(
         "🔎 RESULTADOS FINALES: "
@@ -1542,28 +913,15 @@ def buscar_conocimiento_vectorial(
     )
 
     for item in seleccionados:
-
         print(
             "   ✅ "
             f"{item.get('titulo', '')}"
         )
 
-    if tema:
-
-        print(
-            "🎯 Tema detectado: "
-            f"{tema}"
-        )
-
     if intencion_equipo:
+        print("👥 Intención de equipo detectada.")
 
-        print(
-            "👥 Intención de equipo detectada."
-        )
-
-    print(
-        "🔎 ==================================\n"
-    )
+    print("🔎 ==================================\n")
 
     return seleccionados
 
@@ -1682,7 +1040,6 @@ def construir_contexto_relevante(
     )
 
     if not relevantes:
-
         return (
             "No se encontraron registros en la "
             "base de datos relacionados con "
@@ -1690,19 +1047,60 @@ def construir_contexto_relevante(
         )
 
     bloques = []
+    caracteres_usados = 0
 
-    for idx, item in enumerate(
-        relevantes,
-        1,
-    ):
-
-        bloques.append(
+    for idx, item in enumerate(relevantes, 1):
+        bloque = (
             f"REGISTRO {idx}\n"
             f"ID: {item.get('id', '')}\n"
             f"TIPO: {item.get('tipo', 'desconocido')}\n"
             f"TÍTULO: {item.get('titulo', '')}\n"
             f"CONTENIDO: {item.get('contenido', '')}\n"
             f"DESCRIPCIÓN: {item.get('descripcion', '')}"
+        )
+
+        separador = (
+            "\n\n"
+            "==============================\n\n"
+        )
+
+        costo = len(bloque)
+        costo_separador = (
+            len(separador)
+            if bloques
+            else 0
+        )
+
+        if (
+            bloques
+            and caracteres_usados
+            + costo_separador
+            + costo
+            > MAX_CHARS_CONOCIMIENTO_CHAT
+        ):
+            break
+
+        # Si un único registro supera el límite, se conserva al menos
+        # una parte útil en lugar de mandar un contexto ilimitado.
+        if (
+            not bloques
+            and costo > MAX_CHARS_CONOCIMIENTO_CHAT
+        ):
+            bloque = bloque[
+                :MAX_CHARS_CONOCIMIENTO_CHAT
+            ]
+            costo = len(bloque)
+
+        bloques.append(bloque)
+        caracteres_usados += (
+            costo + costo_separador
+        )
+
+    if not bloques:
+        return (
+            "No se encontraron registros en la "
+            "base de datos relacionados con "
+            "esta solicitud."
         )
 
     return (
@@ -2541,7 +1939,7 @@ SYSTEM_PROMPT_BASE = (
 
 app = FastAPI(
     title="Penaguillo IA",
-    version="7.3.0",
+    version="7.4.0",
     description=(
         "Backend del asistente inteligente "
         "Penaguillo"
@@ -2629,9 +2027,15 @@ def construir_query_conversacional(
     mensaje: str,
     history: list[ChatMessage],
 ) -> str:
-
     """
-    Para preguntas cortas utiliza contexto anterior.
+    Construye una consulta de retrieval conservando contexto cuando
+    la pregunta actual es claramente un seguimiento.
+
+    Importante:
+    - la pregunta actual siempre queda al final;
+    - se priorizan mensajes del usuario, no respuestas largas de Gemini;
+    - no se arrastra todo el historial al buscador;
+    - saludos y mensajes autónomos cortos no heredan contexto anterior.
     """
 
     mensaje_limpio = mensaje.strip()
@@ -2639,9 +2043,24 @@ def construir_query_conversacional(
     if not history:
         return mensaje_limpio
 
-    palabras = (
-        mensaje_limpio.split()
-    )
+    mensaje_n = normalizar_texto(mensaje_limpio)
+
+    saludos = {
+        "hola",
+        "holi",
+        "buenas",
+        "buenos dias",
+        "buenas tardes",
+        "buenas noches",
+        "hey",
+        "que tal",
+        "como estas",
+    }
+
+    if mensaje_n in saludos:
+        return mensaje_limpio
+
+    palabras = mensaje_n.split()
 
     palabras_seguimiento = {
         "ellos",
@@ -2669,51 +2088,47 @@ def construir_query_conversacional(
         "teléfono",
         "celular",
         "celulares",
+        "ese proyecto",
+        "esa persona",
+        "ese equipo",
     }
 
-    es_corta = (
-        len(palabras) <= 8
-    )
-
+    es_corta = len(palabras) <= 8
     tiene_referencia = any(
-        normalizar_texto(palabra)
-        in {
-            normalizar_texto(x)
-            for x in palabras_seguimiento
-        }
+        palabra in palabras_seguimiento
         for palabra in palabras
     )
 
-    if not (
-        es_corta
-        or tiene_referencia
-    ):
+    if not (es_corta or tiene_referencia):
         return mensaje_limpio
 
-    ultimos = []
+    # Solamente mensajes anteriores del usuario. Las respuestas de
+    # Gemini pueden ser largas y contaminar mucho el retrieval.
+    mensajes_usuario = []
 
-    # Para recuperar contexto se priorizan
-    # los últimos mensajes del usuario.
-    for msg in history[-4:]:
-
+    for msg in reversed(history):
         if (
-            msg.content
-            and msg.role
-            in ("user", "assistant")
+            msg.role == "user"
+            and msg.content
+            and msg.content.strip()
         ):
-
-            ultimos.append(
+            mensajes_usuario.append(
                 msg.content.strip()
             )
 
-    if not ultimos:
+        if len(mensajes_usuario) >= 2:
+            break
+
+    if not mensajes_usuario:
         return mensaje_limpio
 
+    mensajes_usuario.reverse()
+
     return (
-        " ".join(ultimos[-3:])
+        " ".join(mensajes_usuario)
         + " "
         + mensaje_limpio
-    )
+    ).strip()
 
 
 # ============================================================
@@ -3877,7 +3292,7 @@ def root():
             "Penaguillo IA",
 
         "version":
-            "7.3.0",
+            "7.4.0",
 
         "engine":
             "Búsqueda textual optimizada",
@@ -3907,7 +3322,7 @@ def startup_event():
 
     print(
         "🚀 Iniciando "
-        "Penaguillo IA v7.3..."
+        "Penaguillo IA v7.4..."
     )
 
     inicializar_google_drive()
