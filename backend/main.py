@@ -3078,9 +3078,9 @@ def calcular_relevancia(
     # 🔥 Aumentamos el límite de 18 a 40 para que el contenido gane peso
     puntuacion += min(coincidencias_contenido * 4, 40)
 
-    # 🔥 BONIFICACIÓN: Los textos enseñados a mano son "la verdad absoluta", les damos 15 puntos extra.
+    # 🔥 BONIFICACIÓN: Los textos enseñados a mano son "la verdad absoluta", les damos 20 puntos extra.
     if tipo == "texto":
-        puntuacion += 15
+        puntuacion += 20.0
 
     # ------------------------------------------------------------
     # 2. Coincidencia de frases completas
@@ -4496,7 +4496,7 @@ palabra aislada del mensaje.
 
 
 # ============================================================
-# ENSEÑAR TEXTO
+# ENSEÑAR TEXTO (CON TÍTULO Y DESCRIPCIÓN DINÁMICOS)
 # ============================================================
 
 @app.post("/ensenar")
@@ -4514,7 +4514,7 @@ def ensenar(
     try:
         conocimientos = cargar_conocimiento()
 
-        # 🔥 MAGIA AQUÍ: Creamos un título dinámico con las primeras palabras
+        # Extraemos las primeras palabras para que el título tenga contexto real
         palabras = texto.split()
         titulo_dinamico = " ".join(palabras[:8])
         if len(palabras) > 8:
@@ -4523,9 +4523,9 @@ def ensenar(
         nuevo = {
             "id": generar_id(),
             "tipo": "texto",
-            "titulo": titulo_dinamico, # Ya no es "Conocimiento manual"
+            "titulo": titulo_dinamico,  # <-- Ya no guarda "Conocimiento manual"
             "contenido": texto,
-            "descripcion": f"Información clave: {titulo_dinamico}", # Ya no está vacío
+            "descripcion": f"Información importante sobre: {titulo_dinamico}",  # <-- Ya no queda vacío
             "fecha": ahora_iso(),
         }
 
@@ -5969,4 +5969,4 @@ if __name__ == "__main__":
 
         reload=False,
 
-    ) 
+    )
