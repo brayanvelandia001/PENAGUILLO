@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 6.1 (Corregido: Retrieval de Equipos + Fuzzy Matching + Conteo + Fix Enseñar)
+# VERSIÓN 6.1 (Corregido: Retrieval de Equipos + Fuzzy Matching + Conteo + Fix Enseñar + Blindaje ERP/Inferencia)
 #
 # PROVEEDOR DE IA:
 # - Google Gemini Native API
@@ -4085,7 +4085,7 @@ def chat(
 
 
         # ====================================================
-        # SYSTEM PROMPT
+        # SYSTEM PROMPT (CON REGLAS DE NO-INFERENCIA DE EQUIPOS)
         # ====================================================
 
         system_prompt = (
@@ -4173,14 +4173,12 @@ palabra aislada del mensaje.
             + conocimiento_relevante
 
             + "\n\n==============================\n"
-            + "REGLAS DE COMPLETITUD Y EQUIPOS\n"
+            + "REGLAS STRICTAS DE NO-INFERENCIA Y EQUIPOS\n"
             + "==============================\n"
-            + "Si el usuario pide información de un 'equipo', 'grupo', 'área' o 'integrantes', debes listar a TODOS los miembros relevantes que aparezcan en el contexto proporcionado, sin omitir a ninguno.\n"
-            + "Si el usuario pide toda la información, toda la data, datos completos, ficha completa, perfil completo o pregunta qué sabes sobre una persona o tema, reúne TODOS los registros relevantes incluidos en el contexto.\n"
-            + "Si existen varios registros sobre la misma entidad, combínalos en una sola respuesta y no obligues al usuario a pedir cada campo por separado.\n"
-            + "Entrega primero los datos concretos disponibles y después los detalles adicionales.\n"
-            + "Nunca inventes un dato que no aparezca en el conocimiento. Si falta un dato, simplemente indícalo.\n"
-            + "No descartes un registro relevante solo porque contenga un campo diferente: puede complementar la información de otro registro.\n"
+            + "1. Queda ABSOLUTAMENTE PROHIBIDO inferir o asumir qué área, equipo o persona maneja un sistema (como ERP SAP, servidores, CRM, etc.) si esa relación exacta no aparece explícitamente en el CONOCIMIENTO RELEVANTE.\n"
+            + "2. Si el contexto NO menciona explícitamente qué persona o equipo atiende un sistema o área, debes responder claramente: 'No tengo un responsable confirmado para esa solicitud en la información que manejo.'\n"
+            + "3. Si el usuario pregunta por un 'equipo', 'grupo' o 'área' (como Modernización Tecnológica, Optimización, etc.), debes listar ÚNICAMENTE a las personas que el contexto asigne formalmente a ese equipo. Jamás agregues personas de otros registros solo porque el usuario preguntó por un tema genérico antes.\n"
+            + "4. Queda PROHIBIDO alterar, acortar o modificar correos electrónicos o teléfonos. Cópialos exactamente iguales a como aparecen en el contexto (mantiene dominios completos como .co y .com).\n"
 
         )
 
