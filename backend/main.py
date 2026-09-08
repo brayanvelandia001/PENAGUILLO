@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 6.1
+# VERSIÓN 6.1 (Corregido: Retrieval de Equipos/Grupos)
 #
 # PROVEEDOR DE IA:
 # - Google Gemini Native API
@@ -24,19 +24,8 @@
 # - penaguillo.json como fuente maestra
 # - Backups
 # - Escritura atómica
-# - Búsqueda local por relevancia
+# - Búsqueda local por relevancia inteligente
 # - Deduplicación inteligente
-#
-# CORRECCIONES V6.1:
-# - Gemini Native API
-# - Modelo gemini-3.5-flash-lite
-# - Menor latencia del chat
-# - Menor contexto enviado a Gemini
-# - Menor historial enviado a Gemini
-# - Retrieval reducido a 3 registros
-# - Pregunta actual siempre conservada
-# - Corrección de priorización de pregunta actual
-# - Menos coincidencias irrelevantes
 # ============================================================
 
 import base64
@@ -245,7 +234,6 @@ VISION_MODEL = GEMINI_MODEL
 # CONFIGURACIÓN DE TOKENS
 # ============================================================
 
-# Reducido para mejorar la velocidad del chat.
 MAX_OUTPUT_TOKENS = 1200
 
 
@@ -253,11 +241,8 @@ MAX_OUTPUT_TOKENS = 1200
 # CONFIGURACIÓN DEL RETRIEVAL LOCAL
 # ============================================================
 
-# Antes: 5
 RELEVANCIA_TOP_K = 8
 
-
-# Antes: 25 KB
 MAX_KB_CONOCIMIENTO_CHAT = 16
 
 MAX_CHARS_CONOCIMIENTO_CHAT = (
@@ -269,7 +254,6 @@ MAX_CHARS_CONOCIMIENTO_CHAT = (
 # CONFIGURACIÓN DEL HISTORIAL
 # ============================================================
 
-# Antes: 10
 MAX_MENSAJES_HISTORIAL = 6
 
 
@@ -362,9 +346,6 @@ def extraer_retry_after(
             pass
 
 
-    # Intentar encontrar segundos dentro
-    # del mensaje de error de Gemini.
-
     patrones = [
 
         r"retry in ([0-9]+(?:\.[0-9]+)?)s",
@@ -455,7 +436,7 @@ def generar_con_gemini(
     gemini_contents = []
 
 
-       # ========================================================
+    # ========================================================
     # CONVERTIR MENSAJES A GEMINI
     # ========================================================
 
@@ -463,10 +444,6 @@ def generar_con_gemini(
 
         role = msg.get("role")
         content = msg.get("content")
-
-        # ----------------------------------------------------
-        # SYSTEM
-        # ----------------------------------------------------
 
         if role == "system":
 
@@ -482,9 +459,6 @@ def generar_con_gemini(
 
             continue
 
-        # ----------------------------------------------------
-        # ROL GEMINI
-        # ----------------------------------------------------
 
         gemini_role = (
             "model"
@@ -493,10 +467,6 @@ def generar_con_gemini(
         )
 
         parts = []
-
-        # ----------------------------------------------------
-        # CONTENIDO DE TEXTO
-        # ----------------------------------------------------
 
         if isinstance(content, str):
 
@@ -508,10 +478,6 @@ def generar_con_gemini(
                     }
                 )
 
-        # ----------------------------------------------------
-        # CONTENIDO MULTIMODAL
-        # ----------------------------------------------------
-
         elif isinstance(content, list):
 
             for item in content:
@@ -520,10 +486,6 @@ def generar_con_gemini(
                     continue
 
                 item_type = item.get("type")
-
-                # --------------------------------------------
-                # TEXTO
-                # --------------------------------------------
 
                 if item_type == "text":
 
@@ -539,10 +501,6 @@ def generar_con_gemini(
                                 "text": texto
                             }
                         )
-
-                # --------------------------------------------
-                # IMAGEN
-                # --------------------------------------------
 
                 elif item_type == "image_url":
 
@@ -569,20 +527,12 @@ def generar_con_gemini(
 
                     try:
 
-                        # ------------------------------------
-                        # SEPARAR MIME Y BASE64
-                        # ------------------------------------
-
                         encabezado, b64_data = (
                             url_img.split(
                                 ",",
                                 1,
                             )
                         )
-
-                        # ------------------------------------
-                        # OBTENER MIME TYPE
-                        # ------------------------------------
 
                         if ":" not in encabezado:
 
@@ -609,10 +559,6 @@ def generar_con_gemini(
                                 "MIME type vacío."
                             )
 
-                        # ------------------------------------
-                        # AGREGAR IMAGEN A GEMINI
-                        # ------------------------------------
-
                         parts.append(
                             {
                                 "inlineData": {
@@ -632,9 +578,6 @@ def generar_con_gemini(
                             f"con formato inválido: {error}"
                         )
 
-        # ----------------------------------------------------
-        # AGREGAR MENSAJE
-        # ----------------------------------------------------
 
         if parts:
 
@@ -2950,21 +2893,15 @@ def construir_consulta_retrieval(
 
     anteriores = historial_usuario[-MAX_MENSAJES_RETRIEVAL:]
 
-    # Una pregunta normal se busca principalmente por sí misma.
-    # Solo añadimos historial reciente como apoyo para resolver referencias
-    # como "¿y cuál?", "¿y el teléfono?", etc.
-    es_completa = _es_pregunta_completa(mensaje_actual)
+    es_amplia = _es_solicitud_amplia(mensaje_actual)
     es_corta = len(palabras_actuales) <= 2 or len(mensaje_actual) <= 12
 
     if es_corta and anteriores:
         partes = anteriores + [mensaje_actual]
-    elif es_completa:
-        # Para "toda la data de X", mantener la pregunta limpia evita que
-        # palabras de conversaciones anteriores bajen la precisión.
+    elif es_amplia:
+        # Para "toda la data de X" o equipos, mantener la pregunta limpia
         partes = [mensaje_actual]
     else:
-        # Una pregunta normal puede beneficiarse únicamente del último
-        # mensaje del usuario, no de todo el historial.
         partes = [mensaje_actual]
         if anteriores:
             ultimo = anteriores[-1]
@@ -2979,7 +2916,6 @@ def construir_consulta_retrieval(
     consulta = " ".join(partes).strip()
 
     if len(consulta) > MAX_CHARS_CONSULTA_RETRIEVAL:
-        # La pregunta actual SIEMPRE conserva prioridad.
         espacio = MAX_CHARS_CONSULTA_RETRIEVAL - len(mensaje_actual) - 1
         if espacio > 0:
             contexto = " ".join(partes[:-1])
@@ -2999,8 +2935,8 @@ def construir_consulta_retrieval(
 # RELEVANCIA DE UN REGISTRO
 # ============================================================
 
-def _es_pregunta_completa(pregunta: str) -> bool:
-    """Detecta solicitudes donde el usuario quiere toda la información disponible."""
+def _es_solicitud_amplia(pregunta: str) -> bool:
+    """Detecta solicitudes de toda la información o miembros de un grupo/equipo."""
     texto = normalizar_texto(str(pregunta or ""))
 
     patrones = (
@@ -3019,6 +2955,15 @@ def _es_pregunta_completa(pregunta: str) -> bool:
         "que sabes de",
         "que informacion tienes de",
         "que datos tienes de",
+        # PATRONES PARA EQUIPOS Y GRUPOS
+        "equipo",
+        "grupo",
+        "integrantes",
+        "conforman",
+        "hacen parte",
+        "personal de",
+        "area de",
+        "miembros",
     )
 
     return any(patron in texto for patron in patrones)
@@ -3041,13 +2986,7 @@ def calcular_relevancia(
     item: dict[str, Any],
     pregunta_actual: str | None = None,
 ) -> float:
-    """
-    Calcula relevancia dando mucha más importancia a la pregunta actual.
-
-    En solicitudes de información completa se busca especialmente que todos
-    los registros que compartan la persona/área/entidad principal entren al
-    contexto, aunque cada registro contenga campos diferentes.
-    """
+    """Calcula relevancia dando mucha más importancia a la pregunta actual."""
     palabras = extraer_palabras_importantes(pregunta)
     actual = pregunta_actual if pregunta_actual else pregunta
     palabras_actuales = extraer_palabras_importantes(actual)
@@ -3067,7 +3006,7 @@ def calcular_relevancia(
     pregunta_normalizada = normalizar_texto(actual)
 
     puntuacion = 0.0
-    es_completa = _es_pregunta_completa(actual)
+    es_amplia = _es_solicitud_amplia(actual)
 
     # ------------------------------------------------------------
     # 1. Coincidencias de la pregunta ACTUAL
@@ -3094,7 +3033,6 @@ def calcular_relevancia(
     # ------------------------------------------------------------
     # 2. Coincidencia de frases completas
     # ------------------------------------------------------------
-    # Muy útil para nombres completos como "Santiago Cruz Buendía".
     palabras_frase = [p for p in palabras_actuales if len(p) >= 3]
     if len(palabras_frase) >= 2:
         frase = " ".join(palabras_frase)
@@ -3115,14 +3053,21 @@ def calcular_relevancia(
             puntuacion += 35
 
     # ------------------------------------------------------------
-    # 4. Para "toda la data", los registros que comparten la
-    #    entidad principal deben sobrevivir aunque tengan campos
-    #    diferentes.
+    # 4. Solicitudes Amplias (Toda la data, Equipos, Grupos)
     # ------------------------------------------------------------
-    if es_completa:
-        # Las primeras palabras importantes suelen contener la entidad
-        # solicitada (persona, área, proyecto, equipo, etc.).
-        entidad = palabras_actuales[:4]
+    if es_amplia:
+        palabras_intent = {
+            "toda", "todo", "datos", "data", "informacion", "info",
+            "completa", "completo", "disponible", "ficha", "perfil",
+            "dame", "dime", "sabes", "tienes",
+            "equipo", "grupo", "integrantes", "quienes", "conforman",
+            "personal", "area", "miembros", "cual", "cuales"
+        }
+
+        entidad = [
+            p for p in palabras_actuales if p not in palabras_intent
+        ][:4]
+
         coincidencias_entidad = _coincidencias_palabras(
             texto_completo,
             entidad,
@@ -3135,16 +3080,13 @@ def calcular_relevancia(
         if coincidencias_entidad >= 3:
             puntuacion += 35
 
-        # Si la entidad aparece en título o descripción, este registro
-        # es especialmente útil para completar la ficha.
         if _coincidencias_palabras(titulo, entidad) >= 1:
             puntuacion += 15
         if _coincidencias_palabras(descripcion, entidad) >= 1:
             puntuacion += 8
 
     # ------------------------------------------------------------
-    # 5. Historial: solo como apoyo, nunca por encima de la pregunta
-    #    actual.
+    # 5. Historial: solo como apoyo
     # ------------------------------------------------------------
     palabras_contexto = [
         palabra for palabra in palabras
@@ -3163,10 +3105,10 @@ def calcular_relevancia(
         puntuacion += min(coincidencias * 0.5, 3)
 
     # ------------------------------------------------------------
-    # 6. Una pregunta completa debe devolver información, no solo
+    # 6. Una pregunta amplia debe devolver información, no solo
     #    el registro que tenga el mayor score.
     # ------------------------------------------------------------
-    if es_completa and coincidencias_actuales >= 1:
+    if es_amplia and coincidencias_actuales >= 1:
         puntuacion += 6
 
     return puntuacion
@@ -3257,25 +3199,25 @@ def buscar_conocimiento_relevante(
     top_k: int = RELEVANCIA_TOP_K,
     pregunta_actual: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Busca y selecciona conocimiento, ampliando resultados para preguntas completas."""
+    """Busca y selecciona conocimiento, ampliando resultados para preguntas completas o de equipos."""
     if not conocimientos:
         return []
 
     actual = pregunta_actual if pregunta_actual else pregunta
-    es_completa = _es_pregunta_completa(actual)
+    es_amplia = _es_solicitud_amplia(actual)
 
     resultados = []
     claves_vistas = set()
 
     palabras_actuales = extraer_palabras_importantes(actual)
-    # Quitamos palabras típicas de intención para que no se conviertan en
-    # la "entidad" principal de una búsqueda de información completa.
     palabras_entidad = [
         p for p in palabras_actuales
         if p not in {
             "toda", "todo", "datos", "data", "informacion", "info",
             "completa", "completo", "disponible", "ficha", "perfil",
             "dame", "dime", "sabes", "tienes",
+            "equipo", "grupo", "integrantes", "quienes", "conforman",
+            "personal", "area", "miembros", "cual", "cuales"
         }
     ]
 
@@ -3294,10 +3236,9 @@ def buscar_conocimiento_relevante(
         )
 
         # --------------------------------------------------------
-        # Refuerzo de entidad para solicitudes completas.
-        # Permite reunir varios registros de una misma persona/área.
+        # Refuerzo de entidad para solicitudes amplias (Equipos/Info)
         # --------------------------------------------------------
-        if es_completa and palabras_entidad:
+        if es_amplia and palabras_entidad:
             texto_item = normalizar_texto(
                 " ".join(
                     (
@@ -3321,15 +3262,12 @@ def buscar_conocimiento_relevante(
             if coincidencias_entidad >= 3:
                 puntuacion += 30
 
-            # Una coincidencia en el título es una señal fuerte de que
-            # el registro pertenece directamente a la entidad solicitada.
             titulo = normalizar_texto(str(item.get("titulo", "")))
             if _coincidencias_palabras(titulo, palabras_entidad) >= 1:
                 puntuacion += 20
 
-        # El umbral sigue evitando ruido, pero es más permisivo cuando
-        # el usuario pidió explícitamente toda la información.
-        umbral = 2 if es_completa else 3
+        # Permisivo cuando se busca equipos o perfiles completos
+        umbral = 2 if es_amplia else 3
 
         if puntuacion >= umbral:
             resultados.append((puntuacion, indice, item))
@@ -3342,9 +3280,10 @@ def buscar_conocimiento_relevante(
         reverse=True,
     )
 
+    # Aumentado a 20 para soportar equipos más grandes
     limite_resultados = (
-        min(len(resultados), max(top_k, 12))
-        if es_completa
+        min(len(resultados), max(top_k, 20))
+        if es_amplia
         else top_k
     )
 
@@ -3356,7 +3295,7 @@ def buscar_conocimiento_relevante(
     print("🔎 Búsqueda de conocimiento:")
     print(f"   Registros totales: {len(conocimientos)}")
     print(f"   Registros únicos evaluados: {len(claves_vistas)}")
-    print(f"   Solicitud completa: {'SÍ' if es_completa else 'NO'}")
+    print(f"   Solicitud amplia/equipo: {'SÍ' if es_amplia else 'NO'}")
     print(f"   Registros relevantes: {len(seleccionados)}")
 
     if len(conocimientos) != len(claves_vistas):
@@ -4175,9 +4114,10 @@ palabra aislada del mensaje.
             + conocimiento_relevante
 
             + "\n\n==============================\n"
-            + "REGLAS DE COMPLETITUD\n"
+            + "REGLAS DE COMPLETITUD Y EQUIPOS\n"
             + "==============================\n"
-            + "Si el usuario pide toda la información, toda la data, datos completos, ficha completa, perfil completo o pregunta qué sabes sobre una persona, área, equipo o tema, reúne TODOS los registros relevantes incluidos en el contexto.\n"
+            + "Si el usuario pide información de un 'equipo', 'grupo', 'área' o 'integrantes', debes listar a TODOS los miembros relevantes que aparezcan en el contexto proporcionado, sin omitir a ninguno.\n"
+            + "Si el usuario pide toda la información, toda la data, datos completos, ficha completa, perfil completo o pregunta qué sabes sobre una persona o tema, reúne TODOS los registros relevantes incluidos en el contexto.\n"
             + "Si existen varios registros sobre la misma entidad, combínalos en una sola respuesta y no obligues al usuario a pedir cada campo por separado.\n"
             + "Entrega primero los datos concretos disponibles y después los detalles adicionales.\n"
             + "Nunca inventes un dato que no aparezca en el conocimiento. Si falta un dato, simplemente indícalo.\n"
