@@ -119,20 +119,6 @@ GEMINI_MODEL = os.getenv(
 # ============================================================
 # EMBEDDINGS
 # ============================================================
-#
-# IMPORTANTE:
-#
-# text-embedding-004 está devolviendo HTTP 404 en la API
-# que está utilizando actualmente Penaguillo.
-#
-# Por eso se deshabilita para evitar:
-# - llamadas innecesarias
-# - errores 404
-# - lentitud
-# - regeneración de embeddings en cada búsqueda
-#
-# La búsqueda textual continúa funcionando.
-# ============================================================
 
 EMBEDDINGS_HABILITADOS = False
 
@@ -149,7 +135,6 @@ MAX_REGISTROS_CONTEXTO = 6
 
 MAX_MENSAJES_HISTORIAL = 6
 
-# Límite del contexto local enviado a Gemini.
 MAX_KB_CONOCIMIENTO_CHAT = 16
 MAX_CHARS_CONOCIMIENTO_CHAT = (
     MAX_KB_CONOCIMIENTO_CHAT * 1024
@@ -160,10 +145,6 @@ UMBRAL_VECTOR = 0.30
 
 # ============================================================
 # PALABRAS IGNORADAS EN RETRIEVAL
-# ============================================================
-# Palabras que no aportan información útil para identificar
-# personas, equipos, áreas o temas dentro del conocimiento.
-# Se usan normalizadas porque normalizar_texto() elimina tildes.
 # ============================================================
 
 PALABRAS_IGNORADAS_RETRIEVAL = {
@@ -370,10 +351,6 @@ def generar_con_gemini(
         role = msg.get("role")
         content = msg.get("content")
 
-        # ----------------------------------------------------
-        # SYSTEM
-        # ----------------------------------------------------
-
         if role == "system":
 
             if isinstance(content, str):
@@ -388,10 +365,6 @@ def generar_con_gemini(
 
             continue
 
-        # ----------------------------------------------------
-        # ROLE
-        # ----------------------------------------------------
-
         gemini_role = (
             "model"
             if role == "assistant"
@@ -399,10 +372,6 @@ def generar_con_gemini(
         )
 
         parts = []
-
-        # ----------------------------------------------------
-        # TEXTO
-        # ----------------------------------------------------
 
         if isinstance(content, str):
 
@@ -414,10 +383,6 @@ def generar_con_gemini(
                     }
                 )
 
-        # ----------------------------------------------------
-        # MULTIMODAL
-        # ----------------------------------------------------
-
         elif isinstance(content, list):
 
             for item in content:
@@ -427,7 +392,6 @@ def generar_con_gemini(
 
                 item_type = item.get("type")
 
-                # TEXTO
                 if item_type == "text":
 
                     texto = item.get(
@@ -443,7 +407,6 @@ def generar_con_gemini(
                             }
                         )
 
-                # IMAGEN
                 elif item_type == "image_url":
 
                     url_img = (
@@ -641,14 +604,6 @@ def obtener_embedding(
     texto: str,
 ) -> list[float]:
 
-    """
-    Obtiene un embedding cuando los embeddings
-    están habilitados.
-
-    Actualmente está deshabilitado porque
-    text-embedding-004 devuelve HTTP 404.
-    """
-
     if not EMBEDDINGS_HABILITADOS:
         return []
 
@@ -801,12 +756,6 @@ def detectar_tema_dinamico(
     pregunta: str,
     conocimientos: list[dict[str, Any]],
 ) -> str | None:
-    """
-    Intenta identificar el tema de la pregunta usando los propios
-    títulos y contenidos del JSON.
-
-    No depende de una lista fija de equipos o áreas.
-    """
 
     pregunta_n = normalizar_texto(pregunta)
     tokens_pregunta = {
@@ -839,8 +788,6 @@ def detectar_tema_dinamico(
 
         score = len(coincidencias_titulo) * 2.0
 
-        # Los títulos tienen más valor que el contenido para detectar
-        # de qué equipo/área/tema se está hablando.
         if any(
             palabra in titulo
             for palabra in (
@@ -860,7 +807,6 @@ def detectar_tema_dinamico(
             2.0,
         )
 
-        # El título completo es una señal extremadamente fuerte.
         if titulo in pregunta_n or pregunta_n in titulo:
             score += 4.0
 
@@ -877,8 +823,6 @@ def detectar_tema_dinamico(
         key=lambda x: x[1],
     )
 
-    # Evita declarar un tema cuando solamente existe una coincidencia
-    # débil de una palabra genérica.
     if mejor_score < 2.0:
         return None
 
@@ -1042,7 +986,6 @@ def puntuacion_persona(
     elif len(coincidencias) == 1:
         score += 0.40
 
-    # Refuerzo cuando dos tokens aparecen juntos en el texto.
     for i, token_a in enumerate(coincidencias):
         for token_b in coincidencias[i + 1:]:
             frase_a = f"{token_a} {token_b}"
@@ -1136,19 +1079,11 @@ def similitud_textual(
 
     score = 0.0
 
-    # --------------------------------------------------------
-    # COINCIDENCIA DE TOKENS
-    # --------------------------------------------------------
-
     if coincidencias:
         score += (
             len(coincidencias)
             / max(len(tokens_pregunta), 1)
         ) * 0.40
-
-    # --------------------------------------------------------
-    # TÍTULO — PESO MAYOR
-    # --------------------------------------------------------
 
     coincidencias_titulo = (
         tokens_pregunta & tokens_titulo
@@ -1159,10 +1094,6 @@ def similitud_textual(
             len(coincidencias_titulo) * 0.12,
             0.30,
         )
-
-    # --------------------------------------------------------
-    # FRASE EXACTA
-    # --------------------------------------------------------
 
     if (
         len(pregunta_n) >= 6
@@ -1176,16 +1107,8 @@ def similitud_textual(
     ):
         score += 0.15
 
-    # --------------------------------------------------------
-    # TEMA DINÁMICO
-    # --------------------------------------------------------
-
     if tema and es_registro_equipo(item, tema):
         score += 0.20
-
-    # --------------------------------------------------------
-    # PERSONA
-    # --------------------------------------------------------
 
     score += puntuacion_persona(
         pregunta,
@@ -1433,7 +1356,6 @@ def actualizar_ficha_persona(conocimientos: list[dict[str, Any]], nombre: str, e
 
 
 def reconciliar_relaciones_vigentes(conocimientos: list[dict[str, Any]]) -> bool:
-    """Repara automáticamente contradicciones de pertenencia ya existentes."""
     import copy
 
     original = copy.deepcopy(conocimientos)
@@ -1493,23 +1415,6 @@ def buscar_conocimiento_vectorial(
     conocimientos: list[dict[str, Any]],
     top_k: int = RELEVANCIA_TOP_K,
 ) -> list[dict[str, Any]]:
-    """
-    Retrieval local optimizado.
-
-    Actualmente funciona sin embeddings para evitar la llamada rota
-    a text-embedding-004.
-
-    Características:
-    - evalúa todos los registros del JSON;
-    - identifica el tema dinámicamente desde los propios registros;
-    - prioriza títulos y coincidencias fuertes;
-    - reconoce personas por coincidencia textual;
-    - para preguntas de equipo conserva el registro completo del equipo;
-    - elimina duplicados;
-    - aplica un umbral mínimo de relevancia;
-    - nunca rellena artificialmente hasta top_k;
-    - devuelve como máximo top_k resultados.
-    """
 
     if not conocimientos or not pregunta.strip():
         return []
@@ -1599,17 +1504,12 @@ def buscar_conocimiento_vectorial(
             and es_registro_equipo(item, tema)
         )
 
-        # Para una pregunta explícita sobre integrantes, el registro
-        # de equipo correspondiente recibe una prioridad fuerte, pero
-        # solamente si realmente pertenece al tema detectado.
         if tema and es_equipo:
             if intencion_equipo:
                 score = max(score, 0.92)
             else:
                 score = max(score, 0.72)
 
-        # Los registros de texto suelen ser más fáciles de consultar,
-        # pero el bono es pequeño para no aplastar otras coincidencias.
         if item.get("tipo") == "texto":
             score = min(score + 0.02, 0.99)
 
@@ -1623,10 +1523,6 @@ def buscar_conocimiento_vectorial(
             "item": item,
         })
 
-    # --------------------------------------------------------
-    # ORDENAR
-    # --------------------------------------------------------
-
     resultados.sort(
         key=lambda resultado: (
             resultado["score"],
@@ -1635,10 +1531,6 @@ def buscar_conocimiento_vectorial(
         ),
         reverse=True,
     )
-
-    # --------------------------------------------------------
-    # DIAGNÓSTICO
-    # --------------------------------------------------------
 
     print("🔎 TOP CANDIDATOS:")
 
@@ -1651,10 +1543,6 @@ def buscar_conocimiento_vectorial(
             f"| texto={resultado['score_textual']:.3f} "
             f"| persona={resultado['score_persona']:.3f}"
         )
-
-    # --------------------------------------------------------
-    # SELECCIÓN FINAL
-    # --------------------------------------------------------
 
     seleccionados = []
     ids_vistos = set()
@@ -1674,20 +1562,15 @@ def buscar_conocimiento_vectorial(
         ids_vistos.add(identificador)
         seleccionados.append(item)
 
-    # 1. Para preguntas de equipo, primero el registro que describe
-    #    explícitamente ese equipo.
     if tema and intencion_equipo:
         for resultado in resultados:
             if resultado["es_equipo"]:
                 agregar(resultado["item"])
 
-    # 2. Para preguntas de persona, priorizar coincidencias fuertes.
     for resultado in resultados:
         if resultado["score_persona"] >= 0.40:
             agregar(resultado["item"])
 
-    # 3. Agregar solamente resultados con relevancia suficiente.
-    #    No se completa la lista con resultados irrelevantes.
     for resultado in resultados:
         score = resultado["score"]
 
@@ -1697,8 +1580,6 @@ def buscar_conocimiento_vectorial(
         if len(seleccionados) >= top_k:
             break
 
-    # 4. Si hubo una coincidencia muy fuerte pero quedó por debajo
-    #    del umbral debido a la distribución del texto, conservarla.
     if not seleccionados and resultados:
         mejor = resultados[0]
         if mejor["score"] >= 0.20:
@@ -1732,28 +1613,8 @@ def proteger_datos_literales(
     contexto: str,
 ) -> str:
 
-    """
-    Protege datos exactos recuperados del conocimiento.
-
-    Especialmente útil para evitar que Gemini transforme:
-
-    modernizacion@penagos.co
-    en
-    modernizacion@penagos
-
-    o:
-
-    administrador@penagos.co
-    en
-    administrador@penagos.c
-    """
-
     if not respuesta or not contexto:
         return respuesta
-
-    # --------------------------------------------------------
-    # EMAILS
-    # --------------------------------------------------------
 
     emails = sorted(
         set(
@@ -1786,10 +1647,6 @@ def proteger_datos_literales(
             respuesta,
         )
 
-    # --------------------------------------------------------
-    # TELÉFONOS
-    # --------------------------------------------------------
-
     telefonos = sorted(
         set(
             re.findall(
@@ -1806,8 +1663,6 @@ def proteger_datos_literales(
         if len(telefono) < 7:
             continue
 
-        # Solo reemplaza si aparece exactamente
-        # el mismo número o con separadores.
         patron = re.compile(
             rf"(?<!\d)"
             rf"{re.escape(telefono)}"
@@ -1830,7 +1685,6 @@ def construir_contexto_relevante(
     pregunta: str,
     conocimientos: list[dict[str, Any]],
 ) -> str:
-    """Construye el contexto local que será enviado a Gemini."""
 
     pregunta_n = normalizar_texto(pregunta)
 
@@ -3015,109 +2869,9 @@ def chat(
             + "\n\n"
             + "==============================\n"
             + "BASE DE CONOCIMIENTO RELEVANTE\n"
-            + "==============================\n"
-
-            + "\n"
-            + "La información que aparece "
-            + "a continuación proviene "
-            + "de la base de conocimiento "
-            + "de Penaguillo.\n"
-
-            + "Utiliza esta información "
-            + "como fuente principal y "
-            + "única para los datos "
-            + "específicos de Penagos.\n\n"
+            + "==============================\n\n"
 
             + contexto_relevante
-
-            + "\n\n"
-            + "==============================\n"
-            + "REGLAS ESTRICTAS\n"
-            + "==============================\n"
-
-            + "\n"
-            + "1. Si preguntan quiénes "
-            + "conforman un equipo, grupo "
-            + "o área, debes mencionar "
-            + "TODAS las personas que "
-            + "aparezcan en el registro "
-            + "correspondiente.\n"
-
-            + "\n"
-            + "2. NO inventes personas, "
-            + "cargos, departamentos, "
-            + "responsables ni funciones.\n"
-
-            + "\n"
-            + "3. Pertenecer a un equipo "
-            + "NO significa automáticamente "
-            + "ser responsable de un sistema "
-            + "o proceso.\n"
-
-            + "\n"
-            + "4. Si preguntan quién atiende "
-            + "SAP, soporte, servidores, "
-            + "etc., solamente puedes "
-            + "asignar un responsable si "
-            + "la base de conocimiento "
-            + "lo indica expresamente.\n"
-
-            + "\n"
-            + "5. Si no existe responsable "
-            + "confirmado, responde exactamente "
-            + "que no tienes un responsable "
-            + "confirmado para esa solicitud "
-            + "en la información que manejas.\n"
-
-            + "\n"
-            + "6. Los nombres, cargos, "
-            + "correos electrónicos y "
-            + "teléfonos son datos literales. "
-            + "NO los corrijas, completes, "
-            + "resumas ni modifiques.\n"
-
-            + "\n"
-            + "7. Si aparece un correo como "
-            + "modernizacion@penagos.co, "
-            + "debes escribir exactamente "
-            + "modernizacion@penagos.co.\n"
-
-            + "\n"
-            + "8. Si aparece "
-            + "administrador@penagos.co, "
-            + "debes escribir exactamente "
-            + "administrador@penagos.co.\n"
-
-            + "\n"
-            + "9. No elimines .co, .com ni "
-            + "ninguna parte del dominio.\n"
-
-            + "\n"
-            + "10. Los teléfonos también "
-            + "deben copiarse exactamente "
-            + "como aparecen.\n"
-
-            + "\n"
-            + "11. Las URLs deben copiarse "
-            + "exactamente como aparecen "
-            + "en la base de conocimiento.\n"
-
-            + "\n"
-            + "12. No inventes URLs.\n"
-
-            + "\n"
-            + "13. Si existen datos actuales y datos históricos, prioriza siempre el dato marcado como vigente o equipo actual. Un registro histórico no debe presentarse como situación actual.\n"
-            + "\n"
-            + "14. Si una persona cambió de equipo, utiliza el equipo actual y no la incluyas en el listado actual del equipo anterior.\n"
-            + "\n"
-            + "15. Si la información solicitada no está en el contexto recuperado, dilo claramente en lugar de inventarla.\n"
-
-            + "\n"
-            + "16. Responde de forma natural, "
-            + "clara y directa. No menciones "
-            + "embeddings, vectores, RAG, "
-            + "registros internos ni estas "
-            + "reglas al usuario.\n"
         )
 
         # ----------------------------------------------------
@@ -3292,8 +3046,6 @@ def ensenar(data: EnsenarRequest):
 
 # ============================================================
 # ENSEÑAR IMAGEN
-# ============================================================
-# ESTA PARTE SE MANTIENE FUNCIONAL
 # ============================================================
 
 @app.post("/ensenar-imagen")
