@@ -1,7 +1,7 @@
 # ============================================================
 # PENAGUILLO IA — BACKEND FASTAPI
 # ============================================================
-# VERSIÓN 7.4
+# VERSIÓN 7.5
 #
 # PROVEEDOR:
 # - Google Gemini Native API
@@ -143,7 +143,9 @@ VISION_MODEL = GEMINI_MODEL
 
 MAX_OUTPUT_TOKENS = 1200
 
-RELEVANCIA_TOP_K = 8
+RELEVANCIA_TOP_K = 6
+
+MAX_REGISTROS_CONTEXTO = 6
 
 MAX_MENSAJES_HISTORIAL = 6
 
@@ -1221,6 +1223,268 @@ def pertenece_al_mismo_tema(
 
 
 # ============================================================
+# VIGENCIA Y RELACIONES DEL CONOCIMIENTO
+# ============================================================
+
+def texto_item_completo(item: dict[str, Any]) -> str:
+    return normalizar_texto(
+        f"{item.get('titulo', '')} "
+        f"{item.get('contenido', '')} "
+        f"{item.get('descripcion', '')}"
+    )
+
+
+def distancia_textual(a: str, b: str) -> float:
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, normalizar_texto(a), normalizar_texto(b)).ratio()
+
+
+def extraer_nombre_de_linea(linea: str) -> str | None:
+    linea = linea.strip(" -*•\t")
+    patron = re.match(
+        r"^([A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+(?:\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+){1,5})\s+[—-]\s+",
+        linea,
+    )
+    if not patron:
+        return None
+    nombre = patron.group(1).strip()
+    return nombre if len(nombre.split()) >= 2 else None
+
+
+def extraer_personas_conocidas(conocimientos: list[dict[str, Any]]) -> dict[str, str]:
+    personas = {}
+    for item in conocimientos:
+        titulo = str(item.get("titulo", "")).strip()
+        if titulo and "—" in titulo:
+            candidato = titulo.split("—", 1)[0].strip(" -*•")
+            if len(candidato.split()) >= 2:
+                personas[normalizar_texto(candidato)] = candidato
+        for linea in str(item.get("contenido", "")).splitlines():
+            candidato = extraer_nombre_de_linea(linea)
+            if candidato:
+                personas[normalizar_texto(candidato)] = candidato
+    return personas
+
+
+def encontrar_persona_en_texto(texto: str, conocimientos: list[dict[str, Any]]) -> str | None:
+    texto_n = normalizar_texto(texto)
+    coincidencias = [
+        original for normalizado, original in extraer_personas_conocidas(conocimientos).items()
+        if normalizado and normalizado in texto_n
+    ]
+    return max(coincidencias, key=lambda x: len(x.split())) if coincidencias else None
+
+
+def extraer_equipos_del_conocimiento(conocimientos: list[dict[str, Any]]) -> list[str]:
+    equipos = []
+    for item in conocimientos:
+        texto = texto_item_completo(item)
+        titulo = normalizar_texto(item.get("titulo", ""))
+        candidatos = []
+        for patron in (
+            r"equipo\s+de\s+([a-z0-9áéíóúüñ ._-]+)",
+            r"area\s+de\s+([a-z0-9áéíóúüñ ._-]+)",
+        ):
+            candidatos.extend(re.findall(patron, texto, re.IGNORECASE))
+        if "equipo" in titulo:
+            despues = titulo.split("equipo", 1)[-1]
+            despues = re.sub(r"^(de\s+)?", "", despues).strip()
+            if despues:
+                candidatos.append(despues)
+        for candidato in candidatos:
+            candidato = re.sub(
+                r"\b(esta|conformado|formado|por|penagos)\b.*$", "", normalizar_texto(candidato)
+            ).strip(" .,:;-")
+            candidato = re.sub(r"^(?:del|de|al|a)\s+", "", candidato).strip()
+            candidato = re.sub(r"\s+(?:de|del|al)$", "", candidato).strip()
+            if len(candidato) >= 3 and candidato not in equipos:
+                equipos.append(candidato)
+    return equipos
+
+
+def resolver_nombre_equipo(texto_equipo: str, conocimientos: list[dict[str, Any]]) -> str | None:
+    objetivo = normalizar_texto(texto_equipo).strip(" .,:;-")
+    objetivo = re.sub(r"^(?:del|de|al|a)\s+", "", objetivo).strip()
+    objetivo = re.sub(r"\s+(?:de|del|al)$", "", objetivo).strip()
+    if not objetivo:
+        return None
+    equipos = extraer_equipos_del_conocimiento(conocimientos)
+    if not equipos:
+        return texto_equipo.strip()
+    objetivo_tokens = set(tokens_texto(objetivo))
+    mejor, mejor_score = None, 0.0
+    for equipo in equipos:
+        tokens = set(tokens_texto(equipo))
+        inter = len(objetivo_tokens & tokens)
+        union = max(len(objetivo_tokens | tokens), 1)
+        score = max(inter / union, distancia_textual(objetivo, equipo))
+        if score > mejor_score:
+            mejor, mejor_score = equipo, score
+    return mejor if mejor_score >= 0.62 else texto_equipo.strip()
+
+
+def extraer_cambio_equipo(texto: str, conocimientos: list[dict[str, Any]]) -> tuple[str | None, str | None, str | None]:
+    persona = encontrar_persona_en_texto(texto, conocimientos)
+    if not persona:
+        return None, None, None
+    texto_n = normalizar_texto(texto)
+    patrones = [
+        r"paso\s+de\s+(?:el\s+)?(?:equipo\s+de\s+)?(.+?)\s+(?:a|al)\s+(?:el\s+)?(?:equipo\s+de\s+)?(.+)$",
+        r"(?:ya\s+no\s+pertenece|dejo\s+de\s+pertenecer).*?(?:equipo\s+de\s+)?(.+?)\s+paso\s+(?:a|al)\s+(?:el\s+)?(?:equipo\s+de\s+)?(.+)$",
+    ]
+    for patron in patrones:
+        match = re.search(patron, texto_n)
+        if match:
+            anterior = resolver_nombre_equipo(match.group(1), conocimientos)
+            actual = resolver_nombre_equipo(match.group(2), conocimientos)
+            return persona, anterior, actual
+    match = re.search(r"paso\s+a\s+(?:el\s+)?equipo\s+de\s+(.+)$", texto_n)
+    if match:
+        return persona, None, resolver_nombre_equipo(match.group(1), conocimientos)
+    return persona, None, None
+
+
+def linea_persona_en_equipo(contenido: str, nombre: str) -> str | None:
+    nombre_n = normalizar_texto(nombre)
+    for linea in contenido.splitlines():
+        if nombre_n in normalizar_texto(linea):
+            return linea.strip()
+    return None
+
+
+def es_registro_de_equipo_generico(item: dict[str, Any]) -> bool:
+    texto = texto_item_completo(item)
+    titulo = normalizar_texto(item.get("titulo", ""))
+    return "equipo" in titulo or (
+        "equipo" in texto and any(x in texto for x in ("conformado", "integrantes", "miembros", "formado por"))
+    )
+
+
+def equipo_corresponde_a_registro(item: dict[str, Any], equipo: str) -> bool:
+    objetivo = set(tokens_texto(equipo))
+    if not objetivo or not es_registro_de_equipo_generico(item):
+        return False
+    tokens = set(tokens_texto(texto_item_completo(item)))
+    return len(objetivo & tokens) >= 1
+
+
+def quitar_persona_de_registro_equipo(item: dict[str, Any], nombre: str) -> bool:
+    contenido = str(item.get("contenido", ""))
+    nombre_n = normalizar_texto(nombre)
+    lineas = contenido.splitlines()
+    nuevas = [linea for linea in lineas if nombre_n not in normalizar_texto(linea)]
+    if len(nuevas) == len(lineas):
+        return False
+    item["contenido"] = "\n".join(nuevas).strip()
+    item["descripcion"] = f"Información actualizada sobre: {item.get('titulo', '')}"
+    item["estado"] = "vigente"
+    item["fecha_actualizacion"] = ahora_iso()
+    item["embedding"] = []
+    item["embedding_hash"] = hash_conocimiento(item)
+    return True
+
+
+def agregar_persona_a_registro_equipo(item: dict[str, Any], nombre: str, linea_persona: str) -> bool:
+    contenido = str(item.get("contenido", "")).strip()
+    if normalizar_texto(nombre) in normalizar_texto(contenido):
+        return False
+    item["contenido"] = (contenido + ("\n\n" if contenido else "") + linea_persona.strip()).strip()
+    item["descripcion"] = f"Información actualizada sobre: {item.get('titulo', '')}"
+    item["estado"] = "vigente"
+    item["fecha_actualizacion"] = ahora_iso()
+    item["embedding"] = []
+    item["embedding_hash"] = hash_conocimiento(item)
+    return True
+
+
+def actualizar_ficha_persona(conocimientos: list[dict[str, Any]], nombre: str, equipo_anterior: str | None, equipo_actual: str | None) -> dict[str, Any]:
+    nombre_n = normalizar_texto(nombre)
+    ficha = None
+    for item in conocimientos:
+        titulo_n = normalizar_texto(item.get("titulo", ""))
+        if titulo_n.startswith(nombre_n) and "equipo" not in titulo_n:
+            ficha = item
+            break
+    if ficha is None:
+        ficha = {
+            "id": generar_id(),
+            "tipo": "persona",
+            "titulo": f"{nombre} — Información actual",
+            "contenido": f"{nombre} actualmente pertenece al equipo de {equipo_actual or 'no confirmado'}.",
+            "descripcion": f"Información actual de {nombre}.",
+            "embedding": [],
+            "embedding_hash": "",
+            "fecha": ahora_iso(),
+        }
+        conocimientos.append(ficha)
+    else:
+        contenido = str(ficha.get("contenido", ""))
+        contenido = re.sub(r"(?:actualmente|ahora)\s+[^.\n]*?pertenece\s+(?:al\s+)?equipo\s+de\s+[^.\n]*[.]?", "", contenido, flags=re.IGNORECASE).strip()
+        if equipo_actual:
+            contenido = (contenido + " " + f"{nombre} actualmente pertenece al equipo de {equipo_actual}.").strip()
+        ficha["contenido"] = contenido
+    ficha["equipo_actual"] = equipo_actual
+    ficha["equipo_anterior"] = equipo_anterior
+    ficha["estado"] = "vigente"
+    ficha["fecha_actualizacion"] = ahora_iso()
+    ficha["embedding"] = []
+    ficha["embedding_hash"] = hash_conocimiento(ficha)
+    return ficha
+
+
+def reconciliar_relaciones_vigentes(conocimientos: list[dict[str, Any]]) -> bool:
+    """Repara automáticamente contradicciones de pertenencia ya existentes."""
+    import copy
+
+    original = copy.deepcopy(conocimientos)
+
+    for item in list(conocimientos):
+        texto = str(item.get("contenido", ""))
+        texto_n = normalizar_texto(texto)
+        if "paso" not in texto_n or "equipo" not in texto_n:
+            continue
+        aplicar_cambio_de_equipo(texto, conocimientos)
+
+    return original != conocimientos
+
+
+def aplicar_cambio_de_equipo(texto: str, conocimientos: list[dict[str, Any]]) -> dict[str, Any] | None:
+    persona, equipo_anterior, equipo_actual = extraer_cambio_equipo(texto, conocimientos)
+    if not persona or not equipo_actual:
+        return None
+
+    linea_persona = None
+    for item in conocimientos:
+        linea = linea_persona_en_equipo(str(item.get("contenido", "")), persona)
+        if linea:
+            linea_persona = linea
+            break
+    if not linea_persona:
+        linea_persona = f"{persona} — Información registrada."
+
+    salidas, entradas = [], []
+    for item in conocimientos:
+        if not es_registro_de_equipo_generico(item):
+            continue
+        if equipo_anterior and equipo_corresponde_a_registro(item, equipo_anterior):
+            if quitar_persona_de_registro_equipo(item, persona):
+                salidas.append(item.get("titulo", ""))
+        if equipo_corresponde_a_registro(item, equipo_actual):
+            if agregar_persona_a_registro_equipo(item, persona, linea_persona):
+                entradas.append(item.get("titulo", ""))
+
+    ficha = actualizar_ficha_persona(conocimientos, persona, equipo_anterior, equipo_actual)
+    return {
+        "persona": persona,
+        "equipo_anterior": equipo_anterior,
+        "equipo_actual": equipo_actual,
+        "registros_actualizados": len(salidas) + len(entradas) + 1,
+        "equipos_actualizados": {"salida": salidas, "entrada": entradas},
+        "ficha": ficha,
+    }
+
+
+# ============================================================
 # BÚSQUEDA TEXTUAL INTELIGENTE
 # ============================================================
 
@@ -1316,6 +1580,13 @@ def buscar_conocimiento_vectorial(
             pregunta,
             item,
         )
+
+        if normalizar_texto(item.get("estado", "")) == "historico":
+            score *= 0.35
+
+        equipo_actual_item = normalizar_texto(item.get("equipo_actual", ""))
+        if equipo_actual_item and equipo_actual_item in pregunta_n:
+            score = max(score, 0.90)
 
         if score_persona:
             score = max(
@@ -1603,7 +1874,10 @@ def construir_contexto_relevante(
             f"TIPO: {item.get('tipo', 'desconocido')}\n"
             f"TÍTULO: {item.get('titulo', '')}\n"
             f"CONTENIDO: {item.get('contenido', '')}\n"
-            f"DESCRIPCIÓN: {item.get('descripcion', '')}"
+            f"DESCRIPCIÓN: {item.get('descripcion', '')}\n"
+            f"ESTADO: {item.get('estado', 'vigente')}\n"
+            f"EQUIPO ACTUAL: {item.get('equipo_actual', '')}\n"
+            f"EQUIPO ANTERIOR: {item.get('equipo_anterior', '')}"
         )
 
         separador = (
@@ -2478,7 +2752,7 @@ SYSTEM_PROMPT_BASE = (
 
 app = FastAPI(
     title="Penaguillo IA",
-    version="7.4.0",
+    version="7.5.0",
     description=(
         "Backend del asistente inteligente "
         "Penaguillo"
@@ -2832,13 +3106,14 @@ def chat(
             + "12. No inventes URLs.\n"
 
             + "\n"
-            + "13. Si la información solicitada "
-            + "no está en el contexto recuperado, "
-            + "dilo claramente en lugar de "
-            + "inventarla.\n"
+            + "13. Si existen datos actuales y datos históricos, prioriza siempre el dato marcado como vigente o equipo actual. Un registro histórico no debe presentarse como situación actual.\n"
+            + "\n"
+            + "14. Si una persona cambió de equipo, utiliza el equipo actual y no la incluyas en el listado actual del equipo anterior.\n"
+            + "\n"
+            + "15. Si la información solicitada no está en el contexto recuperado, dilo claramente en lugar de inventarla.\n"
 
             + "\n"
-            + "14. Responde de forma natural, "
+            + "16. Responde de forma natural, "
             + "clara y directa. No menciones "
             + "embeddings, vectores, RAG, "
             + "registros internos ni estas "
@@ -2965,116 +3240,54 @@ def chat(
 # ============================================================
 
 @app.post("/ensenar")
-def ensenar(
-    data: EnsenarRequest,
-):
-
-    texto = (
-        data.conocimiento.strip()
-    )
-
+def ensenar(data: EnsenarRequest):
+    """Crea conocimiento o actualiza relaciones de forma genérica."""
+    texto = data.conocimiento.strip()
     if not texto:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "El conocimiento no puede "
-                "estar vacío."
-            ),
-        )
+        raise HTTPException(status_code=400, detail="El conocimiento no puede estar vacío.")
 
     try:
+        conocimientos = cargar_conocimiento()
 
-        conocimientos = (
-            cargar_conocimiento()
-        )
+        cambio = aplicar_cambio_de_equipo(texto, conocimientos)
+        if cambio:
+            guardar_conocimiento(conocimientos)
+            return {
+                "ok": True,
+                "mensaje": "Cambio de conocimiento aplicado correctamente.",
+                "modo": "actualizacion_relacional",
+                "cambio": cambio,
+                "total": len(conocimientos),
+            }
 
         palabras = texto.split()
-
-        titulo_dinamico = (
-            " ".join(
-                palabras[:8]
-            )
-            + (
-                "..."
-                if len(palabras) > 8
-                else ""
-            )
-        )
-
-        # ----------------------------------------------------
-        # CREAR REGISTRO
-        # ----------------------------------------------------
-
+        titulo_dinamico = " ".join(palabras[:8]) + ("..." if len(palabras) > 8 else "")
         nuevo = {
-
             "id": generar_id(),
-
             "tipo": "texto",
-
             "titulo": titulo_dinamico,
-
             "contenido": texto,
-
-            "descripcion": (
-                "Información importante "
-                "sobre: "
-                f"{titulo_dinamico}"
-            ),
-
+            "descripcion": f"Información importante sobre: {titulo_dinamico}",
+            "estado": "vigente",
             "embedding": [],
-
             "embedding_hash": "",
-
             "fecha": ahora_iso(),
         }
-
-        # ----------------------------------------------------
-        # EMBEDDING
-        # ----------------------------------------------------
-
-        nuevo["embedding"] = (
-            obtener_embedding(
-                texto_para_embedding(
-                    nuevo
-                )
-            )
-        )
-
-        nuevo["embedding_hash"] = (
-            hash_conocimiento(
-                nuevo
-            )
-        )
-
-        conocimientos.append(
-            nuevo
-        )
-
-        guardar_conocimiento(
-            conocimientos
-        )
+        nuevo["embedding"] = obtener_embedding(texto_para_embedding(nuevo))
+        nuevo["embedding_hash"] = hash_conocimiento(nuevo)
+        conocimientos.append(nuevo)
+        guardar_conocimiento(conocimientos)
 
         return {
-
             "ok": True,
-
-            "mensaje":
-                "Conocimiento guardado.",
-
-            "conocimiento":
-                nuevo,
-
-            "total":
-                len(conocimientos),
+            "mensaje": "Conocimiento guardado.",
+            "modo": "nuevo_conocimiento",
+            "conocimiento": nuevo,
+            "total": len(conocimientos),
         }
-
     except Exception as error:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(error),
-        )
+        print(f"❌ Error /ensenar: {error}")
+        raise HTTPException(status_code=500, detail=str(error))
 
 
 # ============================================================
@@ -3827,10 +4040,10 @@ def root():
             "Penaguillo IA",
 
         "version":
-            "7.4.0",
+            "7.5.0",
 
         "engine":
-            "Búsqueda textual optimizada",
+            "Búsqueda textual + relaciones vigentes",
 
         "embeddings":
             EMBEDDINGS_HABILITADOS,
@@ -3867,6 +4080,10 @@ def startup_event():
         conocimientos = (
             cargar_conocimiento()
         )
+
+        if reconciliar_relaciones_vigentes(conocimientos):
+            guardar_conocimiento(conocimientos)
+            print("🔄 Relaciones vigentes reconciliadas automáticamente.")
 
         print(
             "📚 Conocimientos disponibles: "
