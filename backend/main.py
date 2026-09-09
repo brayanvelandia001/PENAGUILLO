@@ -1143,7 +1143,7 @@ def construir_query_conversacional(mensaje: str, history: list[ChatMessage]) -> 
     palabras = mensaje_n.split()
     palabras_seguimiento = {
         "ellos", "ellas", "el", "ella", "ese", "esa", "esos", "esas",
-        "sus", "su", "tambien", "y", "quienes", "cual", "cuales", "correo",
+        "sus", "su", "tambien", "quienes", "cual", "cuales", "correo",
         "correos", "telefono", "celular", "celulares", "proyecto", "persona", "equipo",
     }
 
